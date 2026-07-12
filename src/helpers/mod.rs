@@ -1,7 +1,6 @@
 //! Useful helpers for agent implementations
 //!
 //! This module provides reusable components that agents can opt-in to:
-//! - `TodoListManager` - Tracks tasks and which turn they were last updated
 //! - `ContextInjection` - Modify messages before each LLM call
 //! - `Debugger` - Log API calls and tool executions for debugging
 //! - `ConversationNamer` - Generate descriptive names for conversations
@@ -11,7 +10,6 @@ mod attachments;
 mod context_injection;
 mod conversation_namer;
 mod debugger;
-mod todo_manager;
 
 pub use attachments::process_attachments;
 pub use context_injection::{
@@ -22,4 +20,3 @@ pub use conversation_namer::{generate_conversation_name, ConversationNamer};
 pub use debugger::{
     ApiRequestEvent, ApiResponseEvent, Debugger, EventType, ToolCallEvent, ToolResultEvent,
 };
-pub use todo_manager::{TodoItem, TodoListManager, TodoStatus};

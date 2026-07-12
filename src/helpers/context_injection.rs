@@ -16,21 +16,16 @@
 //! # Example
 //!
 //! ```ignore
-//! // Create a todo reminder injection
-//! let todo_injection = FnInjection::new("todo_reminder", |internals, mut messages| {
-//!     let manager = internals.context.get_resource::<TodoListManager>();
-//!     if let Some(manager) = manager {
-//!         let turns_since_update = internals.context.current_turn - manager.last_updated_turn();
-//!         if turns_since_update > 20 {
-//!             // Inject a reminder into the last message
-//!             inject_system_reminder(&mut messages, "Consider updating your todo list");
-//!         }
+//! // Example: inject a system reminder after many turns without tool use
+//! let reminder_injection = FnInjection::new("reminder", |internals, mut messages| {
+//!     if internals.context.current_turn > 20 {
+//!         inject_system_reminder(&mut messages, "You haven't used tools recently.");
 //!     }
 //!     messages
 //! });
 //!
 //! // Add to agent's injection list
-//! agent.add_injection(todo_injection);
+//! agent.add_injection(reminder_injection);
 //! ```
 
 use crate::llm::Message;

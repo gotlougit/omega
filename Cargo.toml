@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# HTTP client for Anthropic API (also used by MCP via rmcp)
+# HTTP client for Anthropic API
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Async runtime
@@ -50,17 +50,4 @@ chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.24.0"
 regex = "1.12.2"
 
-# MCP (Model Context Protocol) support
-rmcp = { version = "0.14", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 
-[[example]]
-name = "mcp_agent"
-path = "examples/mcp_agent/main.rs"
-
-[[example]]
-name = "gemini_test_agent"
-path = "examples/gemini_test_agent/main.rs"
-
-[[example]]
-name = "openai_test_agent"
-path = "examples/openai_test_agent/main.rs"

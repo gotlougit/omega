@@ -60,7 +60,7 @@ impl HookMatcher {
     /// Pattern examples:
     /// - `"Bash"` - match only Bash tool
     /// - `"Read|Write|Edit"` - match file tools
-    /// - `"^mcp__"` - match all MCP tools
+    /// - `"^Read$"` - match only the Read tool
     pub fn with_pattern<H: Hook + 'static>(pattern: &str, hook: H) -> Result<Self, regex::Error> {
         Ok(Self {
             pattern: Some(Regex::new(pattern)?),

@@ -1,58 +1,62 @@
-//! Test Agent Example - Using StandardAgent
-//!
-//! Demonstrates the standardized agent framework:
-//! - AgentConfig for configuration
-//! - StandardAgent for the agent loop
-//! - Context injections for dynamic message modification
-//! - TodoListManager for task tracking
-//! - Streaming responses (optional)
-//! - Prompt caching for cost savings (enabled by default)
-//!
-//! Read operations are pre-allowed, others will prompt the user.
+//! Picrust — A coding agent framework
 //!
 //! Run with:
-//!   cargo run --example test_agent                     # New session (with caching)
-//!   cargo run --example test_agent -- --resume         # Resume existing session
-//!   cargo run --example test_agent -- --stream         # New session with streaming
-//!   cargo run --example test_agent -- --stream --resume # Resume with streaming
-//!   cargo run --example test_agent -- --think          # Enable extended thinking
-//!   cargo run --example test_agent -- --stream --think # Streaming with thinking
-//!   cargo run --example test_agent -- --no-cache       # Disable prompt caching
+//!   cargo run                     # New session (with caching)
+//!   cargo run -- --resume         # Resume existing session
+//!   cargo run -- --stream         # New session with streaming
+//!   cargo run -- --stream --resume # Resume with streaming
+//!   cargo run -- --think          # Enable extended thinking
+//!   cargo run -- --stream --think # Streaming with thinking
+//!   cargo run -- --no-cache       # Disable prompt caching
 
-mod tools;
-
-use anyhow::{bail, Result};
 use std::env;
 use std::sync::Arc;
 
+use anyhow::{bail, Result};
 use picrust::{
     agent::{AgentConfig, StandardAgent},
     cli::ConsoleRenderer,
-    helpers::{inject_system_reminder, TodoListManager},
     hooks::{HookContext, HookEvent, HookRegistry, HookResult},
     llm::{AnthropicProvider, AuthConfig},
     runtime::AgentRuntime,
     session::{AgentSession, SessionStorage},
+    tools::{
+        AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry,
+        WriteTool,
+    },
 };
 
-/// System prompt for the test agent
+/// System prompt for the agent
 const SYSTEM_PROMPT: &str = r#"You are a helpful coding assistant with access to tools.
 
 You have the following tools available:
 - Read: Read file contents
 - Write: Write or create files
 - Bash: Execute shell commands
-- TodoWrite: Track tasks you need to perform
 
 When the user asks you to do something, use the appropriate tools.
-Use TodoWrite to track multi-step tasks and show progress.
 Be concise in your responses."#;
+
+/// Create the tool registry with all available tools
+fn create_registry() -> Result<ToolRegistry> {
+    let mut registry = ToolRegistry::new();
+
+    registry.register(ReadTool::new()?);
+    registry.register(WriteTool::new()?);
+    registry.register(BashTool::new()?);
+    registry.register(GrepTool::new()?);
+    registry.register(GlobTool::new()?);
+    registry.register(EditTool::new()?);
+    registry.register(AskUserQuestionTool::new());
+
+    Ok(registry)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
-        .with_env_filter("test_agent=info,picrust=warn")
+        .with_env_filter("picrust=warn")
         .init();
 
     // Parse command line arguments
@@ -61,30 +65,25 @@ async fn main() -> Result<()> {
 
     // Generate session ID with timestamp
     let session_id = format!(
-        "test-agent-session-{}",
+        "picrust-session-{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
 
-    println!("=== Test Agent (StandardAgent) ===");
-    println!("This agent uses the standardized agent framework.");
+    println!("=== Picrust ===");
+    println!("A coding agent powered by Claude.");
     println!("Read operations are pre-allowed. Others will require permission.");
     println!("Use --stream/-s flag to enable streaming responses.");
     println!("Use --think/-t flag to enable extended thinking.");
     println!("Prompt caching is enabled by default (use --no-cache to disable).\n");
 
     // --- Step 1: Create LLM provider with dynamic auth ---
-    println!("[Setup] Creating LLM provider with dynamic auth...");
+    println!("[Setup] Creating LLM provider...");
 
-    // Using dynamic auth provider - callback is called before each API request
-    // This demonstrates the pattern for JWT tokens that expire frequently
     let llm = Arc::new(
         AnthropicProvider::with_auth_provider(|| async {
-            // Read API key from ANTHROPIC_KEY (not ANTHROPIC_API_KEY)
-            // In production, this would fetch a fresh JWT from your auth service
             let api_key = env::var("ANTHROPIC_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_KEY environment variable not set"))?;
 
-            // Return auth config with Anthropic's default base URL
             Ok(AuthConfig::with_base_url(
                 api_key,
                 "https://api.anthropic.com/v1/messages",
@@ -96,7 +95,7 @@ async fn main() -> Result<()> {
         )
         .with_max_tokens(32000),
     );
-    println!("[Setup] Model: {} (using dynamic auth)", llm.model());
+    println!("[Setup] Model: {}", llm.model());
 
     // --- Step 2: Create runtime with global Read permission ---
     let runtime = AgentRuntime::new();
@@ -104,20 +103,15 @@ async fn main() -> Result<()> {
     println!("[Setup] Runtime created (Read tool globally allowed)");
 
     // --- Step 3: Create tool registry ---
-    let tools = Arc::new(tools::create_registry()?);
+    let tools = Arc::new(create_registry()?);
     println!("[Setup] Tools registered: {:?}", tools.tool_names());
 
-    // --- Step 4: Create TodoListManager (shared between agent and console) ---
-    let todo_manager = Arc::new(TodoListManager::new());
-    println!("[Setup] TodoListManager created");
-
-    // --- Step 5: Create hooks ---
+    // --- Step 4: Create hooks ---
     let mut hooks = HookRegistry::new();
 
     // Block dangerous Bash commands
     hooks
         .add_with_pattern(HookEvent::PreToolUse, "Bash", |ctx: &mut HookContext| {
-            println!("PreToolUse hook called with context: {:?}", ctx.tool_input.as_ref().map(|v| v.to_string()));
             let cmd = ctx
                 .tool_input
                 .as_ref()
@@ -125,28 +119,28 @@ async fn main() -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            // Block dangerous patterns
             if cmd.contains("rm ") {
                 HookResult::deny("Dangerous command blocked by safety hook")
             } else {
-                HookResult::none() // Continue with normal permission flow
+                HookResult::none()
             }
         })
         .expect("Invalid regex pattern");
 
-    // Auto-approve read-only tools (skip permission prompts)
+    // Auto-approve read-only tools
     hooks
-        .add_with_pattern(HookEvent::PreToolUse, "^(Read|Glob|Grep)$", |_ctx: &mut HookContext| {
-            HookResult::allow()
-        })
+        .add_with_pattern(
+            HookEvent::PreToolUse,
+            "^(Read|Glob|Grep)$",
+            |_ctx: &mut HookContext| HookResult::allow(),
+        )
         .expect("Invalid regex pattern");
 
     println!("[Setup] Hooks configured: dangerous command blocker, read-only auto-approve");
 
-    // --- Step 6: Create or load session ---
+    // --- Step 5: Create or load session ---
     let storage = SessionStorage::with_dir("./sessions");
     let session = if resume {
-        // Resume existing session
         if !AgentSession::exists_with_storage(&session_id, &storage) {
             bail!(
                 "Cannot resume: session '{}' does not exist. Run without --resume to create a new session.",
@@ -154,18 +148,18 @@ async fn main() -> Result<()> {
             );
         }
         let session = AgentSession::load_with_storage(&session_id, storage)?;
-        println!("[Setup] Resumed session: {} ({} messages in history)",
+        println!(
+            "[Setup] Resumed session: {} ({} messages in history)",
             session.session_id(),
             session.history().len()
         );
         session
     } else {
-        // Create new session
         let session = AgentSession::new_with_storage(
             &session_id,
-            "test-agent",
-            "Test Agent",
-            "A test agent demonstrating the StandardAgent framework",
+            "picrust",
+            "Picrust Agent",
+            "A coding agent powered by Claude",
             SYSTEM_PROMPT,
             storage,
         )?;
@@ -173,65 +167,40 @@ async fn main() -> Result<()> {
         session
     };
 
-    // --- Step 7: Configure the agent ---
-    // Clone todo_manager for the injection closure
-    let todo_for_injection = todo_manager.clone();
-
-    // Check if streaming is requested via command line
+    // --- Step 6: Configure the agent ---
     let streaming = args.iter().any(|a| a == "--stream" || a == "-s");
-    // Check if extended thinking is requested via command line
     let thinking = args.iter().any(|a| a == "--think" || a == "-t");
-    // Check if caching should be disabled (enabled by default)
     let no_cache = args.iter().any(|a| a == "--no-cache");
     let caching = !no_cache;
 
     let mut config = AgentConfig::new()
         .with_tools(tools)
-        .with_hooks(hooks) // Add hooks for safety and auto-approval
-        .with_debug(true) // Enable debug logging
-        .with_streaming(streaming) // Enable streaming if --stream flag is passed
-        .with_prompt_caching(caching); // Enable/disable prompt caching
+        .with_hooks(hooks)
+        .with_debug(true)
+        .with_streaming(streaming)
+        .with_prompt_caching(caching);
 
-    // Enable extended thinking if --think flag is passed
     if thinking {
-        config = config.with_thinking(16000); // 16k token budget for thinking
+        config = config.with_thinking(16000);
     }
 
-    let config = config.with_injection_fn("todo_status", move |_internals, mut messages| {
-            // Only inject reminder if todo list is empty
-            if todo_for_injection.is_empty() {
-                inject_system_reminder(
-                    &mut messages,
-                    "The TodoWrite tool hasn't been used yet. If you're working on tasks that would benefit from tracking progress, consider using the TodoWrite tool to track progress. Only use it if it's relevant to the current work.",
-                );
-            }
-            messages
-        });
-
     println!(
-        "[Setup] AgentConfig created with debug logging, hooks{}{}{} and todo reminder injection",
+        "[Setup] AgentConfig created with debug logging, hooks{}{}{}",
         if streaming { ", streaming enabled" } else { "" },
         if thinking { ", extended thinking enabled" } else { "" },
         if caching { ", prompt caching enabled" } else { ", prompt caching disabled" }
     );
 
-    // --- Step 8: Create StandardAgent ---
+    // --- Step 7: Create and spawn the agent ---
     let agent = StandardAgent::new(config, llm);
 
-    // --- Step 9: Spawn the agent ---
     println!("[Setup] Spawning agent...");
-    let todo_for_context = todo_manager.clone();
     let handle = runtime
-        .spawn(session, move |mut internals| {
-            // Insert TodoListManager into context for TodoWriteTool
-            // Use insert_resource_arc since todo_for_context is already Arc-wrapped
-            internals.context.insert_resource_arc(todo_for_context);
-            agent.run(internals)
-        })
+        .spawn(session, move |internals| agent.run(internals))
         .await;
     println!("[Setup] Agent spawned!");
 
-    // --- Step 10: Create and run the console renderer ---
+    // --- Step 8: Run the console renderer ---
     println!("[Setup] Starting console renderer...");
     println!();
     println!("Type your requests below. Read/Glob/Grep are auto-approved by hooks.");
@@ -245,10 +214,8 @@ async fn main() -> Result<()> {
 
     let renderer = ConsoleRenderer::new(handle)
         .show_thinking(true)
-        .show_tools(true)
-        .with_todo_manager(todo_manager);
+        .show_tools(true);
 
-    // Run the console - this blocks until user types "exit"
     renderer.run().await?;
 
     // --- Cleanup ---

@@ -64,7 +64,7 @@ pub trait LlmProvider: Send + Sync {
     /// Get the current model name.
     fn model(&self) -> String;
 
-    /// Get the provider name (e.g., "anthropic", "gemini").
+    /// Get the provider name (e.g., "anthropic").
     fn provider_name(&self) -> &str;
 
     /// Create a lightweight variant of this provider with a different model and max tokens.
