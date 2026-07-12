@@ -179,12 +179,7 @@ mod tests {
 
     #[test]
     fn test_root_metadata() {
-        let meta = SessionMetadata::new(
-            "session_123",
-            "coder",
-            "My Coder",
-            "A coding agent",
-        );
+        let meta = SessionMetadata::new("session_123", "coder", "My Coder", "A coding agent");
 
         assert_eq!(meta.session_id, "session_123");
         assert_eq!(meta.agent_type, "coder");
@@ -232,10 +227,7 @@ mod tests {
             meta.get_custom("key1").and_then(|v| v.as_str()),
             Some("value1")
         );
-        assert_eq!(
-            meta.get_custom("key2").and_then(|v| v.as_i64()),
-            Some(42)
-        );
+        assert_eq!(meta.get_custom("key2").and_then(|v| v.as_i64()), Some(42));
     }
 
     #[test]

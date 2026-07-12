@@ -40,8 +40,7 @@ use super::types::{
     ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
     ContentBlockStopEvent, ContentDelta, DeltaUsage, Message, MessageContent, MessageDeltaData,
     MessageDeltaEvent, MessageResponse, MessageStartData, MessageStartEvent, StopReason,
-    StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice,
-    ToolDefinition, Usage,
+    StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice, ToolDefinition, Usage,
 };
 
 const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -55,15 +54,9 @@ const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 #[serde(untagged)]
 enum OpenAIMessage {
     /// System message
-    System {
-        role: String,
-        content: String,
-    },
+    System { role: String, content: String },
     /// User message
-    User {
-        role: String,
-        content: String,
-    },
+    User { role: String, content: String },
     /// Assistant message (may include tool_calls)
     Assistant {
         role: String,
@@ -260,12 +253,11 @@ impl OpenAIProvider {
     pub fn from_env() -> Result<Self> {
         tracing::info!("Creating OpenAI provider from environment");
 
-        let api_key = env::var("OPENAI_API_KEY")
-            .context("OPENAI_API_KEY environment variable not set")?;
+        let api_key =
+            env::var("OPENAI_API_KEY").context("OPENAI_API_KEY environment variable not set")?;
 
         let base_url = env::var("OPENAI_BASE_URL").ok();
-        let model = env::var("OPENAI_MODEL")
-            .unwrap_or_else(|_| "gpt-4o".to_string());
+        let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
         let max_tokens = env::var("OPENAI_MAX_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -395,10 +387,7 @@ impl OpenAIProvider {
             .get_auth()
             .await
             .context("Failed to get authentication credentials")?;
-        let api_url = auth_config
-            .base_url
-            .as_deref()
-            .unwrap_or(DEFAULT_API_URL);
+        let api_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
 
         let body = serde_json::to_string(request)?;
 
@@ -438,10 +427,7 @@ impl OpenAIProvider {
             .get_auth()
             .await
             .context("Failed to get authentication credentials")?;
-        let api_url = auth_config
-            .base_url
-            .as_deref()
-            .unwrap_or(DEFAULT_API_URL);
+        let api_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
 
         let mut req_body = serde_json::to_value(request)?;
         req_body["stream"] = json!(true);
@@ -672,8 +658,13 @@ impl LlmProvider for OpenAIProvider {
         system_prompt: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<String> {
-        self.send_message(user_message, conversation_history, system_prompt, session_id)
-            .await
+        self.send_message(
+            user_message,
+            conversation_history,
+            system_prompt,
+            session_id,
+        )
+        .await
     }
 
     async fn send_with_tools_and_system(
@@ -872,7 +863,9 @@ fn convert_to_openai_messages(msg: &Message, out: &mut Vec<OpenAIMessage>) {
                         ContentBlock::Text { text, .. } => {
                             text_content = Some(text.clone());
                         }
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push(OpenAIToolCall {
                                 id: id.clone(),
                                 call_type: "function".to_string(),
@@ -978,8 +971,7 @@ fn convert_response_to_internal(response: OpenAIResponse) -> Result<MessageRespo
     // Tool calls
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
-            let input: Value = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or(json!({}));
+            let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
             content.push(ContentBlock::ToolUse {
                 id: tc.id,
                 name: tc.function.name,
@@ -989,16 +981,13 @@ fn convert_response_to_internal(response: OpenAIResponse) -> Result<MessageRespo
         }
     }
 
-    let stop_reason = choice
-        .finish_reason
-        .as_deref()
-        .and_then(|r| match r {
-            "stop" => Some(StopReason::EndTurn),
-            "length" => Some(StopReason::MaxTokens),
-            "tool_calls" => Some(StopReason::ToolUse),
-            "content_filter" => Some(StopReason::Refusal),
-            _ => Some(StopReason::EndTurn),
-        });
+    let stop_reason = choice.finish_reason.as_deref().and_then(|r| match r {
+        "stop" => Some(StopReason::EndTurn),
+        "length" => Some(StopReason::MaxTokens),
+        "tool_calls" => Some(StopReason::ToolUse),
+        "content_filter" => Some(StopReason::Refusal),
+        _ => Some(StopReason::EndTurn),
+    });
 
     let usage = response.usage.unwrap_or(OpenAIUsage {
         prompt_tokens: 0,

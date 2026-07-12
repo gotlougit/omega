@@ -347,16 +347,11 @@ pub enum ContentBlock {
 
     /// Thinking block (for extended thinking)
     #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
+    Thinking { thinking: String, signature: String },
 
     /// Redacted thinking block
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking {
-        data: String,
-    },
+    RedactedThinking { data: String },
 
     /// Image block
     #[serde(rename = "image")]
@@ -418,7 +413,11 @@ impl ContentBlock {
     }
 
     /// Create a tool result content block
-    pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         ContentBlock::ToolResult {
             tool_use_id: tool_use_id.into(),
             content: Some(content.into()),
@@ -461,16 +460,24 @@ impl ContentBlock {
     /// Add cache control to this content block (if applicable)
     pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
         match &mut self {
-            ContentBlock::Text { cache_control: cc, .. } => {
+            ContentBlock::Text {
+                cache_control: cc, ..
+            } => {
                 *cc = Some(cache_control);
             }
-            ContentBlock::ToolResult { cache_control: cc, .. } => {
+            ContentBlock::ToolResult {
+                cache_control: cc, ..
+            } => {
                 *cc = Some(cache_control);
             }
-            ContentBlock::Image { cache_control: cc, .. } => {
+            ContentBlock::Image {
+                cache_control: cc, ..
+            } => {
                 *cc = Some(cache_control);
             }
-            ContentBlock::Document { cache_control: cc, .. } => {
+            ContentBlock::Document {
+                cache_control: cc, ..
+            } => {
                 *cc = Some(cache_control);
             }
             _ => {
@@ -491,7 +498,9 @@ impl ContentBlock {
     /// Get the tool use info if this is a tool use block
     pub fn as_tool_use(&self) -> Option<(&str, &str, &Value)> {
         match self {
-            ContentBlock::ToolUse { id, name, input, .. } => Some((id.as_str(), name.as_str(), input)),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id.as_str(), name.as_str(), input)),
             _ => None,
         }
     }
@@ -765,7 +774,9 @@ impl MessageResponse {
 
     /// Check if the response contains tool use
     pub fn has_tool_use(&self) -> bool {
-        self.content.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        self.content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
     }
 
     /// Check if the model wants to stop
@@ -1012,13 +1023,19 @@ pub enum RawStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: MessageStartData },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: usize, content_block: ContentBlockStart },
+    ContentBlockStart {
+        index: usize,
+        content_block: ContentBlockStart,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: ContentDelta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: usize },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: MessageDeltaData, usage: DeltaUsage },
+    MessageDelta {
+        delta: MessageDeltaData,
+        usage: DeltaUsage,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "ping")]
@@ -1034,9 +1051,13 @@ impl RawStreamEvent {
             RawStreamEvent::MessageStart { message } => {
                 StreamEvent::MessageStart(MessageStartEvent { message })
             }
-            RawStreamEvent::ContentBlockStart { index, content_block } => {
-                StreamEvent::ContentBlockStart(ContentBlockStartEvent { index, content_block })
-            }
+            RawStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index,
+                content_block,
+            }),
             RawStreamEvent::ContentBlockDelta { index, delta } => {
                 StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent { index, delta })
             }
@@ -1048,12 +1069,10 @@ impl RawStreamEvent {
             }
             RawStreamEvent::MessageStop => StreamEvent::MessageStop,
             RawStreamEvent::Ping => StreamEvent::Ping,
-            RawStreamEvent::Error { error } => {
-                StreamEvent::Error(StreamError {
-                    error_type: "error".to_string(),
-                    error,
-                })
-            }
+            RawStreamEvent::Error { error } => StreamEvent::Error(StreamError {
+                error_type: "error".to_string(),
+                error,
+            }),
         }
     }
 }

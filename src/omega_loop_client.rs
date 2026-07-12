@@ -118,38 +118,62 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                         .map(|s| OutputChunk::ThinkingComplete(s.to_string()))
                         .unwrap_or(OutputChunk::Unknown),
                     "ToolStart" => {
-                        let id = inner.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = inner.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let id = inner
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = inner
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let input = inner.get("input").cloned().unwrap_or(Value::Null);
                         OutputChunk::ToolStart { id, name, input }
                     }
                     "ToolProgress" => {
-                        let id = inner.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let output = inner.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let id = inner
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let output = inner
+                            .get("output")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         OutputChunk::ToolProgress { id, output }
                     }
                     "ToolEnd" => {
-                        let id = inner.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let result = parse_tool_result(inner.get("result"))
-                            .unwrap_or_else(|| ToolResultWire {
+                        let id = inner
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let result = parse_tool_result(inner.get("result")).unwrap_or_else(|| {
+                            ToolResultWire {
                                 text: String::new(),
                                 is_error: false,
                                 content: None,
-                            });
+                            }
+                        });
                         OutputChunk::ToolEnd { id, result }
                     }
                     "AskUserQuestion" => {
-                        let request_id = inner.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let request_id = inner
+                            .get("request_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let questions = inner
                             .get("questions")
                             .and_then(|a| a.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(parse_user_question)
-                                    .collect()
-                            })
+                            .map(|arr| arr.iter().filter_map(parse_user_question).collect())
                             .unwrap_or_default();
-                        OutputChunk::AskUserQuestion { request_id, questions }
+                        OutputChunk::AskUserQuestion {
+                            request_id,
+                            questions,
+                        }
                     }
                     "Status" => inner
                         .as_str()
@@ -171,7 +195,10 @@ fn parse_chunk(val: &Value) -> OutputChunk {
 
 fn parse_tool_result(val: Option<&Value>) -> Option<ToolResultWire> {
     let val = val?;
-    let is_error = val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_error = val
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Extract text from the serde externally-tagged ToolResultData::Text variant.
     let text = val
@@ -214,7 +241,10 @@ fn parse_user_question(val: &Value) -> Option<UserQuestionWire> {
                 })
             })
             .collect(),
-        multi_select: val.get("multi_select").and_then(|v| v.as_bool()).unwrap_or(false),
+        multi_select: val
+            .get("multi_select")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -222,13 +252,10 @@ impl ServerEvent {
     /// Parse a line of JSON received from the daemon.
     pub fn from_json_line(line: &str) -> Result<Self> {
         let val: Value = serde_json::from_str(line)?;
-        let obj = val.as_object().ok_or_else(|| {
-            anyhow::anyhow!("Server event is not a JSON object")
-        })?;
-        let type_name = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let obj = val
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Server event is not a JSON object"))?;
+        let type_name = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match type_name {
             "Created" => Ok(ServerEvent::Created {
                 session_id: obj

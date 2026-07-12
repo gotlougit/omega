@@ -10,11 +10,7 @@ pub fn init_logging() -> Result<()> {
     std::fs::create_dir_all("logs")?;
 
     // File appender - daily rotation in logs/ folder
-    let file_appender = RollingFileAppender::new(
-        Rotation::DAILY,
-        "logs",
-        "agent.log",
-    );
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "agent.log");
 
     // Create file layer
     let file_layer = fmt::layer()
@@ -26,8 +22,7 @@ pub fn init_logging() -> Result<()> {
 
     // Set up environment filter
     // Default to INFO level, can be overridden with RUST_LOG env var
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Combine layers - only file layer, no stdout
     tracing_subscriber::registry()

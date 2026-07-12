@@ -90,7 +90,9 @@ impl ToolRegistry {
 
         self.tools.retain(|name, _| {
             // Keep static tools, remove provider tools
-            !provider_names.iter().any(|p| name.starts_with(&format!("{}:", p)))
+            !provider_names
+                .iter()
+                .any(|p| name.starts_with(&format!("{}:", p)))
         });
 
         // Re-add tools from all providers
@@ -144,11 +146,7 @@ impl ToolRegistry {
 
         let result = tool.execute(input, internals).await?;
 
-        tracing::debug!(
-            "Tool {} completed. Is error: {}",
-            name,
-            result.is_error
-        );
+        tracing::debug!("Tool {} completed. Is error: {}", name, result.is_error);
 
         Ok(result)
     }

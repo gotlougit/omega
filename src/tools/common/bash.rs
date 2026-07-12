@@ -42,9 +42,7 @@ struct BashInput {
 impl BashTool {
     /// Create a new Bash tool with the current directory as working directory
     pub fn new() -> Result<Self> {
-        let working_dir = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
+        let working_dir = std::env::current_dir()?.to_string_lossy().to_string();
 
         Ok(Self { working_dir })
     }
@@ -75,10 +73,7 @@ impl BashTool {
         let output = match timeout(duration, output_future).await {
             Ok(result) => result?,
             Err(_) => {
-                return Ok((
-                    format!("Command timed out after {}ms", timeout_ms),
-                    -1,
-                ));
+                return Ok((format!("Command timed out after {}ms", timeout_ms), -1));
             }
         };
 
@@ -196,7 +191,9 @@ impl Tool for BashTool {
             Ok((output, exit_code)) => {
                 if exit_code == 0 {
                     if output.is_empty() {
-                        Ok(ToolResult::success("Command completed successfully (no output)"))
+                        Ok(ToolResult::success(
+                            "Command completed successfully (no output)",
+                        ))
                     } else {
                         Ok(ToolResult::success(output))
                     }
@@ -207,7 +204,10 @@ impl Tool for BashTool {
                     )))
                 }
             }
-            Err(e) => Ok(ToolResult::error(format!("Failed to execute command: {}", e))),
+            Err(e) => Ok(ToolResult::error(format!(
+                "Failed to execute command: {}",
+                e
+            ))),
         }
     }
 

@@ -9,8 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::types::{
-    Message, MessageResponse, StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice,
-    ToolDefinition,
+    Message, MessageResponse, StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice, ToolDefinition,
 };
 
 /// Trait for LLM providers that can be used with StandardAgent.

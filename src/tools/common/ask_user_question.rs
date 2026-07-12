@@ -233,10 +233,13 @@ impl Tool for AskUserQuestionTool {
             Err(crate::core::FrameworkError::Shutdown) => {
                 Ok(ToolResult::error("Shutdown requested"))
             }
-            Err(crate::core::FrameworkError::ChannelClosed) => {
-                Ok(ToolResult::error("Connection closed before receiving response"))
-            }
-            Err(e) => Ok(ToolResult::error(format!("Failed to get user response: {}", e))),
+            Err(crate::core::FrameworkError::ChannelClosed) => Ok(ToolResult::error(
+                "Connection closed before receiving response",
+            )),
+            Err(e) => Ok(ToolResult::error(format!(
+                "Failed to get user response: {}",
+                e
+            ))),
         }
     }
 

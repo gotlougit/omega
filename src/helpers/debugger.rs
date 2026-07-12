@@ -192,7 +192,10 @@ impl Debugger {
         let writer = BufWriter::new(file);
         serde_json::to_writer_pretty(writer, &event)?;
 
-        tracing::debug!("[Debugger] Logged API request #{} (with cache_control)", seq);
+        tracing::debug!(
+            "[Debugger] Logged API request #{} (with cache_control)",
+            seq
+        );
         Ok(())
     }
 
@@ -245,7 +248,12 @@ impl Debugger {
     }
 
     /// Log a tool result
-    pub fn log_tool_result(&self, tool_name: &str, tool_id: &str, result: &ToolResult) -> Result<()> {
+    pub fn log_tool_result(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        result: &ToolResult,
+    ) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -259,7 +267,11 @@ impl Debugger {
             ToolResultData::Image { data, media_type } => {
                 format!("Image ({}, {} bytes)", media_type, data.len())
             }
-            ToolResultData::Document { description, data, media_type } => {
+            ToolResultData::Document {
+                description,
+                data,
+                media_type,
+            } => {
                 format!("{} ({}, {} bytes)", description, media_type, data.len())
             }
         };

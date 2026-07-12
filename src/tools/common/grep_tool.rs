@@ -74,9 +74,7 @@ struct GrepInput {
 impl GrepTool {
     /// Create a new Grep tool with the current directory as base
     pub fn new() -> Result<Self> {
-        let base_dir = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
+        let base_dir = std::env::current_dir()?.to_string_lossy().to_string();
 
         Ok(Self { base_dir })
     }
@@ -287,10 +285,7 @@ impl Tool for GrepTool {
     }
 
     fn get_info(&self, input: &Value) -> ToolInfo {
-        let pattern = input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
 
         ToolInfo {
             name: "Grep".to_string(),

@@ -229,7 +229,9 @@ impl HookRegistry {
 
             // Optionally short-circuit on Deny (if enabled in config)
             if short_circuit && combined.decision == Some(PermissionDecision::Deny) {
-                tracing::debug!("[HookRegistry] Short-circuiting on Deny (remaining hooks skipped)");
+                tracing::debug!(
+                    "[HookRegistry] Short-circuiting on Deny (remaining hooks skipped)"
+                );
                 break;
             }
         }
@@ -277,7 +279,8 @@ mod tests {
     #[test]
     fn test_hook_matcher_pattern() {
         let matcher =
-            HookMatcher::with_pattern("Bash|Shell", |_ctx: &mut HookContext| HookResult::none()).unwrap();
+            HookMatcher::with_pattern("Bash|Shell", |_ctx: &mut HookContext| HookResult::none())
+                .unwrap();
 
         assert!(matcher.matches("Bash"));
         assert!(matcher.matches("Shell"));
@@ -323,7 +326,9 @@ mod tests {
     fn test_registry_add() {
         let mut registry = HookRegistry::new();
 
-        registry.add(HookEvent::PreToolUse, |_ctx: &mut HookContext| HookResult::none());
+        registry.add(HookEvent::PreToolUse, |_ctx: &mut HookContext| {
+            HookResult::none()
+        });
         registry
             .add_with_pattern(HookEvent::PreToolUse, "Bash", |_ctx: &mut HookContext| {
                 HookResult::deny("blocked")

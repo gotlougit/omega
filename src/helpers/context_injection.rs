@@ -187,7 +187,10 @@ impl Default for InjectionChain {
 /// ```
 pub fn inject_system_reminder(messages: &mut Vec<Message>, reminder: &str) {
     if let Some(last_msg) = messages.last_mut() {
-        let reminder_text = format!("\n<vibe-working-agent-systemreminder>\n{}\n</vibe-working-agent-systemreminder>", reminder);
+        let reminder_text = format!(
+            "\n<vibe-working-agent-systemreminder>\n{}\n</vibe-working-agent-systemreminder>",
+            reminder
+        );
         last_msg.append_text(&reminder_text);
     }
 }

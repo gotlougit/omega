@@ -66,8 +66,13 @@ struct OmegaToolResult {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum OmegaContent {
-    Text { data: String },
-    Image { data: String, media_type: String },
+    Text {
+        data: String,
+    },
+    Image {
+        data: String,
+        media_type: String,
+    },
     Document {
         data: String,
         media_type: String,
@@ -182,22 +187,27 @@ mod tools {
                 ok_text(&result)
             }
         } else {
-            err(format!("Command failed with exit code {exit_code}\n{result}"))
+            err(format!(
+                "Command failed with exit code {exit_code}\n{result}"
+            ))
         }
     }
 
     /// Read a file — dispatches by extension.
     pub async fn read(args: &Value) -> OmegaToolResult {
-        let file_path = args
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         if file_path.is_empty() {
             return err("Missing required field: file_path");
         }
 
-        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let path = Path::new(file_path);
 
@@ -306,14 +316,8 @@ mod tools {
 
     /// Write content to a file, creating parent directories as needed.
     pub async fn write(args: &Value) -> OmegaToolResult {
-        let file_path = args
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let content = args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
         if file_path.is_empty() {
             return err("Missing required field: file_path");
@@ -343,10 +347,7 @@ mod tools {
 
     /// Exact-string replacement in a file.
     pub async fn edit(args: &Value) -> OmegaToolResult {
-        let file_path = args
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         let old_string = args
             .get("old_string")
             .and_then(|v| v.as_str())
@@ -408,10 +409,7 @@ mod tools {
 
     /// Search files by glob pattern (sorted by mtime, newest first).
     pub async fn glob(args: &Value) -> OmegaToolResult {
-        let pattern = args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
         if pattern.is_empty() {
             return err("Missing required field: pattern");
         }
@@ -433,9 +431,7 @@ mod tools {
                 .filter_map(|entry| entry.ok())
                 .filter_map(|path| {
                     let mtime = path.metadata().ok()?.modified().ok()?;
-                    let display = path
-                        .to_string_lossy()
-                        .to_string();
+                    let display = path.to_string_lossy().to_string();
                     Some((display, mtime))
                 })
                 .collect(),
@@ -449,10 +445,7 @@ mod tools {
             return ok_text(format!("No files found matching pattern: {pattern}"));
         }
 
-        let mut result = format!(
-            "Found {} files matching '{pattern}':\n",
-            entries.len()
-        );
+        let mut result = format!("Found {} files matching '{pattern}':\n", entries.len());
         for (path, _) in entries.iter().take(100) {
             result.push_str(&format!("{path}\n"));
         }
@@ -464,10 +457,7 @@ mod tools {
 
     /// Search file contents with ripgrep.
     pub async fn grep(args: &Value) -> OmegaToolResult {
-        let pattern = args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
         if pattern.is_empty() {
             return err("Missing required field: pattern");
         }
@@ -493,9 +483,18 @@ mod tools {
         let line_numbers = args.get("-n").and_then(|v| v.as_bool()).unwrap_or(true);
         let case_insensitive = args.get("-i").and_then(|v| v.as_bool()).unwrap_or(false);
         let file_type = args.get("type").and_then(|v| v.as_str());
-        let multiline = args.get("multiline").and_then(|v| v.as_bool()).unwrap_or(false);
-        let head_limit = args.get("head_limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-        let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let multiline = args
+            .get("multiline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let head_limit = args
+            .get("head_limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let mut cmd = Command::new("rg");
         cmd.arg(pattern).arg(&search_path);
@@ -538,7 +537,12 @@ mod tools {
         }
         cmd.arg("--color=never");
 
-        let output = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).output().await {
+        let output = match cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+        {
             Ok(o) => o,
             Err(e) => return err(format!("Failed to run ripgrep: {e}")),
         };
@@ -577,18 +581,14 @@ mod tools {
 
     fn ok_text(t: impl Into<String>) -> OmegaToolResult {
         OmegaToolResult {
-            content: OmegaContent::Text {
-                data: t.into(),
-            },
+            content: OmegaContent::Text { data: t.into() },
             is_error: false,
         }
     }
 
     fn err(m: impl Into<String>) -> OmegaToolResult {
         OmegaToolResult {
-            content: OmegaContent::Text {
-                data: m.into(),
-            },
+            content: OmegaContent::Text { data: m.into() },
             is_error: true,
         }
     }
@@ -600,12 +600,11 @@ mod tools {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let socket_path = std::env::var("OMEGA_SOCKET_PATH")
-        .unwrap_or_else(|_| "/tmp/omega-sh.sock".to_string());
+    let socket_path =
+        std::env::var("OMEGA_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-sh.sock".to_string());
 
     // Clean up leftover socket
     let _ = std::fs::remove_file(&socket_path);

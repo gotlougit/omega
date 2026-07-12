@@ -208,15 +208,9 @@ mod tests {
     fn create_test_handle(session_id: &str) -> (AgentHandle, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let storage = SessionStorage::with_dir(temp_dir.path());
-        let session = AgentSession::new_with_storage(
-            session_id,
-            "test-agent",
-            "Test",
-            "Test",
-            "",
-            storage,
-        )
-        .unwrap();
+        let session =
+            AgentSession::new_with_storage(session_id, "test-agent", "Test", "Test", "", storage)
+                .unwrap();
         let session = Arc::new(TokioRwLock::new(session));
 
         let (input_tx, _input_rx, output_tx) = create_agent_channels();

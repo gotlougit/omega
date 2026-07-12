@@ -110,9 +110,7 @@ async fn main() -> Result<()> {
         }
 
         // Send to omega-loop
-        client
-            .send_run(&session_id, &input, &config)
-            .await?;
+        client.send_run(&session_id, &input, &config).await?;
 
         // Read and display events
         loop {

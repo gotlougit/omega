@@ -402,10 +402,7 @@ mod tests {
         ctx.set_metadata("key2", serde_json::json!(42));
 
         assert_eq!(ctx.get_metadata_str("key1"), Some("value1"));
-        assert_eq!(
-            ctx.get_metadata("key2").and_then(|v| v.as_i64()),
-            Some(42)
-        );
+        assert_eq!(ctx.get_metadata("key2").and_then(|v| v.as_i64()), Some(42));
         assert!(ctx.has_metadata("key1"));
         assert!(!ctx.has_metadata("nonexistent"));
 

@@ -12,8 +12,10 @@ use tokio::sync::RwLock;
 
 use std::collections::HashMap;
 
-use crate::core::{AgentContext, AgentState, FrameworkError, FrameworkResult, InputMessage, OutputChunk};
 use crate::core::output::UserQuestion;
+use crate::core::{
+    AgentContext, AgentState, FrameworkError, FrameworkResult, InputMessage, OutputChunk,
+};
 use crate::permissions::{CheckResult, PermissionManager, PermissionRule, PermissionScope};
 use crate::session::AgentSession;
 
@@ -235,7 +237,11 @@ impl AgentInternals {
     }
 
     /// Set state to ExecutingTool
-    pub async fn set_executing_tool(&self, tool_name: impl Into<String>, tool_use_id: impl Into<String>) {
+    pub async fn set_executing_tool(
+        &self,
+        tool_name: impl Into<String>,
+        tool_use_id: impl Into<String>,
+    ) {
         self.set_state(AgentState::ExecutingTool {
             tool_name: tool_name.into(),
             tool_use_id: tool_use_id.into(),
@@ -396,7 +402,10 @@ impl AgentInternals {
 
         // Wait for response
         match self.receive().await {
-            Some(InputMessage::UserQuestionResponse { request_id: resp_id, answers }) => {
+            Some(InputMessage::UserQuestionResponse {
+                request_id: resp_id,
+                answers,
+            }) => {
                 if resp_id == request_id {
                     Ok(answers)
                 } else {
@@ -415,7 +424,9 @@ impl AgentInternals {
             Some(InputMessage::Interrupt) => Err(FrameworkError::Interrupted),
             Some(InputMessage::Shutdown) => Err(FrameworkError::Shutdown),
             None => Err(FrameworkError::ChannelClosed),
-            _ => Err(FrameworkError::Other("Unexpected message while waiting for user response".into())),
+            _ => Err(FrameworkError::Other(
+                "Unexpected message while waiting for user response".into(),
+            )),
         }
     }
 
@@ -528,8 +539,7 @@ impl AgentInternals {
 
     /// Get a subagent's handle by session ID
     pub fn get_subagent(&self, session_id: &str) -> Option<super::AgentHandle> {
-        self.subagent_manager()
-            .and_then(|m| m.get(session_id))
+        self.subagent_manager().and_then(|m| m.get(session_id))
     }
 
     /// List all active subagent session IDs
@@ -585,7 +595,11 @@ mod tests {
     use crate::session::SessionStorage;
     use tempfile::TempDir;
 
-    fn create_test_internals() -> (AgentInternals, super::super::channels::InputSender, super::super::channels::OutputReceiver) {
+    fn create_test_internals() -> (
+        AgentInternals,
+        super::super::channels::InputSender,
+        super::super::channels::OutputReceiver,
+    ) {
         let (input_tx, input_rx, output_tx) = create_agent_channels();
         let output_rx = output_tx.subscribe();
         let state = Arc::new(RwLock::new(AgentState::Idle));
@@ -602,18 +616,14 @@ mod tests {
         )
         .unwrap();
 
-        let context = AgentContext::new(
-            "test-session",
-            "test-agent",
-            "Test Agent",
-            "A test agent",
-        );
+        let context = AgentContext::new("test-session", "test-agent", "Test Agent", "A test agent");
 
         let global_permissions = Arc::new(GlobalPermissions::new());
         let permissions = PermissionManager::new(global_permissions, "test-agent");
 
         let session = Arc::new(RwLock::new(session));
-        let internals = AgentInternals::new(session, context, permissions, input_rx, output_tx, state);
+        let internals =
+            AgentInternals::new(session, context, permissions, input_rx, output_tx, state);
 
         (internals, input_tx, output_rx)
     }
@@ -655,7 +665,10 @@ mod tests {
 
         // Should have sent state change notification
         let chunk = output_rx.recv().await.unwrap();
-        assert!(matches!(chunk, OutputChunk::StateChange(AgentState::Processing)));
+        assert!(matches!(
+            chunk,
+            OutputChunk::StateChange(AgentState::Processing)
+        ));
     }
 
     #[tokio::test]
@@ -666,11 +679,8 @@ mod tests {
         assert!(matches!(internals.state().await, AgentState::Processing));
 
         // Should NOT have sent notification - verify by trying to receive with timeout
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            output_rx.recv(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_millis(10), output_rx.recv()).await;
         assert!(result.is_err()); // Timeout means no message
     }
 

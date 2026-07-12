@@ -6,8 +6,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::core::FrameworkResult;
 use crate::core::error::FrameworkError;
+use crate::core::FrameworkResult;
 use crate::llm::Message;
 
 use super::metadata::SessionMetadata;
@@ -68,9 +68,10 @@ impl SessionStorage {
     pub fn load_system_prompt(&self, session_id: &str) -> FrameworkResult<String> {
         let path = self.system_prompt_path(session_id);
         if !path.exists() {
-            return Err(crate::core::error::FrameworkError::Other(
-                format!("system_prompt.md not found for session '{}'", session_id),
-            ));
+            return Err(crate::core::error::FrameworkError::Other(format!(
+                "system_prompt.md not found for session '{}'",
+                session_id
+            )));
         }
         Ok(fs::read_to_string(&path)?)
     }
@@ -331,8 +332,12 @@ mod tests {
         let (storage, _temp) = create_test_storage();
 
         // Create a few sessions
-        storage.save_metadata(&SessionMetadata::new("session1", "coder", "S1", "D1")).unwrap();
-        storage.save_metadata(&SessionMetadata::new("session2", "researcher", "S2", "D2")).unwrap();
+        storage
+            .save_metadata(&SessionMetadata::new("session1", "coder", "S1", "D1"))
+            .unwrap();
+        storage
+            .save_metadata(&SessionMetadata::new("session2", "researcher", "S2", "D2"))
+            .unwrap();
 
         let sessions = storage.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
@@ -358,12 +363,19 @@ mod tests {
 
         // Create a top-level session
         storage
-            .save_metadata(&SessionMetadata::new("parent1", "main", "Parent", "A parent"))
+            .save_metadata(&SessionMetadata::new(
+                "parent1", "main", "Parent", "A parent",
+            ))
             .unwrap();
 
         // Create another top-level session
         storage
-            .save_metadata(&SessionMetadata::new("parent2", "main", "Parent 2", "Another parent"))
+            .save_metadata(&SessionMetadata::new(
+                "parent2",
+                "main",
+                "Parent 2",
+                "Another parent",
+            ))
             .unwrap();
 
         // Create a subagent session
@@ -404,7 +416,12 @@ mod tests {
 
         // Create sessions
         storage
-            .save_metadata(&SessionMetadata::new("main1", "coder", "Main 1", "First main"))
+            .save_metadata(&SessionMetadata::new(
+                "main1",
+                "coder",
+                "Main 1",
+                "First main",
+            ))
             .unwrap();
         storage
             .save_metadata(&SessionMetadata::new_subagent(

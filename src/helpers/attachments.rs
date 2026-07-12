@@ -75,10 +75,7 @@ pub fn process_attachments(input: &str, base_dir: &str) -> Vec<ContentBlock> {
                 }
                 Err(e) => {
                     // On error, add a text block describing the error
-                    let error_text = format!(
-                        "Error: Cannot read file {} - {}",
-                        file_path, e
-                    );
+                    let error_text = format!("Error: Cannot read file {} - {}", file_path, e);
                     tracing::warn!("[Attachments] {}", error_text);
                     blocks.push(ContentBlock::Text {
                         text: error_text,
@@ -126,10 +123,7 @@ fn resolve_path(path: &str, base_dir: &str) -> String {
     if path_obj.is_absolute() {
         path.to_string()
     } else {
-        Path::new(base_dir)
-            .join(path)
-            .to_string_lossy()
-            .to_string()
+        Path::new(base_dir).join(path).to_string_lossy().to_string()
     }
 }
 
@@ -155,10 +149,7 @@ fn read_text_file(resolved_path: &str, original_path: &str) -> Result<Vec<Conten
     }
 
     if end < total_lines {
-        result.push_str(&format!(
-            "\n... ({} more lines)\n",
-            total_lines - end
-        ));
+        result.push_str(&format!("\n... ({} more lines)\n", total_lines - end));
     }
 
     Ok(vec![ContentBlock::Text {
@@ -266,12 +257,10 @@ fn read_directory(resolved_path: &str, original_path: &str) -> Result<Vec<Conten
     }
 
     // Sort: directories first, then files, alphabetically within each group
-    items.sort_by(|a, b| {
-        match (a.1, b.1) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.cmp(&b.0),
-        }
+    items.sort_by(|a, b| match (a.1, b.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.cmp(&b.0),
     });
 
     let item_count = items.len();

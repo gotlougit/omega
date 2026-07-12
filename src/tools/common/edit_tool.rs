@@ -36,9 +36,7 @@ struct EditInput {
 impl EditTool {
     /// Create a new Edit tool with the current directory as base
     pub fn new() -> Result<Self> {
-        let base_dir = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
+        let base_dir = std::env::current_dir()?.to_string_lossy().to_string();
 
         Ok(Self { base_dir })
     }

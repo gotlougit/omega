@@ -20,8 +20,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::env;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -33,8 +33,8 @@ use tracing_subscriber::EnvFilter;
 use picrust::{
     agent::{AgentConfig, StandardAgent},
     llm::{AuthConfig, LlmProvider, OpenAIProvider},
-    omega_client::OmegaClient,
     omega_client::proxy::{BashProxy, EditProxy, GlobProxy, GrepProxy, ReadProxy, WriteProxy},
+    omega_client::OmegaClient,
     runtime::{AgentHandle, AgentRuntime},
     session::{AgentSession, SessionStorage},
     tools::{AskUserQuestionTool, ToolRegistry},
@@ -91,10 +91,7 @@ fn create_llm_provider() -> Arc<dyn LlmProvider> {
                 .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
             Ok(AuthConfig::with_base_url(api_key, base_url))
         })
-        .with_model(
-            env::var("OPENAI_MODEL")
-                .unwrap_or_else(|_| "gpt-4o".to_string()),
-        )
+        .with_model(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()))
         .with_max_tokens(16384),
     )
 }
@@ -138,8 +135,7 @@ async fn handle_connection(
     let (event_tx, _) = broadcast::channel(256);
 
     // Sessions created on THIS connection (session_id → handle).
-    let sessions: Arc<Mutex<HashMap<String, AgentHandle>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Arc<Mutex<HashMap<String, AgentHandle>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // --- writer task (sole writer to the socket) -------------------------
     let writer_handle = {
@@ -327,16 +323,15 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let llm = create_llm_provider();
     let tools = create_tools()?;
     let runtime = AgentRuntime::new();
 
-    let socket_path = env::var("OMEGA_LOOP_SOCKET_PATH")
-        .unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
+    let socket_path =
+        env::var("OMEGA_LOOP_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
 
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)

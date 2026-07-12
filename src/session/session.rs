@@ -209,7 +209,8 @@ impl AgentSession {
     /// Update the system prompt in memory and persist to system_prompt.md
     pub fn update_system_prompt(&mut self, prompt: impl Into<String>) -> FrameworkResult<()> {
         self.system_prompt = prompt.into();
-        self.storage.save_system_prompt(&self.metadata.session_id, &self.system_prompt)?;
+        self.storage
+            .save_system_prompt(&self.metadata.session_id, &self.system_prompt)?;
         Ok(())
     }
 
@@ -450,8 +451,15 @@ mod tests {
     fn test_new_session() {
         let (storage, _temp) = create_test_storage();
 
-        let session =
-            AgentSession::new_with_storage("test_session", "coder", "Test Coder", "A test agent", "You are a coder.", storage).unwrap();
+        let session = AgentSession::new_with_storage(
+            "test_session",
+            "coder",
+            "Test Coder",
+            "A test agent",
+            "You are a coder.",
+            storage,
+        )
+        .unwrap();
 
         assert_eq!(session.session_id(), "test_session");
         assert_eq!(session.agent_type(), "coder");
@@ -466,9 +474,15 @@ mod tests {
         let (storage, _temp) = create_test_storage();
 
         // Create parent first
-        let _parent =
-            AgentSession::new_with_storage("parent", "main", "Main Agent", "Parent agent", "Test system prompt.", storage.clone())
-                .unwrap();
+        let _parent = AgentSession::new_with_storage(
+            "parent",
+            "main",
+            "Main Agent",
+            "Parent agent",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         // Create subagent
         let subagent = AgentSession::new_subagent_with_storage(
@@ -497,9 +511,15 @@ mod tests {
     fn test_add_and_get_messages() {
         let (storage, _temp) = create_test_storage();
 
-        let mut session =
-            AgentSession::new_with_storage("msg_session", "coder", "Test", "Testing", "Test system prompt.", storage.clone())
-                .unwrap();
+        let mut session = AgentSession::new_with_storage(
+            "msg_session",
+            "coder",
+            "Test",
+            "Testing",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         // Add messages
         session.add_message(Message::user("Hello")).unwrap();
@@ -516,9 +536,15 @@ mod tests {
     fn test_save_and_reload() {
         let (storage, _temp) = create_test_storage();
 
-        let mut session =
-            AgentSession::new_with_storage("save_test", "coder", "Test", "Testing", "Test system prompt.", storage.clone())
-                .unwrap();
+        let mut session = AgentSession::new_with_storage(
+            "save_test",
+            "coder",
+            "Test",
+            "Testing",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         // Add messages directly (bypassing append)
         session.messages.push(Message::user("Direct add"));
@@ -533,9 +559,15 @@ mod tests {
     fn test_delete_session() {
         let (storage, _temp) = create_test_storage();
 
-        let session =
-            AgentSession::new_with_storage("to_delete", "coder", "Test", "Testing", "Test system prompt.", storage.clone())
-                .unwrap();
+        let session = AgentSession::new_with_storage(
+            "to_delete",
+            "coder",
+            "Test",
+            "Testing",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         assert!(AgentSession::exists_with_storage("to_delete", &storage));
 
@@ -548,11 +580,24 @@ mod tests {
     fn test_list_sessions() {
         let (storage, _temp) = create_test_storage();
 
-        let _s1 =
-            AgentSession::new_with_storage("session1", "coder", "S1", "D1", "Test system prompt.", storage.clone()).unwrap();
-        let _s2 =
-            AgentSession::new_with_storage("session2", "researcher", "S2", "D2", "Test system prompt.", storage.clone())
-                .unwrap();
+        let _s1 = AgentSession::new_with_storage(
+            "session1",
+            "coder",
+            "S1",
+            "D1",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
+        let _s2 = AgentSession::new_with_storage(
+            "session2",
+            "researcher",
+            "S2",
+            "D2",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         let sessions = AgentSession::list_all_with_storage(&storage).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -564,9 +609,15 @@ mod tests {
     fn test_custom_metadata() {
         let (storage, _temp) = create_test_storage();
 
-        let mut session =
-            AgentSession::new_with_storage("custom_test", "coder", "Test", "Testing", "Test system prompt.", storage.clone())
-                .unwrap();
+        let mut session = AgentSession::new_with_storage(
+            "custom_test",
+            "coder",
+            "Test",
+            "Testing",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         session.set_custom("key1", "value1");
         session.set_custom("count", serde_json::json!(42));
@@ -588,8 +639,15 @@ mod tests {
     fn test_model_and_provider() {
         let (storage, _temp) = create_test_storage();
 
-        let mut session =
-            AgentSession::new_with_storage("model_test", "coder", "Test", "Testing", "Test system prompt.", storage).unwrap();
+        let mut session = AgentSession::new_with_storage(
+            "model_test",
+            "coder",
+            "Test",
+            "Testing",
+            "Test system prompt.",
+            storage,
+        )
+        .unwrap();
 
         session.set_model("claude-opus-4-5-20251101");
         session.set_provider("anthropic");
@@ -634,12 +692,24 @@ mod tests {
         let (storage, _temp) = create_test_storage();
 
         // Create top-level sessions
-        let _parent1 =
-            AgentSession::new_with_storage("parent1", "main", "Parent 1", "First parent", "Test system prompt.", storage.clone())
-                .unwrap();
-        let _parent2 =
-            AgentSession::new_with_storage("parent2", "main", "Parent 2", "Second parent", "Test system prompt.", storage.clone())
-                .unwrap();
+        let _parent1 = AgentSession::new_with_storage(
+            "parent1",
+            "main",
+            "Parent 1",
+            "First parent",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
+        let _parent2 = AgentSession::new_with_storage(
+            "parent2",
+            "main",
+            "Parent 2",
+            "Second parent",
+            "Test system prompt.",
+            storage.clone(),
+        )
+        .unwrap();
 
         // Create a subagent
         let _child = AgentSession::new_subagent_with_storage(
@@ -723,7 +793,9 @@ mod tests {
 
         // Add some messages
         session.add_message(Message::user("Hello")).unwrap();
-        session.add_message(Message::assistant("Hi there!")).unwrap();
+        session
+            .add_message(Message::assistant("Hi there!"))
+            .unwrap();
         session.add_message(Message::user("How are you?")).unwrap();
 
         // Get history using static method

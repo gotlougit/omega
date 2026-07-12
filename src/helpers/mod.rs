@@ -13,8 +13,8 @@ mod debugger;
 
 pub use attachments::process_attachments;
 pub use context_injection::{
-    append_to_last_message, inject_system_reminder, prepend_to_first_user_message,
-    BoxedInjection, ContextInjection, FnInjection, InjectionChain, SharedInjection,
+    append_to_last_message, inject_system_reminder, prepend_to_first_user_message, BoxedInjection,
+    ContextInjection, FnInjection, InjectionChain, SharedInjection,
 };
 pub use conversation_namer::{generate_conversation_name, ConversationNamer};
 pub use debugger::{

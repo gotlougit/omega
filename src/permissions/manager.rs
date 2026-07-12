@@ -407,7 +407,9 @@ mod tests {
 
         let mut manager = PermissionManager::new(global, "test-agent");
         manager.local.push(PermissionRule::allow_tool("Grep"));
-        manager.session.push(PermissionRule::allow_prefix("Bash", "ls"));
+        manager
+            .session
+            .push(PermissionRule::allow_prefix("Bash", "ls"));
 
         // Session rule
         assert_eq!(manager.check("Bash", "ls -la"), CheckResult::Allowed);

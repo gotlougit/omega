@@ -9,7 +9,6 @@ pub struct Console {
     user_color: Color,
     assistant_color: Color,
     tool_color: Color,
-
 }
 
 impl Console {
@@ -103,7 +102,11 @@ impl Console {
     /// Print a tool action message (tool name + key args) — no newline, so result follows on same line.
     pub fn print_tool_action(&self, tool_name: &str, args: &str) {
         let line = if args.is_empty() {
-            format!("{} {}", "✓".green(), tool_name.color(self.tool_color).bold())
+            format!(
+                "{} {}",
+                "✓".green(),
+                tool_name.color(self.tool_color).bold()
+            )
         } else {
             format!(
                 "{} {}  {}",
@@ -123,7 +126,12 @@ impl Console {
                 crate::tools::ToolResultData::Text(t) => t.clone(),
                 _ => String::new(),
             };
-            println!("  {} {} {}", "✗".red(), "status code 1".red().bold(), msg.red());
+            println!(
+                "  {} {} {}",
+                "✗".red(),
+                "status code 1".red().bold(),
+                msg.red()
+            );
         } else {
             println!("  {} {}", "✓".green(), "OK".green().bold());
         }
@@ -246,8 +254,6 @@ impl Console {
         println!();
         io::stdout().flush().unwrap();
     }
-
-
 }
 
 impl Default for Console {

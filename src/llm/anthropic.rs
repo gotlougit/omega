@@ -71,8 +71,8 @@ impl AnthropicProvider {
 
         let base_url = env::var("ANTHROPIC_BASE_URL").ok();
 
-        let model = env::var("ANTHROPIC_MODEL")
-            .context("ANTHROPIC_MODEL environment variable not set")?;
+        let model =
+            env::var("ANTHROPIC_MODEL").context("ANTHROPIC_MODEL environment variable not set")?;
 
         let max_tokens = env::var("ANTHROPIC_MAX_TOKENS")
             .ok()
@@ -89,10 +89,7 @@ impl AnthropicProvider {
 
         Ok(Self {
             client,
-            auth: AuthSource::Static(AuthConfig {
-                api_key,
-                base_url,
-            }),
+            auth: AuthSource::Static(AuthConfig { api_key, base_url }),
             model,
             max_tokens,
         })
@@ -317,17 +314,23 @@ impl AnthropicProvider {
     }
 
     /// Send a raw request to the Anthropic API
-    async fn send_request(&self, request: &MessageRequest, session_id: Option<&str>) -> Result<MessageResponse> {
+    async fn send_request(
+        &self,
+        request: &MessageRequest,
+        session_id: Option<&str>,
+    ) -> Result<MessageResponse> {
         tracing::debug!("Model: {}", request.model);
         tracing::debug!("Max tokens: {}", request.max_tokens);
 
         // Get auth credentials (static or from provider)
-        let auth_config = self.auth.get_auth().await
+        let auth_config = self
+            .auth
+            .get_auth()
+            .await
             .context("Failed to get authentication credentials")?;
         let api_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
 
-        let request_json = serde_json::to_string(request)
-            .context("Failed to serialize request")?;
+        let request_json = serde_json::to_string(request).context("Failed to serialize request")?;
         tracing::debug!("Request JSON: {}", request_json);
 
         let mut request_builder = self
@@ -363,8 +366,8 @@ impl AnthropicProvider {
             anyhow::bail!("Anthropic API error ({}): {}", status, response_text);
         }
 
-        let response: MessageResponse = serde_json::from_str(&response_text)
-            .context("Failed to parse API response")?;
+        let response: MessageResponse =
+            serde_json::from_str(&response_text).context("Failed to parse API response")?;
 
         tracing::info!("Received response from Anthropic API");
         tracing::debug!("Response ID: {}", response.id);
@@ -505,12 +508,14 @@ impl AnthropicProvider {
         tracing::debug!("Max tokens: {}", request.max_tokens);
 
         // Get auth credentials (static or from provider)
-        let auth_config = self.auth.get_auth().await
+        let auth_config = self
+            .auth
+            .get_auth()
+            .await
             .context("Failed to get authentication credentials")?;
         let api_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
 
-        let request_json =
-            serde_json::to_string(request).context("Failed to serialize request")?;
+        let request_json = serde_json::to_string(request).context("Failed to serialize request")?;
         tracing::debug!("Request JSON: {}", request_json);
 
         let mut request_builder = self
@@ -593,8 +598,14 @@ impl AnthropicProvider {
 /// Parse an SSE event from its type and data
 fn parse_sse_event(event_type: &str, data: &str) -> Result<Option<StreamEvent>> {
     match event_type {
-        "message_start" | "content_block_start" | "content_block_delta" | "content_block_stop"
-        | "message_delta" | "message_stop" | "ping" | "error" => {
+        "message_start"
+        | "content_block_start"
+        | "content_block_delta"
+        | "content_block_stop"
+        | "message_delta"
+        | "message_stop"
+        | "ping"
+        | "error" => {
             let raw_event: RawStreamEvent =
                 serde_json::from_str(data).context("Failed to parse SSE event data")?;
             Ok(Some(raw_event.into_stream_event()))
@@ -615,8 +626,13 @@ impl LlmProvider for AnthropicProvider {
         system_prompt: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<String> {
-        self.send_message(user_message, conversation_history, system_prompt, session_id)
-            .await
+        self.send_message(
+            user_message,
+            conversation_history,
+            system_prompt,
+            session_id,
+        )
+        .await
     }
 
     async fn send_with_tools_and_system(
@@ -641,8 +657,15 @@ impl LlmProvider for AnthropicProvider {
         thinking: Option<ThinkingConfig>,
         session_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        self.stream_with_tools_and_system(messages, system, tools, tool_choice, thinking, session_id)
-            .await
+        self.stream_with_tools_and_system(
+            messages,
+            system,
+            tools,
+            tool_choice,
+            thinking,
+            session_id,
+        )
+        .await
     }
 
     fn model(&self) -> String {

@@ -172,7 +172,10 @@ impl AgentConfig {
     /// Add a function-based injection
     pub fn with_injection_fn<F>(mut self, name: impl Into<String>, func: F) -> Self
     where
-        F: Fn(&crate::runtime::AgentInternals, Vec<crate::llm::Message>) -> Vec<crate::llm::Message>
+        F: Fn(
+                &crate::runtime::AgentInternals,
+                Vec<crate::llm::Message>,
+            ) -> Vec<crate::llm::Message>
             + Send
             + Sync
             + 'static,
@@ -422,7 +425,10 @@ impl std::fmt::Debug for AgentConfig {
             .field("enable_prompt_caching", &self.enable_prompt_caching)
             .field("naming_llm", &self.naming_llm.as_ref().map(|l| l.model()))
             .field("hook_short_circuit", &self.hook_short_circuit)
-            .field("dangerous_skip_permissions", &self.dangerous_skip_permissions)
+            .field(
+                "dangerous_skip_permissions",
+                &self.dangerous_skip_permissions,
+            )
             .field("turn_retry", &self.turn_retry)
             .finish()
     }

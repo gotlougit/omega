@@ -1,7 +1,7 @@
 pub mod core;
+pub mod permissions;
 pub mod runtime;
 pub mod session;
-pub mod permissions;
 pub mod tools;
 
 // Optional components
@@ -23,4 +23,3 @@ pub mod omega_client;
 
 // omega-loop client for UI processes
 pub mod omega_loop_client;
-

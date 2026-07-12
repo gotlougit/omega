@@ -104,7 +104,8 @@ impl ConsoleRenderer {
 
             // Send input to agent
             if let Err(e) = self.handle.send_input(&input).await {
-                self.console.print_error(&format!("Failed to send input: {}", e));
+                self.console
+                    .print_error(&format!("Failed to send input: {}", e));
                 continue;
             }
 
@@ -125,7 +126,8 @@ impl ConsoleRenderer {
     pub async fn run_turn(&self, input: &str) -> io::Result<()> {
         // Send input to agent
         if let Err(e) = self.handle.send_input(input).await {
-            self.console.print_error(&format!("Failed to send input: {}", e));
+            self.console
+                .print_error(&format!("Failed to send input: {}", e));
             return Ok(());
         }
 
@@ -196,7 +198,12 @@ impl ConsoleRenderer {
                         }
 
                         // Permission requests
-                        OutputChunk::PermissionRequest { tool_name, action, input, details } => {
+                        OutputChunk::PermissionRequest {
+                            tool_name,
+                            action,
+                            input,
+                            details,
+                        } => {
                             if in_text {
                                 self.console.println();
                                 in_text = false;
@@ -222,11 +229,17 @@ impl ConsoleRenderer {
                             };
 
                             // Send response back to agent
-                            let _ = self.handle.send_permission_response(&tool_name, allowed, remember).await;
+                            let _ = self
+                                .handle
+                                .send_permission_response(&tool_name, allowed, remember)
+                                .await;
                         }
 
                         // User questions
-                        OutputChunk::AskUserQuestion { request_id, questions } => {
+                        OutputChunk::AskUserQuestion {
+                            request_id,
+                            questions,
+                        } => {
                             if in_text {
                                 self.console.println();
                                 in_text = false;
@@ -235,9 +248,15 @@ impl ConsoleRenderer {
                             // Display questions and collect answers
                             let mut answers = std::collections::HashMap::new();
                             for q in &questions {
-                                self.console.print_system(&format!("[{}] {}", q.header, q.question));
+                                self.console
+                                    .print_system(&format!("[{}] {}", q.header, q.question));
                                 for (i, opt) in q.options.iter().enumerate() {
-                                    self.console.print_system(&format!("  {}. {} - {}", i + 1, opt.label, opt.description));
+                                    self.console.print_system(&format!(
+                                        "  {}. {} - {}",
+                                        i + 1,
+                                        opt.label,
+                                        opt.description
+                                    ));
                                 }
                                 // For CLI, just use first option as default for now
                                 // A full implementation would prompt user for input
@@ -247,10 +266,13 @@ impl ConsoleRenderer {
                             }
 
                             // Send response back to agent
-                            let _ = self.handle.send(InputMessage::UserQuestionResponse {
-                                request_id,
-                                answers,
-                            }).await;
+                            let _ = self
+                                .handle
+                                .send(InputMessage::UserQuestionResponse {
+                                    request_id,
+                                    answers,
+                                })
+                                .await;
                         }
 
                         // Status updates
@@ -278,14 +300,19 @@ impl ConsoleRenderer {
                         }
 
                         // Subagent events (could render differently)
-                        OutputChunk::SubAgentSpawned { session_id, agent_type } => {
+                        OutputChunk::SubAgentSpawned {
+                            session_id,
+                            agent_type,
+                        } => {
                             self.console.print_system(&format!(
-                                "Spawned subagent: {} ({})", agent_type, session_id
+                                "Spawned subagent: {} ({})",
+                                agent_type, session_id
                             ));
                         }
                         OutputChunk::SubAgentComplete { session_id, result } => {
                             self.console.print_system(&format!(
-                                "Subagent {} completed: {:?}", session_id, result
+                                "Subagent {} completed: {:?}",
+                                session_id, result
                             ));
                         }
                         OutputChunk::SubAgentOutput { chunk, .. } => {

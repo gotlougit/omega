@@ -42,9 +42,7 @@ struct ReadInput {
 impl ReadTool {
     /// Create a new Read tool with the current directory as base
     pub fn new() -> Result<Self> {
-        let base_dir = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
+        let base_dir = std::env::current_dir()?.to_string_lossy().to_string();
 
         Ok(Self { base_dir })
     }
@@ -70,7 +68,12 @@ impl ReadTool {
     }
 
     /// Read file contents - dispatches to appropriate handler based on file type
-    fn read_file(&self, file_path: &str, offset: Option<usize>, limit: Option<usize>) -> Result<ToolResult> {
+    fn read_file(
+        &self,
+        file_path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ToolResult> {
         let resolved_path = self.resolve_path(file_path);
         tracing::info!("Reading file: {}", resolved_path);
 
@@ -84,9 +87,7 @@ impl ReadTool {
             Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") => {
                 self.read_image(&resolved_path)
             }
-            Some("pdf") => {
-                self.read_pdf(&resolved_path)
-            }
+            Some("pdf") => self.read_pdf(&resolved_path),
             _ => {
                 // Default to text reading for all other files
                 self.read_text_file(&resolved_path, offset, limit)
@@ -95,7 +96,12 @@ impl ReadTool {
     }
 
     /// Read a text file with optional offset and limit
-    fn read_text_file(&self, resolved_path: &str, offset: Option<usize>, limit: Option<usize>) -> Result<ToolResult> {
+    fn read_text_file(
+        &self,
+        resolved_path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ToolResult> {
         let content = fs::read_to_string(resolved_path)
             .with_context(|| format!("Failed to read file: {}", resolved_path))?;
 

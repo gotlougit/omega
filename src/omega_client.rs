@@ -36,9 +36,18 @@ struct OmegaResponse {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum OmegaContent {
-    Text { data: String },
-    Image { data: String, media_type: String },
-    Document { data: String, media_type: String, description: String },
+    Text {
+        data: String,
+    },
+    Image {
+        data: String,
+        media_type: String,
+    },
+    Document {
+        data: String,
+        media_type: String,
+        description: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -63,8 +72,8 @@ pub struct OmegaClient {
 impl OmegaClient {
     /// Create a client using `OMEGA_SOCKET_PATH` env-var or the default path.
     pub fn new() -> Self {
-        let socket_path = std::env::var("OMEGA_SOCKET_PATH")
-            .unwrap_or_else(|_| "/tmp/omega-sh.sock".to_string());
+        let socket_path =
+            std::env::var("OMEGA_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-sh.sock".to_string());
         Self {
             socket_path,
             session: None,
@@ -97,9 +106,7 @@ impl OmegaClient {
     pub async fn execute(&self, tool: &str, args: Value) -> Result<ToolResult, String> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
-            .map_err(|e| {
-                format!("Cannot connect to omega-sh at {}: {e}", self.socket_path)
-            })?;
+            .map_err(|e| format!("Cannot connect to omega-sh at {}: {e}", self.socket_path))?;
 
         let (reader, mut writer) = stream.into_split();
         let id = uuid::Uuid::new_v4().to_string();
@@ -112,8 +119,7 @@ impl OmegaClient {
             dir: self.dir.clone(),
         };
 
-        let mut buf =
-            serde_json::to_vec(&request).map_err(|e| format!("Serialize error: {e}"))?;
+        let mut buf = serde_json::to_vec(&request).map_err(|e| format!("Serialize error: {e}"))?;
         buf.push(b'\n');
         writer
             .write_all(&buf)

@@ -90,7 +90,8 @@ impl AgentRuntime {
         F: FnOnce(AgentInternals) -> Fut + Send + 'static,
         Fut: Future<Output = FrameworkResult<()>> + Send + 'static,
     {
-        self.spawn_with_local_rules(session, Vec::new(), agent_fn).await
+        self.spawn_with_local_rules(session, Vec::new(), agent_fn)
+            .await
     }
 
     /// Spawn a new agent task with local permission rules
@@ -152,13 +153,7 @@ impl AgentRuntime {
         );
 
         // Create handle for external use
-        let handle = AgentHandle::new(
-            session_id.clone(),
-            session,
-            input_tx,
-            output_tx,
-            state,
-        );
+        let handle = AgentHandle::new(session_id.clone(), session, input_tx, output_tx, state);
 
         // Store handle in registry
         {

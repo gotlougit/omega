@@ -18,8 +18,8 @@ use crate::core::{FrameworkResult, InputMessage};
 use crate::helpers::{process_attachments, ConversationNamer, Debugger};
 use crate::hooks::HookContext;
 use crate::llm::{
-    CacheControl, ContentBlock, ContentBlockStart, ContentDelta, LlmProvider, Message,
-    StopReason, StreamEvent, SystemBlock, SystemPrompt,
+    CacheControl, ContentBlock, ContentBlockStart, ContentDelta, LlmProvider, Message, StopReason,
+    StreamEvent, SystemBlock, SystemPrompt,
 };
 use crate::runtime::AgentInternals;
 use crate::tools::{ToolResult, ToolResultData};
@@ -65,7 +65,10 @@ impl StandardAgent {
             session.set_provider(self.llm.provider_name());
 
             // Store dangerous_skip_permissions in session metadata for runtime access
-            session.set_custom("dangerous_skip_permissions", self.config.dangerous_skip_permissions);
+            session.set_custom(
+                "dangerous_skip_permissions",
+                self.config.dangerous_skip_permissions,
+            );
         }
 
         // Log warning if dangerous mode is enabled
@@ -124,8 +127,13 @@ impl StandardAgent {
 
                         // Check if hook denied the prompt
                         if let Some(crate::hooks::PermissionDecision::Deny) = result.decision {
-                            let reason = result.reason.unwrap_or_else(|| "Blocked by hook".to_string());
-                            tracing::info!("[StandardAgent] UserPromptSubmit hook denied: {}", reason);
+                            let reason = result
+                                .reason
+                                .unwrap_or_else(|| "Blocked by hook".to_string());
+                            tracing::info!(
+                                "[StandardAgent] UserPromptSubmit hook denied: {}",
+                                reason
+                            );
                             internals.send_error(format!("Prompt blocked: {}", reason));
                             should_process = false;
                         }
@@ -139,13 +147,17 @@ impl StandardAgent {
                         let mut attempt = 0u32;
                         let mut first_attempt = true;
                         loop {
-                            match self.process_turn(&mut internals, &current_text, first_attempt).await {
+                            match self
+                                .process_turn(&mut internals, &current_text, first_attempt)
+                                .await
+                            {
                                 Ok(()) => break,
                                 Err(e) => {
                                     first_attempt = false;
                                     attempt += 1;
                                     let err_msg = e.to_string();
-                                    let is_transient = err_msg.contains("error decoding response body")
+                                    let is_transient = err_msg
+                                        .contains("error decoding response body")
                                         || err_msg.contains("connection")
                                         || err_msg.contains("timeout")
                                         || err_msg.contains("broken pipe")
@@ -154,7 +166,10 @@ impl StandardAgent {
                                         || err_msg.contains("hyper")
                                         || err_msg.contains("io error");
 
-                                    if retry_config.enabled && is_transient && attempt < retry_config.max_retries {
+                                    if retry_config.enabled
+                                        && is_transient
+                                        && attempt < retry_config.max_retries
+                                    {
                                         tracing::warn!(
                                             "[StandardAgent] Transient error on attempt {}/{}: {}. Retrying in {}s...",
                                             attempt, retry_config.max_retries, e, retry_config.retry_delay_secs
@@ -163,7 +178,10 @@ impl StandardAgent {
                                             "Connection issue, retrying... (attempt {}/{})",
                                             attempt, retry_config.max_retries
                                         ));
-                                        tokio::time::sleep(std::time::Duration::from_secs(retry_config.retry_delay_secs)).await;
+                                        tokio::time::sleep(std::time::Duration::from_secs(
+                                            retry_config.retry_delay_secs,
+                                        ))
+                                        .await;
                                         continue;
                                     }
 
@@ -182,7 +200,8 @@ impl StandardAgent {
                             };
                             let has_name = internals.session.read().await.has_conversation_name();
                             if !has_name {
-                                self.generate_conversation_name(&mut internals, Some(&session_id)).await;
+                                self.generate_conversation_name(&mut internals, Some(&session_id))
+                                    .await;
                             }
                         }
                     }
@@ -231,11 +250,19 @@ impl StandardAgent {
     }
 
     /// Generate a conversation name using the ConversationNamer helper
-    async fn generate_conversation_name(&self, internals: &mut AgentInternals, session_id: Option<&str>) {
+    async fn generate_conversation_name(
+        &self,
+        internals: &mut AgentInternals,
+        session_id: Option<&str>,
+    ) {
         tracing::debug!("[StandardAgent] Generating conversation name...");
 
         // Use naming LLM if configured, otherwise fall back to main LLM
-        let naming_llm = self.config.naming_llm.clone().unwrap_or_else(|| self.llm.clone());
+        let naming_llm = self
+            .config
+            .naming_llm
+            .clone()
+            .unwrap_or_else(|| self.llm.clone());
         let namer = ConversationNamer::new(naming_llm);
         let history = {
             let session = internals.session.read().await;
@@ -247,14 +274,14 @@ impl StandardAgent {
                 tracing::info!("[StandardAgent] Generated conversation name: {}", name);
                 let mut session = internals.session.write().await;
                 if let Err(e) = session.set_conversation_name(&name) {
-                    tracing::warn!(
-                        "[StandardAgent] Failed to save conversation name: {}",
-                        e
-                    );
+                    tracing::warn!("[StandardAgent] Failed to save conversation name: {}", e);
                 }
             }
             Err(e) => {
-                tracing::warn!("[StandardAgent] Failed to generate conversation name: {}", e);
+                tracing::warn!(
+                    "[StandardAgent] Failed to generate conversation name: {}",
+                    e
+                );
             }
         }
     }
@@ -263,7 +290,12 @@ impl StandardAgent {
     ///
     /// `add_user_message`: true on the first attempt, false on retries to avoid
     /// duplicating the user message in session history.
-    async fn process_turn(&self, internals: &mut AgentInternals, user_input: &str, add_user_message: bool) -> Result<()> {
+    async fn process_turn(
+        &self,
+        internals: &mut AgentInternals,
+        user_input: &str,
+        add_user_message: bool,
+    ) -> Result<()> {
         // Only add the user message on the first attempt (not on retries)
         if add_user_message {
             // Check if input contains attachment tags and process them
@@ -316,7 +348,10 @@ impl StandardAgent {
             // Get messages and system prompt from session
             let (messages, system_prompt_text) = {
                 let session = internals.session.read().await;
-                (session.history().to_vec(), session.system_prompt().to_string())
+                (
+                    session.history().to_vec(),
+                    session.system_prompt().to_string(),
+                )
             };
 
             // IMPORTANT: Apply cache control BEFORE injections
@@ -371,11 +406,9 @@ impl StandardAgent {
                     }
                 } else {
                     // Legacy path for simple string system prompt
-                    if let Err(e) = debugger.log_api_request(
-                        &messages_with_cache,
-                        system_str,
-                        Some(&tool_defs),
-                    ) {
+                    if let Err(e) =
+                        debugger.log_api_request(&messages_with_cache, system_str, Some(&tool_defs))
+                    {
                         tracing::warn!("[StandardAgent] Failed to log API request: {}", e);
                     }
                 }
@@ -413,7 +446,10 @@ impl StandardAgent {
             let mut tool_call_set = std::collections::HashSet::new();
 
             for (index, block) in content_blocks.iter().enumerate() {
-                if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                if let ContentBlock::ToolUse {
+                    id, name, input, ..
+                } = block
+                {
                     tracing::info!("[StandardAgent] Tool use: {} ({})", name, id);
 
                     // Loop detection: Check if this exact tool call was already made in this turn
@@ -445,10 +481,7 @@ impl StandardAgent {
                         )
                         .await
                     } else {
-                        ToolResult::error(format!(
-                            "No tools configured, cannot execute: {}",
-                            name
-                        ))
+                        ToolResult::error(format!("No tools configured, cannot execute: {}", name))
                     };
 
                     tool_results.push((id.clone(), result));
@@ -457,7 +490,7 @@ impl StandardAgent {
                     // Use tokio::select with immediate timeout to check without blocking
                     let interrupt_check = tokio::time::timeout(
                         std::time::Duration::from_millis(0),
-                        internals.receive()
+                        internals.receive(),
                     );
 
                     if let Ok(Some(InputMessage::Interrupt)) = interrupt_check.await {
@@ -465,8 +498,12 @@ impl StandardAgent {
 
                         // For all remaining tools that haven't executed, add "Interrupted" error
                         for remaining_block in content_blocks.iter().skip(index + 1) {
-                            if let ContentBlock::ToolUse { id: remaining_id, .. } = remaining_block {
-                                tool_results.push((remaining_id.clone(), ToolResult::error("Interrupted")));
+                            if let ContentBlock::ToolUse {
+                                id: remaining_id, ..
+                            } = remaining_block
+                            {
+                                tool_results
+                                    .push((remaining_id.clone(), ToolResult::error("Interrupted")));
                             }
                         }
 
@@ -505,13 +542,11 @@ impl StandardAgent {
                 // Add the interrupt results to history
                 let tool_result_blocks: Vec<ContentBlock> = tool_results
                     .into_iter()
-                    .flat_map(|(id, result)| {
-                        match result.content {
-                            ToolResultData::Text(text) => {
-                                vec![ContentBlock::tool_result(&id, &text, result.is_error)]
-                            }
-                            _ => vec![]
+                    .flat_map(|(id, result)| match result.content {
+                        ToolResultData::Text(text) => {
+                            vec![ContentBlock::tool_result(&id, &text, result.is_error)]
                         }
+                        _ => vec![],
                     })
                     .collect();
 
@@ -546,14 +581,18 @@ impl StandardAgent {
                             ToolResultData::Image { data, media_type } => {
                                 // Encode image data to base64
                                 use base64::Engine;
-                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+                                let base64_data =
+                                    base64::engine::general_purpose::STANDARD.encode(&data);
 
-                                vec![ContentBlock::ToolResult {
-                                    tool_use_id: id,
-                                    content: None,
-                                    is_error: if result.is_error { Some(true) } else { None },
-                                    cache_control: None,
-                                }, ContentBlock::image(base64_data, media_type)]
+                                vec![
+                                    ContentBlock::ToolResult {
+                                        tool_use_id: id,
+                                        content: None,
+                                        is_error: if result.is_error { Some(true) } else { None },
+                                        cache_control: None,
+                                    },
+                                    ContentBlock::image(base64_data, media_type),
+                                ]
                             }
                             ToolResultData::Document {
                                 data,
@@ -562,7 +601,8 @@ impl StandardAgent {
                             } => {
                                 // Encode document data to base64
                                 use base64::Engine;
-                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+                                let base64_data =
+                                    base64::engine::general_purpose::STANDARD.encode(&data);
 
                                 // For PDFs: two separate blocks as per API spec
                                 vec![
@@ -618,7 +658,11 @@ impl StandardAgent {
         system_prompt_text: &str,
         mut tool_definitions: Vec<crate::llm::ToolDefinition>,
         mut messages: Vec<Message>,
-    ) -> (Vec<crate::llm::ToolDefinition>, Option<SystemPrompt>, Vec<Message>) {
+    ) -> (
+        Vec<crate::llm::ToolDefinition>,
+        Option<SystemPrompt>,
+        Vec<Message>,
+    ) {
         if !self.config.enable_prompt_caching {
             // Caching disabled - return system prompt as simple text
             return (
@@ -648,7 +692,9 @@ impl StandardAgent {
 
         // 1. Add cache control to last tool definition (caches all tools)
         if let Some(last_tool) = tool_definitions.last_mut() {
-            *last_tool = last_tool.clone().with_cache_control(CacheControl::ephemeral());
+            *last_tool = last_tool
+                .clone()
+                .with_cache_control(CacheControl::ephemeral());
         }
 
         // 2. Create system prompt with cache control
@@ -664,17 +710,18 @@ impl StandardAgent {
             match &mut last_message.content {
                 crate::llm::MessageContent::Text(text) => {
                     // Convert to blocks format with cache control on the text
-                    last_message.content = crate::llm::MessageContent::Blocks(vec![
-                        ContentBlock::Text {
+                    last_message.content =
+                        crate::llm::MessageContent::Blocks(vec![ContentBlock::Text {
                             text: text.clone(),
                             cache_control: Some(CacheControl::ephemeral()),
-                        },
-                    ]);
+                        }]);
                 }
                 crate::llm::MessageContent::Blocks(blocks) => {
                     // Add cache control to the last block
                     if let Some(last_block) = blocks.last_mut() {
-                        *last_block = last_block.clone().with_cache_control(CacheControl::ephemeral());
+                        *last_block = last_block
+                            .clone()
+                            .with_cache_control(CacheControl::ephemeral());
                     }
                 }
             }
@@ -992,7 +1039,10 @@ impl StandardAgent {
             }
 
             if let Err(e) = debugger.log_api_response(&response_for_logging) {
-                tracing::warn!("[StandardAgent] Failed to log streaming API response: {}", e);
+                tracing::warn!(
+                    "[StandardAgent] Failed to log streaming API response: {}",
+                    e
+                );
             }
         }
 

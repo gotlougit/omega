@@ -141,14 +141,12 @@ impl AgentHandle {
     ///
     /// Returns an error if the channel is full or closed.
     pub fn try_send(&self, message: InputMessage) -> FrameworkResult<()> {
-        self.input_tx
-            .try_send(message)
-            .map_err(|e| match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    FrameworkError::SendError("Channel full".into())
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => FrameworkError::ChannelClosed,
-            })
+        self.input_tx.try_send(message).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                FrameworkError::SendError("Channel full".into())
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => FrameworkError::ChannelClosed,
+        })
     }
 
     // =========================================================================
@@ -276,7 +274,8 @@ impl AgentHandle {
             );
         }
 
-        self.set_custom_metadata("dangerous_skip_permissions", enabled).await
+        self.set_custom_metadata("dangerous_skip_permissions", enabled)
+            .await
     }
 
     /// Check if dangerous_skip_permissions is currently enabled
@@ -397,15 +396,9 @@ mod tests {
     async fn test_state() {
         let temp_dir = TempDir::new().unwrap();
         let storage = SessionStorage::with_dir(temp_dir.path());
-        let session = AgentSession::new_with_storage(
-            "test",
-            "test-agent",
-            "Test",
-            "Test",
-            "",
-            storage,
-        )
-        .unwrap();
+        let session =
+            AgentSession::new_with_storage("test", "test-agent", "Test", "Test", "", storage)
+                .unwrap();
         let session = Arc::new(RwLock::new(session));
 
         let (input_tx, _input_rx, output_tx) = create_agent_channels();
