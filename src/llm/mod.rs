@@ -1,9 +1,11 @@
 pub mod anthropic;
 pub mod auth;
+pub mod openai;
 pub mod provider;
 pub mod types;
 
 pub use anthropic::{define_tool, AnthropicProvider};
+pub use openai::OpenAIProvider;
 pub use auth::{auth_provider, AuthConfig, AuthProvider};
 pub use provider::LlmProvider;
 pub use types::{

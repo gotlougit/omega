@@ -17,7 +17,7 @@ use picrust::{
     agent::{AgentConfig, StandardAgent},
     cli::ConsoleRenderer,
     hooks::{HookContext, HookEvent, HookRegistry, HookResult},
-    llm::{AnthropicProvider, AuthConfig},
+    llm::{AuthConfig, OpenAIProvider},
     runtime::AgentRuntime,
     session::{AgentSession, SessionStorage},
     tools::{
@@ -80,20 +80,20 @@ async fn main() -> Result<()> {
     println!("[Setup] Creating LLM provider...");
 
     let llm = Arc::new(
-        AnthropicProvider::with_auth_provider(|| async {
-            let api_key = env::var("ANTHROPIC_KEY")
-                .map_err(|_| anyhow::anyhow!("ANTHROPIC_KEY environment variable not set"))?;
+        OpenAIProvider::with_auth_provider(|| async {
+            let api_key = env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
 
-            Ok(AuthConfig::with_base_url(
-                api_key,
-                "https://api.anthropic.com/v1/messages",
-            ))
+            let base_url = env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
+
+            Ok(AuthConfig::with_base_url(api_key, base_url))
         })
         .with_model(
-            env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string()),
+            env::var("OPENAI_MODEL")
+                .unwrap_or_else(|_| "gpt-4o".to_string()),
         )
-        .with_max_tokens(32000),
+        .with_max_tokens(16384),
     );
     println!("[Setup] Model: {}", llm.model());
 
@@ -205,10 +205,9 @@ async fn main() -> Result<()> {
     println!();
     println!("Type your requests below. Read/Glob/Grep are auto-approved by hooks.");
     if caching {
-        println!("💰 Prompt caching enabled: 90% cost savings on repeated content!");
-        println!("   (Tools, system prompt, and conversation history are automatically cached)");
+        println!("📋 Attempting to optimize context (OpenAI does not support Anthropic-style caching)");
     } else {
-        println!(" Prompt caching disabled. To enable: run without --no-cache flag");
+        println!(" Prompt caching disabled.");
     }
     println!("Type 'exit' or 'quit' to stop.\n");
 
