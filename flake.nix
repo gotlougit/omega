@@ -41,6 +41,7 @@
               pkgs.clippy
               pkgs.rust-analyzer
               pkgs.gdb
+              pkgs.python313Packages.playwright
             ];
           };
         }

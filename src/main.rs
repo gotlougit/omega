@@ -1,205 +1,203 @@
-//! Picrust — A coding agent framework
+//! # picrust — UI client
 //!
-//! Run with:
-//!   cargo run                     # New session (with caching)
-//!   cargo run -- --resume         # Resume existing session
-//!   cargo run -- --stream         # New session with streaming
-//!   cargo run -- --stream --resume # Resume with streaming
-//!   cargo run -- --think          # Enable extended thinking
-//!   cargo run -- --stream --think # Streaming with thinking
-//!   cargo run -- --no-cache       # Disable prompt caching
+//! Thin user-interface process that connects to the `agentd` daemon,
+//! sends user messages, and renders streaming responses.
 
-use std::env;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::io::{self, Write};
 
-use anyhow::{bail, Result};
-use picrust::{
-    agent::{AgentConfig, StandardAgent},
-    cli::ConsoleRenderer,
-    llm::{AuthConfig, OpenAIProvider},
-    omega_client::{
-        proxy::{BashProxy, EditProxy, GlobProxy, GrepProxy, ReadProxy, WriteProxy},
-        OmegaClient,
-    },
-    runtime::AgentRuntime,
-    session::{AgentSession, SessionStorage},
-    tools::{AskUserQuestionTool, ToolRegistry},
-};
+use anyhow::Result;
 
-/// System prompt for the agent
-const SYSTEM_PROMPT: &str = r#"You are a helpful coding assistant with access to tools.
+use picrust::omega_loop_client::{AgentdClient, OutputChunk, ServerEvent, SessionConfig};
 
-You have the following tools available:
-- Read: Read file contents
-- Write: Write or create files
-- Bash: Execute shell commands
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-When the user asks you to do something, use the appropriate tools.
-Be concise in your responses."#;
-
-/// Create the tool registry with all available tools.
-///
-/// Read, Write, Edit, Bash, Glob, and Grep are proxied through the omega-sh
-/// daemon.  AskUserQuestion runs in-process.
-fn create_registry(session_id: &str, cwd: &str) -> Result<ToolRegistry> {
-    let mut registry = ToolRegistry::new();
-    let omega = OmegaClient::new()
-        .with_session(session_id)
-        .with_dir(cwd);
-
-    registry.register(ReadProxy::new(omega.clone()));
-    registry.register(WriteProxy::new(omega.clone()));
-    registry.register(EditProxy::new(omega.clone()));
-    registry.register(BashProxy::new(omega.clone()));
-    registry.register(GlobProxy::new(omega.clone()));
-    registry.register(GrepProxy::new(omega.clone()));
-    registry.register(AskUserQuestionTool::new());
-
-    Ok(registry)
+fn tool_input_preview(input: &serde_json::Value) -> String {
+    input
+        .get("command")
+        .or_else(|| input.get("file_path"))
+        .or_else(|| input.get("pattern"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            if s.len() > 80 {
+                format!("{}…", &s[..80])
+            } else {
+                s.to_string()
+            }
+        })
+        .unwrap_or_default()
 }
+
+fn chunk_to_one_liner(chunk: &OutputChunk) {
+    match chunk {
+        OutputChunk::TextDelta(text) => {
+            print!("{}", text);
+            io::stdout().flush().ok();
+        }
+        OutputChunk::ToolStart { name, input, .. } => {
+            let preview = tool_input_preview(input);
+            print!("\n  \x1b[33m⚡ {name}\x1b[0m {preview}");
+            io::stdout().flush().ok();
+        }
+        OutputChunk::ToolEnd { result, .. } => {
+            if result.is_error {
+                print!("  \x1b[31m✗\x1b[0m");
+            } else {
+                print!("  \x1b[32m✓\x1b[0m");
+            }
+            println!();
+        }
+        OutputChunk::Error(e) => {
+            println!("\x1b[31mError: {e}\x1b[0m");
+        }
+        OutputChunk::Done => {
+            println!();
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter("picrust=warn")
-        .init();
-
-    // Parse command line arguments
-    let args: Vec<String> = env::args().collect();
-    let resume = args.iter().any(|a| a == "--resume" || a == "-r");
-
-    // Generate session ID with timestamp
     let session_id = format!(
         "picrust-session-{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
 
+    // Parse flags
+    let args: Vec<String> = std::env::args().collect();
+    let use_stream = !args.iter().any(|a| a == "--no-stream" || a == "-n");
+    let use_think = args.iter().any(|a| a == "--think" || a == "-t");
+    let no_cache = args.iter().any(|a| a == "--no-cache");
+
     println!("=== Picrust ===");
-    println!("A coding agent. All tools are allowed.");
-    println!("Use --stream/-s flag to enable streaming responses.");
-    println!("Use --think/-t flag to enable extended thinking.");
-    println!("Prompt caching is enabled by default (use --no-cache to disable).\n");
+    println!("Connecting to agentd...\n");
 
-    // --- Step 1: Create LLM provider with dynamic auth ---
-    println!("[Setup] Creating LLM provider...");
+    let mut client = AgentdClient::connect().await?;
+    println!("✓ Connected to omega-loop");
 
-    let llm = Arc::new(
-        OpenAIProvider::with_auth_provider(|| async {
-            let api_key = env::var("OPENAI_API_KEY")
-                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
-
-            let base_url = env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
-
-            Ok(AuthConfig::with_base_url(api_key, base_url))
-        })
-        .with_model(
-            env::var("OPENAI_MODEL")
-                .unwrap_or_else(|_| "gpt-4o".to_string()),
-        )
-        .with_max_tokens(16384),
-    );
-    println!("[Setup] Model: {}", llm.model());
-
-    // --- Step 2: Create runtime ---
-    let runtime = AgentRuntime::new();
-    println!("[Setup] Runtime created");
-
-    let cwd = std::env::current_dir()
-        .map(|d| d.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "?".to_string());
-
-    // --- Step 3: Create tool registry ---
-    let tools = Arc::new(create_registry(&session_id, &cwd)?);
-    println!("[Setup] Tools registered: {:?}", tools.tool_names());
-
-    // --- Step 4: Create hooks (none — all tools allowed) ---
-    let hooks = picrust::hooks::HookRegistry::new();
-
-    // --- Step 5: Create or load session ---
-    let storage = SessionStorage::with_dir("./sessions");
-    let session = if resume {
-        if !AgentSession::exists_with_storage(&session_id, &storage) {
-            bail!(
-                "Cannot resume: session '{}' does not exist. Run without --resume to create a new session.",
-                session_id
-            );
-        }
-        let session = AgentSession::load_with_storage(&session_id, storage)?;
-        println!(
-            "[Setup] Resumed session: {} ({} messages in history)",
-            session.session_id(),
-            session.history().len()
-        );
-        session
-    } else {
-        let session = AgentSession::new_with_storage(
-            &session_id,
-            "picrust",
-            "Picrust Agent",
-            "A coding agent powered by Claude",
-            SYSTEM_PROMPT,
-            storage,
-        )?;
-        println!("[Setup] New session: {}", session.session_id());
-        session
+    let config = SessionConfig {
+        stream: use_stream,
+        think: use_think,
+        no_cache,
     };
 
-    // --- Step 6: Configure the agent ---
-    let streaming = args.iter().any(|a| a == "--stream" || a == "-s");
-    let thinking = args.iter().any(|a| a == "--think" || a == "-t");
-    let no_cache = args.iter().any(|a| a == "--no-cache");
-    let caching = !no_cache;
+    // --- interaction loop ---
+    let mut first = true;
 
-    let mut config = AgentConfig::new()
-        .with_tools(tools)
-        .with_hooks(hooks)
-        .with_debug(true)
-        .with_streaming(streaming)
-        .with_prompt_caching(caching);
+    loop {
+        // Read user input
+        print!("\n> ");
+        io::stdout().flush()?;
 
-    if thinking {
-        config = config.with_thinking(16000);
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_string();
+
+        if input.is_empty() {
+            continue;
+        }
+
+        if input == "exit" || input == "/exit" || input == "/quit" {
+            println!("Goodbye!");
+            break;
+        }
+
+        // Send to omega-loop
+        client
+            .send_run(&session_id, &input, &config)
+            .await?;
+
+        // Read and display events
+        loop {
+            match client.recv_event().await? {
+                None => {
+                    eprintln!("\n[omega-loop disconnected]");
+                    return Ok(());
+                }
+                Some(ServerEvent::Created { session_name, .. }) => {
+                    if first {
+                        println!("Session: {session_name}");
+                        first = false;
+                    }
+                }
+                Some(ServerEvent::Chunk { chunk, .. }) => {
+                    // Check for AskUserQuestion
+                    if let OutputChunk::AskUserQuestion {
+                        request_id,
+                        questions,
+                    } = &chunk
+                    {
+                        handle_ask_question(&mut client, &session_id, request_id, questions)
+                            .await?;
+                        continue;
+                    }
+
+                    // Check for terminal
+                    let is_done = matches!(&chunk, OutputChunk::Done | OutputChunk::Error(_));
+
+                    chunk_to_one_liner(&chunk);
+
+                    if is_done {
+                        break;
+                    }
+                }
+                Some(ServerEvent::Unknown(val)) => {
+                    tracing::debug!("Unknown server event: {val}");
+                }
+            }
+        }
     }
 
-    println!(
-        "[Setup] AgentConfig created{}{}{}",
-        if streaming { ", streaming enabled" } else { "" },
-        if thinking { ", extended thinking enabled" } else { "" },
-        if caching { ", prompt caching enabled" } else { ", prompt caching disabled" }
-    );
+    Ok(())
+}
 
-    // --- Step 7: Create and spawn the agent ---
-    let agent = StandardAgent::new(config, llm);
+/// Handle an `AskUserQuestion` by printing the questions, collecting answers,
+/// and sending the response back to the daemon.
+async fn handle_ask_question(
+    client: &mut AgentdClient,
+    session_id: &str,
+    request_id: &str,
+    questions: &[picrust::omega_loop_client::UserQuestionWire],
+) -> Result<()> {
+    let mut answers = HashMap::new();
 
-    println!("[Setup] Spawning agent...");
-    let handle = runtime
-        .spawn(session, move |internals| agent.run(internals))
-        .await;
-    println!("[Setup] Agent spawned!");
+    for q in questions {
+        println!("\n\x1b[36m{}\x1b[0m", q.header);
+        println!("{}", q.question);
 
-    // --- Step 8: Run the console renderer ---
-    println!("[Setup] Starting console renderer...");
-    println!();
-    println!("Type your requests below. All tools are allowed.");
-    if caching {
-        println!("📋 Attempting to optimize context (OpenAI does not support Anthropic-style caching)");
-    } else {
-        println!(" Prompt caching disabled.");
+        for (i, opt) in q.options.iter().enumerate() {
+            println!("  {}. {} — {}", i + 1, opt.label, opt.description);
+        }
+
+        print!("Answer (number): ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let choice = line.trim().parse::<usize>().ok().and_then(|n| {
+            if n >= 1 && n <= q.options.len() {
+                Some(q.options[n - 1].label.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(label) = choice {
+            answers.insert(q.header.clone(), label);
+        } else {
+            answers.insert(q.header.clone(), String::new());
+        }
     }
-    println!("Type 'exit' or 'quit' to stop.\n");
 
-    let renderer = ConsoleRenderer::new(handle)
-        .show_thinking(true)
-        .show_tools(true);
+    client
+        .send_ask_response(session_id, request_id, answers)
+        .await?;
 
-    renderer.run().await?;
-
-    // --- Cleanup ---
-    println!("\n[Cleanup] Shutting down runtime...");
-    runtime.shutdown_all().await;
-
-    println!("[Cleanup] Done.");
     Ok(())
 }

@@ -58,4 +58,8 @@ path = "src/main.rs"
 name = "omega-sh"
 path = "src/bin/omega-sh.rs"
 
+[[bin]]
+name = "omega-loop"
+path = "src/bin/omega-loop.rs"
+
 

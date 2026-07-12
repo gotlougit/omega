@@ -21,3 +21,6 @@ pub mod hooks;
 // Omega-sh client for delegating tool execution to a daemon
 pub mod omega_client;
 
+// omega-loop client for UI processes
+pub mod omega_loop_client;
+

@@ -781,6 +781,10 @@ impl StandardAgent {
         let mut current_tool_id = String::new();
         let mut current_tool_name = String::new();
         let mut current_tool_signature: Option<String> = None;
+        // Some providers (e.g. OpenAI) send the full tool input upfront in
+        // ContentBlockStart, unlike Anthropic which streams it incrementally
+        // via InputJsonDelta.  We store it here as a fallback.
+        let mut current_tool_start_input: Option<Value> = None;
 
         loop {
             tokio::select! {
@@ -812,11 +816,16 @@ impl StandardAgent {
                                     thinking_accum.clear();
                                     thinking_signature.clear();
                                 }
-                                ContentBlockStart::ToolUse { id, name, signature, .. } => {
+                                ContentBlockStart::ToolUse { id, name, input, signature } => {
                                     tool_input_accum.clear();
                                     current_tool_id = id.clone();
                                     current_tool_name = name.clone();
                                     current_tool_signature = signature.clone();
+                                    // Save the start input – it is the full input for
+                                    // providers that send it upfront (OpenAI) but an
+                                    // empty object for providers that stream it via
+                                    // InputJsonDelta (Anthropic).
+                                    current_tool_start_input = Some(input.clone());
                                 }
                             }
                         }
@@ -865,9 +874,20 @@ impl StandardAgent {
                                 } else if !tool_input_accum.is_empty()
                                     || !current_tool_name.is_empty()
                                 {
-                                    // Parse accumulated JSON
-                                    let input: Value =
-                                        serde_json::from_str(&tool_input_accum).unwrap_or_default();
+                                    // Determine the tool input:
+                                    //   1. If we have accumulated InputJsonDelta events
+                                    //      (Anthropic-style), parse those.
+                                    //   2. Otherwise, fall back to the input that was
+                                    //      provided upfront in ContentBlockStart
+                                    //      (OpenAI-style).
+                                    //   3. If neither is available, use default.
+                                    let input: Value = if !tool_input_accum.is_empty() {
+                                        serde_json::from_str(&tool_input_accum).unwrap_or_default()
+                                    } else if let Some(start_input) = current_tool_start_input.take() {
+                                        start_input
+                                    } else {
+                                        Value::Null
+                                    };
                                     content_blocks.push(ContentBlock::ToolUse {
                                         id: current_tool_id.clone(),
                                         name: current_tool_name.clone(),
@@ -878,6 +898,7 @@ impl StandardAgent {
                                     current_tool_id.clear();
                                     current_tool_name.clear();
                                     current_tool_signature = None;
+                                    current_tool_start_input = None;
                                 }
                                 current_block_index = None;
                             }
