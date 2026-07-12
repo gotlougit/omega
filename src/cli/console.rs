@@ -2,6 +2,7 @@ use colored::*;
 use std::io::{self, Write};
 
 use crate::permissions::{PermissionDecision, PermissionRequest};
+use crate::tools::ToolResult;
 
 /// Console handles all terminal I/O with colored formatting
 pub struct Console {
@@ -99,28 +100,32 @@ impl Console {
         println!("{}", "-".repeat(60).bright_black());
     }
 
-    /// Print a tool action message
-    pub fn print_tool_action(&self, tool_name: &str, action: &str) {
-        println!(
-            "{} {} {}",
-            "Tool:".color(self.tool_color).bold(),
-            format!("[{}]", tool_name).color(self.tool_color),
-            action
-        );
+    /// Print a tool action message (tool name + key args) — no newline, so result follows on same line.
+    pub fn print_tool_action(&self, tool_name: &str, args: &str) {
+        let line = if args.is_empty() {
+            format!("{} {}", "✓".green(), tool_name.color(self.tool_color).bold())
+        } else {
+            format!(
+                "{} {}  {}",
+                "✓".green(),
+                tool_name.color(self.tool_color).bold(),
+                args
+            )
+        };
+        print!("{line}");
+        io::stdout().flush().unwrap();
     }
 
-    /// Print a tool result
-    pub fn print_tool_result(&self, result: &str, is_error: bool) {
-        if is_error {
-            println!("{} {}", "Tool Error:".red().bold(), result);
-        } else {
-            // Truncate long output
-            let display = if result.len() > 500 {
-                format!("{}...\n(output truncated)", &result[..500])
-            } else {
-                result.to_string()
+    /// Print a tool result — appends on same line as the action.
+    pub fn print_tool_result(&self, result: &ToolResult) {
+        if result.is_error {
+            let msg = match &result.content {
+                crate::tools::ToolResultData::Text(t) => t.clone(),
+                _ => String::new(),
             };
-            println!("{}", display.bright_black());
+            println!("  {} {} {}", "✗".red(), "status code 1".red().bold(), msg.red());
+        } else {
+            println!("  {} {}", "✓".green(), "OK".green().bold());
         }
     }
 

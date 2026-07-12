@@ -17,12 +17,13 @@ use picrust::{
     agent::{AgentConfig, StandardAgent},
     cli::ConsoleRenderer,
     llm::{AuthConfig, OpenAIProvider},
+    omega_client::{
+        proxy::{BashProxy, EditProxy, GlobProxy, GrepProxy, ReadProxy, WriteProxy},
+        OmegaClient,
+    },
     runtime::AgentRuntime,
     session::{AgentSession, SessionStorage},
-    tools::{
-        AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, ToolRegistry,
-        WriteTool,
-    },
+    tools::{AskUserQuestionTool, ToolRegistry},
 };
 
 /// System prompt for the agent
@@ -36,16 +37,22 @@ You have the following tools available:
 When the user asks you to do something, use the appropriate tools.
 Be concise in your responses."#;
 
-/// Create the tool registry with all available tools
-fn create_registry() -> Result<ToolRegistry> {
+/// Create the tool registry with all available tools.
+///
+/// Read, Write, Edit, Bash, Glob, and Grep are proxied through the omega-sh
+/// daemon.  AskUserQuestion runs in-process.
+fn create_registry(session_id: &str, cwd: &str) -> Result<ToolRegistry> {
     let mut registry = ToolRegistry::new();
+    let omega = OmegaClient::new()
+        .with_session(session_id)
+        .with_dir(cwd);
 
-    registry.register(ReadTool::new()?);
-    registry.register(WriteTool::new()?);
-    registry.register(BashTool::new()?);
-    registry.register(GrepTool::new()?);
-    registry.register(GlobTool::new()?);
-    registry.register(EditTool::new()?);
+    registry.register(ReadProxy::new(omega.clone()));
+    registry.register(WriteProxy::new(omega.clone()));
+    registry.register(EditProxy::new(omega.clone()));
+    registry.register(BashProxy::new(omega.clone()));
+    registry.register(GlobProxy::new(omega.clone()));
+    registry.register(GrepProxy::new(omega.clone()));
     registry.register(AskUserQuestionTool::new());
 
     Ok(registry)
@@ -99,8 +106,12 @@ async fn main() -> Result<()> {
     let runtime = AgentRuntime::new();
     println!("[Setup] Runtime created");
 
+    let cwd = std::env::current_dir()
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+
     // --- Step 3: Create tool registry ---
-    let tools = Arc::new(create_registry()?);
+    let tools = Arc::new(create_registry(&session_id, &cwd)?);
     println!("[Setup] Tools registered: {:?}", tools.tool_names());
 
     // --- Step 4: Create hooks (none — all tools allowed) ---

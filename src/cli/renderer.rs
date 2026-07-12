@@ -8,7 +8,9 @@
 //!
 //! This can be replaced with other renderers (Tauri UI, Web UI, etc.)
 
-use std::io::{self, Write};
+use std::io::{self};
+
+use serde_json::Value;
 
 use crate::core::{InputMessage, OutputChunk};
 use crate::permissions::PermissionDecision;
@@ -174,34 +176,22 @@ impl ConsoleRenderer {
                         }
 
                         // Tool execution
-                        OutputChunk::ToolStart { name, .. } => {
+                        OutputChunk::ToolStart { name, input, .. } => {
                             if in_text {
                                 self.console.println();
                                 in_text = false;
                             }
                             if self.show_tools {
-                                self.console.print_tool_action(&name, "executing...");
+                                let args = format_tool_args(&name, &input);
+                                self.console.print_tool_action(&name, &args);
                             }
                         }
-                        OutputChunk::ToolProgress { output, .. } => {
-                            if self.show_tools {
-                                print!("{}", output);
-                                io::stdout().flush()?;
-                            }
+                        OutputChunk::ToolProgress { .. } => {
+                            // Tool progress output suppressed
                         }
                         OutputChunk::ToolEnd { result, .. } => {
                             if self.show_tools {
-                                use crate::tools::ToolResultData;
-                                let output_text = match &result.content {
-                                    ToolResultData::Text(text) => text.clone(),
-                                    ToolResultData::Image { data, media_type } => {
-                                        format!("Image ({}, {} bytes)", media_type, data.len())
-                                    }
-                                    ToolResultData::Document { description, data, media_type } => {
-                                        format!("{} ({}, {} bytes)", description, media_type, data.len())
-                                    }
-                                };
-                                self.console.print_tool_result(&output_text, result.is_error);
+                                self.console.print_tool_result(&result);
                             }
                         }
 
@@ -323,5 +313,69 @@ impl ConsoleRenderer {
     /// Get the underlying console
     pub fn console(&self) -> &Console {
         &self.console
+    }
+}
+
+/// Format key arguments for a tool into a one-liner string.
+fn format_tool_args(name: &str, input: &Value) -> String {
+    match name {
+        "Read" | "Write" | "Edit" => {
+            if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                path.to_string()
+            } else if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                path.to_string()
+            } else {
+                String::new()
+            }
+        }
+        "Bash" => {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                let truncated = if cmd.len() > 80 {
+                    format!("{}…", &cmd[..80])
+                } else {
+                    cmd.to_string()
+                };
+                format!("$ {}", truncated)
+            } else {
+                String::new()
+            }
+        }
+        "Grep" => {
+            if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+                format!("\"{}\"", pattern)
+            } else if let Some(pattern) = input.get("regex").and_then(|v| v.as_str()) {
+                format!("/{}/", pattern)
+            } else {
+                String::new()
+            }
+        }
+        "Glob" => {
+            if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+                pattern.to_string()
+            } else {
+                String::new()
+            }
+        }
+        "AskUserQuestion" => {
+            if let Some(questions) = input.get("questions").and_then(|v| v.as_array()) {
+                if let Some(first) = questions.first() {
+                    if let Some(q) = first.get("question").and_then(|v| v.as_str()) {
+                        let truncated = if q.len() > 60 {
+                            format!("{}…", &q[..60])
+                        } else {
+                            q.to_string()
+                        };
+                        truncated
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
     }
 }

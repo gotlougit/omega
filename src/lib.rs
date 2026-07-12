@@ -18,3 +18,6 @@ pub mod agent;
 // Hooks for intercepting agent behavior
 pub mod hooks;
 
+// Omega-sh client for delegating tool execution to a daemon
+pub mod omega_client;
+

@@ -50,4 +50,12 @@ chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.24.0"
 regex = "1.12.2"
 
+[[bin]]
+name = "picrust"
+path = "src/main.rs"
+
+[[bin]]
+name = "omega-sh"
+path = "src/bin/omega-sh.rs"
+
 
