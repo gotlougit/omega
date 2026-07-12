@@ -16,7 +16,6 @@ use anyhow::{bail, Result};
 use picrust::{
     agent::{AgentConfig, StandardAgent},
     cli::ConsoleRenderer,
-    hooks::{HookContext, HookEvent, HookRegistry, HookResult},
     llm::{AuthConfig, OpenAIProvider},
     runtime::AgentRuntime,
     session::{AgentSession, SessionStorage},
@@ -70,8 +69,7 @@ async fn main() -> Result<()> {
     );
 
     println!("=== Picrust ===");
-    println!("A coding agent powered by Claude.");
-    println!("Read operations are pre-allowed. Others will require permission.");
+    println!("A coding agent. All tools are allowed.");
     println!("Use --stream/-s flag to enable streaming responses.");
     println!("Use --think/-t flag to enable extended thinking.");
     println!("Prompt caching is enabled by default (use --no-cache to disable).\n");
@@ -97,46 +95,16 @@ async fn main() -> Result<()> {
     );
     println!("[Setup] Model: {}", llm.model());
 
-    // --- Step 2: Create runtime with global Read permission ---
+    // --- Step 2: Create runtime ---
     let runtime = AgentRuntime::new();
-    runtime.global_permissions();
-    println!("[Setup] Runtime created (Read tool globally allowed)");
+    println!("[Setup] Runtime created");
 
     // --- Step 3: Create tool registry ---
     let tools = Arc::new(create_registry()?);
     println!("[Setup] Tools registered: {:?}", tools.tool_names());
 
-    // --- Step 4: Create hooks ---
-    let mut hooks = HookRegistry::new();
-
-    // Block dangerous Bash commands
-    hooks
-        .add_with_pattern(HookEvent::PreToolUse, "Bash", |ctx: &mut HookContext| {
-            let cmd = ctx
-                .tool_input
-                .as_ref()
-                .and_then(|v| v.get("command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if cmd.contains("rm ") {
-                HookResult::deny("Dangerous command blocked by safety hook")
-            } else {
-                HookResult::none()
-            }
-        })
-        .expect("Invalid regex pattern");
-
-    // Auto-approve read-only tools
-    hooks
-        .add_with_pattern(
-            HookEvent::PreToolUse,
-            "^(Read|Glob|Grep)$",
-            |_ctx: &mut HookContext| HookResult::allow(),
-        )
-        .expect("Invalid regex pattern");
-
-    println!("[Setup] Hooks configured: dangerous command blocker, read-only auto-approve");
+    // --- Step 4: Create hooks (none — all tools allowed) ---
+    let hooks = picrust::hooks::HookRegistry::new();
 
     // --- Step 5: Create or load session ---
     let storage = SessionStorage::with_dir("./sessions");
@@ -185,7 +153,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "[Setup] AgentConfig created with debug logging, hooks{}{}{}",
+        "[Setup] AgentConfig created{}{}{}",
         if streaming { ", streaming enabled" } else { "" },
         if thinking { ", extended thinking enabled" } else { "" },
         if caching { ", prompt caching enabled" } else { ", prompt caching disabled" }
@@ -203,7 +171,7 @@ async fn main() -> Result<()> {
     // --- Step 8: Run the console renderer ---
     println!("[Setup] Starting console renderer...");
     println!();
-    println!("Type your requests below. Read/Glob/Grep are auto-approved by hooks.");
+    println!("Type your requests below. All tools are allowed.");
     if caching {
         println!("📋 Attempting to optimize context (OpenAI does not support Anthropic-style caching)");
     } else {
