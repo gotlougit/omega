@@ -23,8 +23,6 @@ use super::types::{
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Send a simple message and get a text response (no tool calling).
-    ///
-    /// Used by ConversationNamer and other simple use cases.
     async fn send_message(
         &self,
         user_message: &str,
@@ -67,8 +65,5 @@ pub trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
 
     /// Create a lightweight variant of this provider with a different model and max tokens.
-    ///
-    /// Used by ConversationNamer to create a Haiku-based namer that shares
-    /// the same authentication configuration.
     fn create_variant(&self, model: &str, max_tokens: u32) -> Arc<dyn LlmProvider>;
 }

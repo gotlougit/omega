@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::helpers::InjectionChain;
 use crate::hooks::HookRegistry;
-use crate::llm::{LlmProvider, ThinkingConfig};
+use crate::llm::ThinkingConfig;
 use crate::tools::ToolRegistry;
 
 /// Configuration for a StandardAgent
@@ -52,10 +52,6 @@ pub struct AgentConfig {
     /// Use hooks to block dangerous operations, modify tool inputs, auto-approve tools, etc.
     pub hooks: Option<Arc<HookRegistry>>,
 
-    /// Whether to automatically generate a conversation name after the first turn
-    /// Uses Haiku to create a short, descriptive name based on conversation content.
-    pub auto_name_conversation: bool,
-
     /// Whether to enable prompt caching
     /// When enabled, the agent will automatically add cache_control breakpoints to:
     /// - The last tool definition (caches all tools)
@@ -63,11 +59,6 @@ pub struct AgentConfig {
     /// - The last message block before each LLM call (caches conversation history)
     /// This significantly reduces costs and latency for multi-turn conversations.
     pub enable_prompt_caching: bool,
-
-    /// Optional LLM provider for conversation naming.
-    /// If set, this provider is used for auto-naming conversations (typically a
-    /// lightweight/fast model). If not set, the main agent LLM is used.
-    pub naming_llm: Option<Arc<dyn LlmProvider>>,
 
     /// Whether to enable hook short-circuiting.
     ///
@@ -139,9 +130,7 @@ impl AgentConfig {
             streaming_enabled: false,
             thinking: None,
             hooks: None,
-            auto_name_conversation: true,
             enable_prompt_caching: true,
-            naming_llm: None,
             hook_short_circuit: false, // Safe default: all hooks run
             dangerous_skip_permissions: false, // Safe default: permissions enforced
             turn_retry: TurnRetryConfig::default(),
@@ -264,28 +253,6 @@ impl AgentConfig {
     /// ```
     pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
         self.hooks = Some(Arc::new(hooks));
-        self
-    }
-
-    /// Enable or disable automatic conversation naming
-    ///
-    /// When enabled (default), the agent will automatically generate a short,
-    /// descriptive name for the conversation after the first turn completes.
-    /// Uses the naming LLM if set (see [`with_naming_llm`](Self::with_naming_llm)),
-    /// otherwise uses the main agent LLM.
-    pub fn with_auto_name(mut self, enabled: bool) -> Self {
-        self.auto_name_conversation = enabled;
-        self
-    }
-
-    /// Set a separate LLM provider for conversation naming
-    ///
-    /// This allows using a lightweight/fast model for naming (e.g., Haiku or Flash)
-    /// while the main agent uses a more capable model.
-    ///
-    /// If not set, the main agent LLM is used for naming.
-    pub fn with_naming_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
-        self.naming_llm = Some(llm);
         self
     }
 
@@ -421,9 +388,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("streaming_enabled", &self.streaming_enabled)
             .field("thinking", &self.thinking)
             .field("hooks", &self.hooks.as_ref().map(|h| format!("{:?}", h)))
-            .field("auto_name_conversation", &self.auto_name_conversation)
             .field("enable_prompt_caching", &self.enable_prompt_caching)
-            .field("naming_llm", &self.naming_llm.as_ref().map(|l| l.model()))
             .field("hook_short_circuit", &self.hook_short_circuit)
             .field(
                 "dangerous_skip_permissions",
@@ -443,7 +408,6 @@ mod tests {
         let config = AgentConfig::default();
         assert!(!config.debug_enabled);
         assert!(config.auto_save_session);
-        assert!(config.auto_name_conversation);
         assert_eq!(config.max_tool_iterations, 100);
     }
 

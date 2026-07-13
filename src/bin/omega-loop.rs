@@ -223,7 +223,6 @@ async fn handle_connection(
                         .with_tools(tools.clone())
                         .with_streaming(config.stream)
                         .with_prompt_caching(!config.no_cache)
-                        .with_auto_name(true)
                         .with_dangerous_skip_permissions(true);
 
                     if config.think {

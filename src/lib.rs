@@ -6,6 +6,7 @@ pub mod tools;
 
 // Optional components
 pub mod cli;
+pub mod tui;
 pub mod llm;
 pub mod logging;
 

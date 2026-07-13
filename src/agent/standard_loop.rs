@@ -15,7 +15,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use crate::core::{FrameworkResult, InputMessage};
-use crate::helpers::{process_attachments, ConversationNamer, Debugger};
+use crate::helpers::{process_attachments, Debugger};
 use crate::hooks::HookContext;
 use crate::llm::{
     CacheControl, ContentBlock, ContentBlockStart, ContentDelta, LlmProvider, Message, StopReason,
@@ -192,18 +192,8 @@ impl StandardAgent {
                             }
                         }
 
-                        if self.config.auto_name_conversation && internals.context.current_turn == 0
-                        {
-                            let session_id = {
-                                let session = internals.session.read().await;
-                                session.session_id().to_string()
-                            };
-                            let has_name = internals.session.read().await.has_conversation_name();
-                            if !has_name {
-                                self.generate_conversation_name(&mut internals, Some(&session_id))
-                                    .await;
-                            }
-                        }
+                        // Conversation naming removed — it caused a 30-second blocking
+                        // LLM call before send_done(), freezing the TUI.
                     }
                     // Run TurnComplete hooks
                     if let Some(ref hooks) = self.config.hooks {
@@ -249,42 +239,7 @@ impl StandardAgent {
         Ok(())
     }
 
-    /// Generate a conversation name using the ConversationNamer helper
-    async fn generate_conversation_name(
-        &self,
-        internals: &mut AgentInternals,
-        session_id: Option<&str>,
-    ) {
-        tracing::debug!("[StandardAgent] Generating conversation name...");
 
-        // Use naming LLM if configured, otherwise fall back to main LLM
-        let naming_llm = self
-            .config
-            .naming_llm
-            .clone()
-            .unwrap_or_else(|| self.llm.clone());
-        let namer = ConversationNamer::new(naming_llm);
-        let history = {
-            let session = internals.session.read().await;
-            session.history().to_vec()
-        };
-
-        match namer.generate_name(&history, session_id).await {
-            Ok(name) => {
-                tracing::info!("[StandardAgent] Generated conversation name: {}", name);
-                let mut session = internals.session.write().await;
-                if let Err(e) = session.set_conversation_name(&name) {
-                    tracing::warn!("[StandardAgent] Failed to save conversation name: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[StandardAgent] Failed to generate conversation name: {}",
-                    e
-                );
-            }
-        }
-    }
 
     /// Process a single user turn (may involve multiple LLM calls for tool use)
     ///

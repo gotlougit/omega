@@ -56,6 +56,12 @@ pub enum OutputChunk {
         request_id: String,
         questions: Vec<UserQuestionWire>,
     },
+    PermissionRequest {
+        tool_name: String,
+        action: String,
+        input: String,
+        details: Option<String>,
+    },
     Status(String),
     Error(String),
     Done,
@@ -75,7 +81,7 @@ pub struct ContentBlockWire {
     pub text: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UserQuestionWire {
     pub question: String,
     pub header: String,
@@ -83,7 +89,7 @@ pub struct UserQuestionWire {
     pub multi_select: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QuestionOptionWire {
     pub label: String,
     pub description: String,
@@ -173,6 +179,33 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                         OutputChunk::AskUserQuestion {
                             request_id,
                             questions,
+                        }
+                    }
+                    "PermissionRequest" => {
+                        let tool_name = inner
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let action = inner
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = inner
+                            .get("input")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let details = inner
+                            .get("details")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        OutputChunk::PermissionRequest {
+                            tool_name,
+                            action,
+                            input,
+                            details,
                         }
                     }
                     "Status" => inner
@@ -289,6 +322,7 @@ impl ServerEvent {
 // ---------------------------------------------------------------------------
 
 /// Session configuration sent with a `run` request.
+#[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub stream: bool,
     pub think: bool,
@@ -303,6 +337,16 @@ impl Default for SessionConfig {
             no_cache: false,
         }
     }
+}
+
+/// Read half of a daemon connection — reads events from the socket.
+pub struct DaemonReader {
+    reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
+}
+
+/// Write half of a daemon connection — sends commands to the socket.
+pub struct DaemonWriter {
+    writer: tokio::io::WriteHalf<UnixStream>,
 }
 
 /// A client connected to the omega-loop daemon.
@@ -381,6 +425,89 @@ impl AgentdClient {
                 return Ok(Some(event));
             }
         }
+    }
+
+    /// Try to read an event without blocking. Returns `None` if no data is available.
+    pub fn try_recv_event(&mut self) -> Result<Option<ServerEvent>> {
+        Ok(None)
+    }
+
+    /// Split the client into separate reader and writer halves.
+    ///
+    /// Use this when you need to read events and write commands
+    /// concurrently from different tasks (no Mutex required).
+    pub fn split(self) -> (DaemonReader, DaemonWriter) {
+        (
+            DaemonReader {
+                reader: self.reader,
+            },
+            DaemonWriter {
+                writer: self.writer,
+            },
+        )
+    }
+
+    async fn write_json(&mut self, value: &Value) -> Result<()> {
+        let json = serde_json::to_string(value)?;
+        self.writer.write_all(json.as_bytes()).await?;
+        self.writer.write_all(b"\n").await?;
+        Ok(())
+    }
+}
+
+impl DaemonReader {
+    /// Read the next event from the daemon. Returns `None` on EOF.
+    pub async fn recv_event(&mut self) -> Result<Option<ServerEvent>> {
+        loop {
+            let mut line = String::new();
+            let n = self.reader.read_line(&mut line).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let line = line.trim();
+            if !line.is_empty() {
+                let event = ServerEvent::from_json_line(line)?;
+                return Ok(Some(event));
+            }
+        }
+    }
+}
+
+impl DaemonWriter {
+    /// Send a `run` request (creates session if new, then sends the message).
+    pub async fn send_run(
+        &mut self,
+        session_id: &str,
+        content: &str,
+        config: &SessionConfig,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "run",
+            "session_id": session_id,
+            "content": content,
+            "config": {
+                "stream": config.stream,
+                "think": config.think,
+                "no_cache": config.no_cache,
+            },
+        });
+        self.write_json(&req).await
+    }
+
+    /// Send an `ask_response` to the daemon.
+    pub async fn send_ask_response(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        answers: HashMap<String, String>,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "ask_response",
+            "session_id": session_id,
+            "request_id": request_id,
+            "answers": answers,
+        });
+        self.write_json(&req).await
     }
 
     async fn write_json(&mut self, value: &Value) -> Result<()> {

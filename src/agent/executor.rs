@@ -43,8 +43,8 @@ impl ToolExecutor {
             }
         }
 
-        // Send tool start notification
-        internals.send_tool_start(tool_name, tool_name, input.clone());
+        // Send tool start notification — use the actual LLM-assigned tool-use ID
+        internals.send_tool_start(tool_id, tool_name, input.clone());
 
         // Execute
         let result = match tools.execute(tool_name, input, internals).await {
@@ -59,8 +59,8 @@ impl ToolExecutor {
             }
         }
 
-        // Send tool end notification
-        internals.send_tool_end(tool_name, result.clone());
+        // Send tool end notification — use the actual LLM-assigned tool-use ID
+        internals.send_tool_end(tool_id, result.clone());
         internals.context.current_tool_use_id = None;
 
         result

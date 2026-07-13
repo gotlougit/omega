@@ -13,5 +13,5 @@ pub mod state;
 
 pub use context::{AgentContext, DangerousSkipPermissions, ResourceMap};
 pub use error::{FrameworkError, FrameworkResult};
-pub use output::{InputMessage, OutputChunk};
+pub use output::{InputMessage, OutputChunk, UserQuestion, QuestionOption};
 pub use state::AgentState;
