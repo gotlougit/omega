@@ -222,12 +222,18 @@ async fn handle_connection(
 
                     // --- create session ----------------------------------
                     let storage = SessionStorage::with_dir("./sessions");
+                    // Read system prompt from OMEGA_SYSTEM_PROMPT_PATH file, or empty
+                    let system_prompt = env::var("OMEGA_SYSTEM_PROMPT_PATH")
+                        .ok()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .unwrap_or_default();
+
                     let agent_session = match AgentSession::new_with_storage(
                         &session_id,
                         "picrust",
                         "Picrust Agent",
                         "A coding agent",
-                        "", // system prompt – baked into the session file
+                        &system_prompt,
                         storage,
                     ) {
                         Ok(s) => s,

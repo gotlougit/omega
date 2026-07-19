@@ -1,6 +1,5 @@
 /target
 .env
-Cargo.lock
 logs/
 
 # Conversations (remove this line if you want to track conversation history in git)
@@ -11,4 +10,5 @@ test-2/
 test-3/
 sessions/
 
+result
 *.DS_Store

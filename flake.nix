@@ -1,5 +1,5 @@
 {
-  description = "Generic Rust Dev Environment";
+  description = "Picrust — AI coding agent with persistent omega services";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -16,6 +16,35 @@
       nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
     in
     {
+      # --------------------------------------------------------------------------
+      # Packages — the four picrust binaries
+      # --------------------------------------------------------------------------
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgsFor.${system};
+          picrust = pkgs.rustPlatform.buildRustPackage {
+            pname = "picrust";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [ openssl.dev ];
+            doCheck = false;
+          };
+        in
+        {
+          default = picrust;
+          picrust = picrust;
+          omega-sh = picrust;
+          omega-loop = picrust;
+          picrust-tui = picrust;
+        }
+      );
+
+      # --------------------------------------------------------------------------
+      # Dev shells (retained from original config)
+      # --------------------------------------------------------------------------
       devShells = forAllSystems (
         system:
         let
@@ -34,17 +63,43 @@
             buildInputs = [
               pkgs.pkg-config
               pkgs.openssl.dev
-              pkgs.sqlite.dev
               pkgs.rustc
               pkgs.cargo
               pkgs.rustfmt
               pkgs.clippy
               pkgs.rust-analyzer
               pkgs.gdb
-              pkgs.python313Packages.playwright
+              pkgs.git
+              pkgs.nix
+              pkgs.ripgrep
             ];
           };
         }
       );
+
+      # --------------------------------------------------------------------------
+      # NixOS module — import this in your system configuration to set up
+      # the picrust omega services (omega-sh + omega-loop) as systemd units
+      # running under the dedicated "clanker" user.
+      #
+      # Usage:
+      #   # flake.nix
+      #   inputs.picrust.url = "path:/home/gotlou/Code/picrust";
+      #
+      #   outputs = { self, nixpkgs, picrust, ... }: {
+      #     nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      #       modules = [
+      #         picrust.nixosModules.picrust
+      #         {
+      #           services.picrust = {
+      #             enable = true;
+      #             humanUsers = [ "gotlou" ];
+      #           };
+      #         }
+      #       ];
+      #     };
+      #   };
+      # --------------------------------------------------------------------------
+      nixosModules.picrust = import ./nixos/module.nix;
     };
 }
