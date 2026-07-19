@@ -27,6 +27,25 @@ pub enum ServerEvent {
         session_id: String,
         chunk: OutputChunk,
     },
+    /// List of available sessions (response to list_sessions).
+    SessionList {
+        sessions: Vec<String>,
+    },
+    /// A session was resumed.
+    SessionResumed {
+        session_id: String,
+        session_name: String,
+    },
+    /// Model was changed.
+    ModelChanged {
+        model: String,
+    },
+    /// Session was compacted.
+    SessionCompacted {
+        session_id: String,
+    },
+    /// A system message from the daemon.
+    SystemMsg(String),
     /// An unrecognised variant (forward-compatibility).
     Unknown(Value),
 }
@@ -312,6 +331,50 @@ impl ServerEvent {
                 let chunk = parse_chunk(&chunk_val);
                 Ok(ServerEvent::Chunk { session_id, chunk })
             }
+            "SessionList" => {
+                let sessions = obj
+                    .get("sessions")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(ServerEvent::SessionList { sessions })
+            }
+            "SessionResumed" => Ok(ServerEvent::SessionResumed {
+                session_id: obj
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                session_name: obj
+                    .get("session_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+            "ModelChanged" => Ok(ServerEvent::ModelChanged {
+                model: obj
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+            "SessionCompacted" => Ok(ServerEvent::SessionCompacted {
+                session_id: obj
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+            "SystemMsg" => Ok(ServerEvent::SystemMsg(
+                obj.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )),
             _ => Ok(ServerEvent::Unknown(val)),
         }
     }
@@ -510,10 +573,216 @@ impl DaemonWriter {
         self.write_json(&req).await
     }
 
+    /// Request the list of available sessions from the daemon.
+    pub async fn send_list_sessions(&mut self) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "list_sessions",
+        });
+        self.write_json(&req).await
+    }
+
+    /// Resume an existing session by ID.
+    pub async fn send_resume_session(&mut self, session_id: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "resume_session",
+            "session_id": session_id,
+        });
+        self.write_json(&req).await
+    }
+
+    /// Change the model for a session.
+    pub async fn send_set_model(
+        &mut self,
+        session_id: &str,
+        model: &str,
+        max_tokens: u32,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "set_model",
+            "session_id": session_id,
+            "model": model,
+            "max_tokens": max_tokens,
+        });
+        self.write_json(&req).await
+    }
+
+    /// Compact the current session (summarize/trim history).
+    pub async fn send_compact(&mut self, session_id: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "compact",
+            "session_id": session_id,
+        });
+        self.write_json(&req).await
+    }
+
     async fn write_json(&mut self, value: &Value) -> Result<()> {
         let json = serde_json::to_string(value)?;
         self.writer.write_all(json.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_created_event() {
+        let json = r#"{"type":"Created","session_id":"test-123","session_name":"Test Session"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::Created { session_id, session_name } => {
+                assert_eq!(session_id, "test-123");
+                assert_eq!(session_name, "Test Session");
+            }
+            _ => panic!("Expected Created event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_session_list_event() {
+        let json = r#"{"type":"SessionList","sessions":["sess1","sess2"]}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::SessionList { sessions } => {
+                assert_eq!(sessions, vec!["sess1", "sess2"]);
+            }
+            _ => panic!("Expected SessionList event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_changed_event() {
+        let json = r#"{"type":"ModelChanged","model":"gpt-4o"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::ModelChanged { model } => {
+                assert_eq!(model, "gpt-4o");
+            }
+            _ => panic!("Expected ModelChanged event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_system_msg_event() {
+        let json = r#"{"type":"SystemMsg","message":"Hello world"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::SystemMsg(msg) => {
+                assert_eq!(msg, "Hello world");
+            }
+            _ => panic!("Expected SystemMsg event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unknown_event() {
+        let json = r#"{"type":"UnknownType","foo":"bar"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::Unknown(val) => {
+                assert_eq!(val.get("type").and_then(|v| v.as_str()), Some("UnknownType"));
+            }
+            _ => panic!("Expected Unknown event"),
+        }
+    }
+
+    #[test]
+    fn test_output_chunk_parse_text_delta() {
+        let json = r#"{"TextDelta":"Hello"}"#;
+        let val: serde_json::Value = serde_json::from_str(json).unwrap();
+        let chunk = parse_chunk(&val);
+        match chunk {
+            OutputChunk::TextDelta(s) => assert_eq!(s, "Hello"),
+            _ => panic!("Expected TextDelta"),
+        }
+    }
+
+    #[test]
+    fn test_output_chunk_parse_done() {
+        let val = serde_json::Value::String("Done".to_string());
+        let chunk = parse_chunk(&val);
+        match chunk {
+            OutputChunk::Done => {},
+            _ => panic!("Expected Done"),
+        }
+    }
+
+    #[test]
+    fn test_session_config_default() {
+        let config = SessionConfig::default();
+        assert!(config.stream);
+        assert!(!config.think);
+        assert!(!config.no_cache);
+    }
+
+    #[test]
+    fn test_server_event_from_invalid_json() {
+        let result = ServerEvent::from_json_line("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_send_run_json_shape() {
+        let json = serde_json::json!({
+            "type": "run",
+            "session_id": "sess-1",
+            "content": "Hello",
+            "config": {
+                "stream": true,
+                "think": false,
+                "no_cache": false,
+            },
+        });
+        assert_eq!(json["type"], "run");
+        assert_eq!(json["session_id"], "sess-1");
+        assert_eq!(json["content"], "Hello");
+        assert_eq!(json["config"]["stream"], true);
+        assert_eq!(json["config"]["think"], false);
+    }
+
+    #[test]
+    fn test_send_list_sessions_json_shape() {
+        let json = serde_json::json!({"type": "list_sessions"});
+        assert_eq!(json["type"], "list_sessions");
+    }
+
+    #[test]
+    fn test_send_resume_session_json_shape() {
+        let json = serde_json::json!({
+            "type": "resume_session",
+            "session_id": "sess-1",
+        });
+        assert_eq!(json["type"], "resume_session");
+        assert_eq!(json["session_id"], "sess-1");
+    }
+
+    #[test]
+    fn test_send_set_model_json_shape() {
+        let json = serde_json::json!({
+            "type": "set_model",
+            "session_id": "sess-1",
+            "model": "claude-3.5",
+            "max_tokens": 8192,
+        });
+        assert_eq!(json["type"], "set_model");
+        assert_eq!(json["session_id"], "sess-1");
+        assert_eq!(json["model"], "claude-3.5");
+        assert_eq!(json["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn test_send_compact_json_shape() {
+        let json = serde_json::json!({
+            "type": "compact",
+            "session_id": "sess-1",
+        });
+        assert_eq!(json["type"], "compact");
+        assert_eq!(json["session_id"], "sess-1");
     }
 }

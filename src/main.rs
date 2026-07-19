@@ -146,6 +146,24 @@ async fn main() -> Result<()> {
                         break;
                     }
                 }
+                Some(ServerEvent::SessionList { sessions }) => {
+                    println!("Available sessions:");
+                    for s in &sessions {
+                        println!("  {s}");
+                    }
+                }
+                Some(ServerEvent::SessionResumed { session_name, .. }) => {
+                    println!("Resumed session: {session_name}");
+                }
+                Some(ServerEvent::ModelChanged { model }) => {
+                    println!("Model changed to: {model}");
+                }
+                Some(ServerEvent::SessionCompacted { .. }) => {
+                    println!("Session compacted.");
+                }
+                Some(ServerEvent::SystemMsg(msg)) => {
+                    println!("[system] {msg}");
+                }
                 Some(ServerEvent::Unknown(val)) => {
                     tracing::debug!("Unknown server event: {val}");
                 }

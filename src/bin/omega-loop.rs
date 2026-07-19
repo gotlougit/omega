@@ -53,6 +53,8 @@ struct ClientRequest {
     config: Option<SessionConfig>,
     request_id: Option<String>,
     answers: Option<HashMap<String, String>>,
+    model: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -75,6 +77,22 @@ enum ServerEvent {
     Chunk {
         session_id: String,
         chunk: picrust::core::OutputChunk,
+    },
+    SessionList {
+        sessions: Vec<String>,
+    },
+    SessionResumed {
+        session_id: String,
+        session_name: String,
+    },
+    ModelChanged {
+        model: String,
+    },
+    SessionCompacted {
+        session_id: String,
+    },
+    SystemMsg {
+        message: String,
     },
 }
 
@@ -123,7 +141,8 @@ fn create_tools() -> Result<Arc<ToolRegistry>> {
 
 async fn handle_connection(
     stream: tokio::net::UnixStream,
-    llm: Arc<dyn LlmProvider>,
+    current_provider: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
+    session_storage: Arc<picrust::session::SessionStorage>,
     tools: Arc<ToolRegistry>,
     runtime: AgentRuntime,
 ) {
@@ -229,7 +248,7 @@ async fn handle_connection(
                         agent_cfg = agent_cfg.with_thinking(16000);
                     }
 
-                    let agent = StandardAgent::new(agent_cfg, llm.clone());
+                    let agent = StandardAgent::new(agent_cfg, current_provider.read().unwrap().clone());
 
                     // --- spawn agent task --------------------------------
                     let handle = runtime
@@ -298,6 +317,219 @@ async fn handle_connection(
                 }
             }
 
+            "new_session" | "new" => {
+                // Explicitly created on next run; just acknowledge.
+                let _ = event_tx.send(ServerEvent::Created {
+                    session_id: session_id.clone(),
+                    session_name: session_id.clone(),
+                });
+            }
+
+            "list_sessions" => {
+                let list = match session_storage.list_top_level_sessions() {
+                    Ok(sessions) => sessions,
+                    Err(e) => {
+                        tracing::warn!("list_sessions error: {e}");
+                        Vec::new()
+                    }
+                };
+                let _ = event_tx.send(ServerEvent::SessionList { sessions: list });
+            }
+
+            "resume_session" => {
+                if session_storage.session_exists(&session_id) {
+                    let mut sessions_lock = sessions.lock().await;
+                    if !sessions_lock.contains_key(&session_id) {
+                        // Load existing session from disk
+                        let agent_session = match picrust::session::AgentSession::load_with_storage(
+                            &session_id,
+                            picrust::session::SessionStorage::with_dir("./sessions"),
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(%session_id, "resume load session: {e}");
+                                let _ = event_tx.send(ServerEvent::SystemMsg {
+                                    message: format!("Cannot resume session: {e}"),
+                                });
+                                continue;
+                            }
+                        };
+
+                        let prov = current_provider.read().unwrap().clone();
+                        let agent_cfg = AgentConfig::new()
+                            .with_tools(tools.clone())
+                            .with_streaming(true)
+                            .with_dangerous_skip_permissions(true);
+                        let agent = StandardAgent::new(agent_cfg, prov);
+
+                        let handle = runtime
+                            .spawn(agent_session, |internals| agent.run(internals))
+                            .await;
+
+                        let mut output_rx = handle.subscribe();
+                        let ev_tx = event_tx.clone();
+                        let sid = session_id.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match output_rx.recv().await {
+                                    Ok(chunk) => {
+                                        let event = ServerEvent::Chunk {
+                                            session_id: sid.clone(),
+                                            chunk,
+                                        };
+                                        if ev_tx.send(event).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(%sid, "output forwarder lagged by {n}");
+                                    }
+                                }
+                            }
+                        });
+
+                        sessions_lock.insert(session_id.clone(), handle);
+                    }
+
+                    let _ = event_tx.send(ServerEvent::SessionResumed {
+                        session_id: session_id.clone(),
+                        session_name: session_id.clone(),
+                    });
+
+                    // Load message history and replay it to the client
+                    if let Ok(messages) = session_storage.load_messages(&session_id) {
+                        for msg in &messages {
+                            match msg.role.as_str() {
+                                "user" => {
+                                    let content = match &msg.content {
+                                        picrust::llm::MessageContent::Text(t) => t.clone(),
+                                        picrust::llm::MessageContent::Blocks(blocks) => {
+                                            blocks.iter().filter_map(|b| {
+                                                if let picrust::llm::ContentBlock::Text { text, .. } = b {
+                                                    Some(text.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            }).collect::<Vec<_>>().join(" ")
+                                        }
+                                    };
+                                    let _ = event_tx.send(ServerEvent::SystemMsg {
+                                        message: format!("[History] User: {content}"),
+                                    });
+                                }
+                                "assistant" => {
+                                    let content = match &msg.content {
+                                        picrust::llm::MessageContent::Text(t) => t.clone(),
+                                        picrust::llm::MessageContent::Blocks(blocks) => {
+                                            blocks.iter().filter_map(|b| {
+                                                if let picrust::llm::ContentBlock::Text { text, .. } = b {
+                                                    Some(text.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            }).collect::<Vec<_>>().join(" ")
+                                        }
+                                    };
+                                    if !content.is_empty() {
+                                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                                            message: format!("[History] Assistant: {content}"),
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    let _ = event_tx.send(ServerEvent::SystemMsg {
+                        message: format!("Session '{session_id}' not found"),
+                    });
+                }
+            }
+
+            "set_model" => {
+                if let Some(model) = &req.model {
+                    let max_tokens = req.max_tokens.unwrap_or(16384);
+                    let prov = current_provider.read().unwrap().clone();
+                    let new_provider = prov.create_variant(model, max_tokens);
+                    *current_provider.write().unwrap() = new_provider;
+                    let _ = event_tx.send(ServerEvent::ModelChanged {
+                        model: model.clone(),
+                    });
+                    tracing::info!(model = %model, "model changed");
+                }
+            }
+
+            "compact" => {
+                let mut sessions_lock = sessions.lock().await;
+                if let Some(handle) = sessions_lock.get(&session_id) {
+                    // Interrupt current processing
+                    let _ = handle.interrupt().await;
+                    // Remove the old handle (the agent task will terminate)
+                    sessions_lock.remove(&session_id);
+                }
+
+                // Reload session from disk and re-spawn so the channel is fresh
+                match picrust::session::AgentSession::load_with_storage(
+                    &session_id,
+                    picrust::session::SessionStorage::with_dir("./sessions"),
+                ) {
+                    Ok(agent_session) => {
+                        let prov = current_provider.read().unwrap().clone();
+                        let agent_cfg = AgentConfig::new()
+                            .with_tools(tools.clone())
+                            .with_streaming(true)
+                            .with_dangerous_skip_permissions(true);
+                        let agent = StandardAgent::new(agent_cfg, prov);
+
+                        let handle = runtime
+                            .spawn(agent_session, |internals| agent.run(internals))
+                            .await;
+
+                        // Forward output chunks to the event channel
+                        let mut output_rx = handle.subscribe();
+                        let ev_tx = event_tx.clone();
+                        let sid = session_id.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match output_rx.recv().await {
+                                    Ok(chunk) => {
+                                        let event = ServerEvent::Chunk {
+                                            session_id: sid.clone(),
+                                            chunk,
+                                        };
+                                        if ev_tx.send(event).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(%sid, "output forwarder lagged by {n}");
+                                    }
+                                }
+                            }
+                        });
+
+                        sessions_lock.insert(session_id.clone(), handle);
+
+                        let _ = event_tx.send(ServerEvent::SessionCompacted {
+                            session_id: session_id.clone(),
+                        });
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: format!("Session '{}' compacted and re-created", session_id),
+                        });
+                        tracing::info!(%session_id, "session compacted and re-created");
+                    }
+                    Err(e) => {
+                        tracing::error!(%session_id, "compact reload session: {e}");
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: format!("Cannot compact session: {e}"),
+                        });
+                    }
+                }
+            }
+
             other => {
                 tracing::warn!("unknown request type: {other}");
             }
@@ -329,6 +561,13 @@ async fn main() -> Result<()> {
     let tools = create_tools()?;
     let runtime = AgentRuntime::new();
 
+    // Track the currently-active LLM provider so we can change models at runtime.
+    let current_provider: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>> =
+        Arc::new(std::sync::RwLock::new(llm));
+
+    // Global shared SessionStorage for listing/resuming sessions.
+    let session_storage = Arc::new(picrust::session::SessionStorage::with_dir("./sessions"));
+
     let socket_path =
         env::var("OMEGA_LOOP_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
 
@@ -339,17 +578,27 @@ async fn main() -> Result<()> {
     let cwd = env::current_dir()
         .map(|d| d.to_string_lossy().to_string())
         .unwrap_or_else(|_| "?".to_string());
-    tracing::info!(socket = %socket_path, cwd = %cwd, model = %llm.model(), "omega-loop started");
-    eprintln!("omega-loop ({}) listening on {socket_path}", llm.model());
+    {
+        let prov = current_provider.read().unwrap();
+        tracing::info!(socket = %socket_path, cwd = %cwd, model = %prov.model(), "omega-loop started");
+        eprintln!("omega-loop ({}) listening on {socket_path}", prov.model());
+    }
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 tracing::debug!(peer = ?addr, "accepted connection");
-                let llm = llm.clone();
+                let current_provider = current_provider.clone();
+                let session_storage = session_storage.clone();
                 let tools = tools.clone();
                 let runtime = runtime.clone();
-                tokio::spawn(handle_connection(stream, llm, tools, runtime));
+                tokio::spawn(handle_connection(
+                    stream,
+                    current_provider,
+                    session_storage,
+                    tools,
+                    runtime,
+                ));
             }
             Err(e) => {
                 tracing::error!("accept error: {e}");

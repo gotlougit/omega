@@ -26,6 +26,42 @@ use tokio::sync::mpsc;
 use picrust::omega_loop_client::{AgentdClient, OutputChunk, ServerEvent, SessionConfig};
 
 // ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+
+const COMMANDS: &[CommandDef] = &[
+    CommandDef { name: "/new", args: "", desc: "Start a new session" },
+    CommandDef { name: "/resume", args: "[id]", desc: "Resume an existing session" },
+    CommandDef { name: "/model", args: "<name>", desc: "Change the LLM model" },
+    CommandDef { name: "/compact", args: "", desc: "Compact the current session" },
+    CommandDef { name: "/help", args: "", desc: "Show this help" },
+];
+
+struct CommandDef {
+    name: &'static str,
+    args: &'static str,
+    desc: &'static str,
+}
+
+fn matching_commands(input: &str) -> Vec<(usize, &'static CommandDef)> {
+    if !input.starts_with('/') || input.is_empty() {
+        return Vec::new();
+    }
+    let lower = input.to_lowercase();
+    COMMANDS.iter().enumerate()
+        .filter(|(_, cmd)| cmd.name.to_lowercase().starts_with(&lower))
+        .collect()
+}
+
+fn format_command(cmd: &CommandDef) -> String {
+    if cmd.args.is_empty() {
+        format!("{}", cmd.name)
+    } else {
+        format!("{} {}", cmd.name, cmd.args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TUI Client State
 // ---------------------------------------------------------------------------
 
@@ -34,6 +70,7 @@ struct TuiClient {
     chat_lines: Vec<Line<'static>>,
     input: String,
     cursor_pos: usize,
+    session_id: String,
     status: String,
     running: bool,
     auto_scroll: bool,
@@ -44,6 +81,10 @@ struct TuiClient {
     question_request_id: String,
     questions: Vec<picrust::omega_loop_client::UserQuestionWire>,
     processing: bool,
+    session_list: Vec<String>, // for /resume
+    waiting_session_list: bool,
+    /// Currently highlighted command index in the command preview (None = no preview).
+    command_selection: Option<usize>,
     /// Maps tool-use ID → index into `chat_lines` so we can update
     /// the correct line when the tool result arrives (handles multiple
     /// concurrent tool calls correctly).
@@ -77,6 +118,7 @@ impl TuiClient {
             chat_lines: Vec::new(),
             input: String::new(),
             cursor_pos: 0,
+            session_id: String::new(),
             status: "Ready".to_string(),
             running: true,
             auto_scroll: true,
@@ -98,6 +140,9 @@ impl TuiClient {
             selection_end: None,
             selection_term_area: ratatui::layout::Rect::new(0,0,80,24),
             flash_message: None,
+            session_list: Vec::new(),
+            waiting_session_list: false,
+            command_selection: None,
         }
     }
 
@@ -777,13 +822,30 @@ impl TuiClient {
         };
         let input_total_height = 2 + input_text_lines as u16; // borders + text lines
 
+        // Command preview: show matching commands when input starts with /
+        let cmd_matches = if self.input.starts_with('/') && !self.input.is_empty() {
+            matching_commands(&self.input)
+        } else {
+            Vec::new()
+        };
+        let cmd_preview_h: u16 = if cmd_matches.is_empty() || self.processing || self.waiting_permission || self.waiting_question {
+            0
+        } else {
+            (cmd_matches.len() as u16).min(5).saturating_add(2) // border + up to 5 items + border
+        };
+
+        let mut constraints = vec![
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ];
+        if cmd_preview_h > 0 {
+            constraints.push(Constraint::Length(cmd_preview_h));
+        }
+        constraints.push(Constraint::Length(input_total_height));
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(input_total_height),
-            ])
+            .constraints(constraints)
             .split(area);
 
         // Chat area
@@ -903,8 +965,40 @@ impl TuiClient {
             status_area,
         );
 
+        // Command preview (shown when input starts with /)
+        let input_area_idx = if cmd_preview_h > 0 { 3 } else { 2 };
+        if cmd_preview_h > 0 {
+            let cmd_area = chunks[2];
+            let sel = self.command_selection;
+            let cmd_lines: Vec<Line> = cmd_matches.iter().enumerate().map(|(i, (_, cmd))| {
+                let is_sel = sel == Some(i);
+                let style = if is_sel {
+                    Style::default().fg(Color::White).bg(Color::Rgb(60, 80, 180))
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let prefix = if is_sel { "▸ " } else { "  " };
+                Line::from(Span::styled(
+                    format!("{}{}  — {}", prefix, format_command(cmd), cmd.desc),
+                    style,
+                ))
+            }).collect();
+            frame.render_widget(
+                Paragraph::new(cmd_lines)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan))
+                            .title(" Commands ")
+                            .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    )
+                    .style(Style::default().fg(Color::White)),
+                cmd_area,
+            );
+        }
+
         // Input bar
-        let input_area = chunks[2];
+        let input_area = chunks[input_area_idx];
 
         // Build wrapped lines for the input text
         let input_lines: Vec<Line> = if self.input.is_empty() {
@@ -1394,7 +1488,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let session_id = format!(
+    client.session_id = format!(
         "picrust-session-{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
@@ -1405,7 +1499,7 @@ async fn main() -> Result<()> {
         no_cache,
     };
 
-    let res = run_loop(&mut terminal, &mut client, daemon, &session_id, config).await;
+    let res = run_loop(&mut terminal, &mut client, daemon, config).await;
     cleanup_terminal(&mut terminal);
 
     if let Err(e) = res {
@@ -1500,7 +1594,6 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &mut TuiClient,
     daemon: AgentdClient,
-    session_id: &str,
     config: SessionConfig,
 ) -> Result<()> {
     // Split into independent reader + writer halves so they can be used
@@ -1535,7 +1628,6 @@ async fn run_loop(
     });
 
     let mut first = true;
-    let session_id_owned = session_id.to_string();
 
     while client.running {
         client.tick();
@@ -1582,6 +1674,45 @@ async fn run_loop(
                             }
                         }
                     }
+                }
+                Ok(ServerEvent::SessionList { sessions }) => {
+                    client.waiting_session_list = false;
+                    if sessions.is_empty() {
+                        client.add_system_msg("No saved sessions found.".to_string());
+                    } else {
+                        client.add_system_msg(
+                            format!("Available sessions ({}):", sessions.len())
+                        );
+                        for s in &sessions {
+                            client.add_system_msg(format!("  /resume {}", s));
+                        }
+                        // Store the list so user can pick
+                        client.session_list = sessions;
+                    }
+                }
+                Ok(ServerEvent::SessionResumed { session_id, session_name }) => {
+                    client.session_id = session_id.clone();
+                    client.chat_lines.clear();
+                    client.pending_assistant_idx = None;
+                    client.pending_assistant_raw = String::new();
+                    client.pending_thinking_idx = None;
+                    client.pending_thinking_raw = String::new();
+                    client.collapsed_thinking_line = None;
+                    client.collapsed_thinking_raw = String::new();
+                    client.pending_tool_calls.clear();
+                    client.processing = false;
+                    first = true;
+                    client.add_system_msg(format!("Resumed session: {session_name}"));
+                    client.status = "Ready".to_string();
+                }
+                Ok(ServerEvent::ModelChanged { model }) => {
+                    client.add_system_msg(format!("Model changed to: {model}"));
+                }
+                Ok(ServerEvent::SessionCompacted { .. }) => {
+                    client.add_system_msg("Session compacted.".to_string());
+                }
+                Ok(ServerEvent::SystemMsg(msg)) => {
+                    client.add_system_msg(msg);
                 }
                 Ok(ServerEvent::Unknown(val)) => {
                     if val.get("type").and_then(|v| v.as_str()) == Some("Disconnected") {
@@ -1701,7 +1832,7 @@ async fn run_loop(
                                         // Send ask-response on the writer half
                                         let _ = daemon_writer
                                             .send_ask_response(
-                                                &session_id_owned,
+                                                &client.session_id,
                                                 &client.question_request_id,
                                                 answers,
                                             )
@@ -1725,19 +1856,94 @@ async fn run_loop(
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Enter => {
-                            if !client.input.is_empty() && !client.processing {
+                            if !client.input.is_empty() && !client.processing && !client.waiting_session_list {
                                 let text = std::mem::take(&mut client.input);
                                 client.cursor_pos = 0;
-                                client.add_user_msg(text.clone());
-                                client.add_separator();
-                                client.status = "Processing...".to_string();
-                                client.processing = true;
 
-                                // Send run on the writer half (same underlying connection
-                                // as the reader — daemon sends Chunk events back here)
-                                let _ = daemon_writer
-                                    .send_run(&session_id_owned, &text, &config)
-                                    .await;
+                                // --- Slash commands ---
+                                if text.starts_with('/') {
+                                    let parts: Vec<&str> = text.splitn(2, ' ').collect();
+                                    let cmd = parts[0];
+                                    let arg = parts.get(1).copied().unwrap_or("");
+                                    match cmd {
+                                        "/new" | "/new_session" => {
+                                            client.session_id = format!(
+                                                "picrust-session-{}",
+                                                chrono::Local::now().format("%Y%m%d-%H%M%S")
+                                            );
+                                            client.chat_lines.clear();
+                                            client.pending_assistant_idx = None;
+                                            client.pending_assistant_raw = String::new();
+                                            client.pending_thinking_idx = None;
+                                            client.pending_thinking_raw = String::new();
+                                            client.collapsed_thinking_line = None;
+                                            client.collapsed_thinking_raw = String::new();
+                                            client.pending_tool_calls.clear();
+                                            client.processing = false;
+                                            client.status = "Ready".to_string();
+                                            client.add_system_msg(
+                                                format!("New session: {}", client.session_id)
+                                            );
+                                        }
+                                        "/model" => {
+                                            let model_name = if arg.is_empty() {
+                                                "gpt-4o"
+                                            } else {
+                                                arg
+                                            };
+                                            let _ = daemon_writer
+                                                .send_set_model(&client.session_id, model_name, 16384)
+                                                .await;
+                                            client.add_system_msg(
+                                                format!("Changing model to {model_name}...")
+                                            );
+                                        }
+                                        "/compact" => {
+                                            let _ = daemon_writer
+                                                .send_compact(&client.session_id)
+                                                .await;
+                                            client.add_system_msg("Compacting session...".to_string());
+                                        }
+                                        "/resume" | "/list" => {
+                                            if arg.is_empty() {
+                                                let _ = daemon_writer
+                                                    .send_list_sessions()
+                                                    .await;
+                                                client.add_system_msg(
+                                                    "Requesting session list...".to_string()
+                                                );
+                                                client.waiting_session_list = true;
+                                            } else {
+                                                let _ = daemon_writer
+                                                    .send_resume_session(arg.trim())
+                                                    .await;
+                                                client.add_system_msg(
+                                                    format!("Resuming session: {}...", arg.trim())
+                                                );
+                                            }
+                                        }
+                                        "/help" => {
+                                            client.add_system_msg(
+                                                "Available commands: /new, /resume, /model <name>, /compact, /help".to_string()
+                                            );
+                                        }
+                                        _ => {
+                                            client.add_system_msg(
+                                                format!("Unknown command: {cmd}. Type /help for available commands.")
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    client.add_user_msg(text.clone());
+                                    client.add_separator();
+                                    client.status = "Processing...".to_string();
+                                    client.processing = true;
+
+                                    // Send run on the writer half
+                                    let _ = daemon_writer
+                                        .send_run(&client.session_id, &text, &config)
+                                        .await;
+                                }
                             }
                         }
                         KeyCode::Char(c) => {
@@ -1750,9 +1956,47 @@ async fn run_loop(
                             } else if key.modifiers == KeyModifiers::CONTROL && c == 'l' {
                                 client.clear();
                             } else {
+                                client.command_selection = None;
                                 let byte_idx = client.cursor_byte();
                                 client.input.insert(byte_idx, c);
                                 client.cursor_pos += 1;
+                            }
+                        }
+                        // --- Command preview navigation ---
+                        KeyCode::Tab => {
+                            if client.input.starts_with('/') && !client.processing {
+                                let matches = matching_commands(&client.input);
+                                if let Some((_, cmd)) = matches.first() {
+                                    // Replace input with the full command name + space
+                                    client.input = format!("{} ", cmd.name);
+                                    client.cursor_pos = client.char_count();
+                                    client.command_selection = None;
+                                }
+                            }
+                        }
+                        KeyCode::Up if client.input.starts_with('/') && !client.processing => {
+                            let matches = matching_commands(&client.input);
+                            if !matches.is_empty() {
+                                let cur = client.command_selection.unwrap_or(0);
+                                let next = if cur == 0 { matches.len() - 1 } else { cur - 1 };
+                                client.command_selection = Some(next);
+                                // Update input with selected command
+                                if let Some((_, cmd)) = matches.get(next) {
+                                    client.input = cmd.name.to_string();
+                                    client.cursor_pos = client.char_count();
+                                }
+                            }
+                        }
+                        KeyCode::Down if client.input.starts_with('/') && !client.processing => {
+                            let matches = matching_commands(&client.input);
+                            if !matches.is_empty() {
+                                let cur = client.command_selection.unwrap_or(0);
+                                let next = if cur >= matches.len() - 1 { 0 } else { cur + 1 };
+                                client.command_selection = Some(next);
+                                if let Some((_, cmd)) = matches.get(next) {
+                                    client.input = cmd.name.to_string();
+                                    client.cursor_pos = client.char_count();
+                                }
                             }
                         }
                         KeyCode::Backspace => {
@@ -1764,6 +2008,7 @@ async fn run_loop(
                                     .unwrap_or(0);
                                 client.input.remove(byte_idx);
                                 client.cursor_pos -= 1;
+                                client.command_selection = None;
                             }
                         }
                         KeyCode::Delete => {
@@ -1776,6 +2021,7 @@ async fn run_loop(
                                 if byte_idx < client.input.len() {
                                     client.input.remove(byte_idx);
                                 }
+                                client.command_selection = None;
                             }
                         }
                         KeyCode::Left => {
@@ -1844,4 +2090,96 @@ async fn run_loop(
     // Cleanup
     reader_handle.abort();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matching_commands_empty_input() {
+        let matches = matching_commands("");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_matching_commands_non_slash() {
+        let matches = matching_commands("hello");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_matching_commands_just_slash() {
+        let matches = matching_commands("/");
+        // All commands start with '/', so all should match
+        assert_eq!(matches.len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn test_matching_commands_new_prefix() {
+        let matches = matching_commands("/n");
+        // Should match /new only
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.name, "/new");
+    }
+
+    #[test]
+    fn test_matching_commands_resume_prefix() {
+        let matches = matching_commands("/res");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.name, "/resume");
+    }
+
+    #[test]
+    fn test_matching_commands_full_command() {
+        let matches = matching_commands("/compact");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.name, "/compact");
+    }
+
+    #[test]
+    fn test_matching_commands_case_insensitive() {
+        let matches = matching_commands("/New");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1.name, "/new");
+    }
+
+    #[test]
+    fn test_matching_commands_unknown_prefix() {
+        let matches = matching_commands("/xyz");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_format_command_no_args() {
+        let cmd = CommandDef { name: "/new", args: "", desc: "test" };
+        assert_eq!(format_command(&cmd), "/new");
+    }
+
+    #[test]
+    fn test_format_command_with_args() {
+        let cmd = CommandDef { name: "/model", args: "<name>", desc: "test" };
+        assert_eq!(format_command(&cmd), "/model <name>");
+    }
+
+    #[test]
+    fn test_command_defs_are_consistent() {
+        // All commands should start with /
+        for cmd in COMMANDS {
+            assert!(cmd.name.starts_with('/'), "Command '{}' must start with /", cmd.name);
+            assert!(!cmd.desc.is_empty(), "Command '{}' must have a description", cmd.name);
+        }
+    }
+
+    #[test]
+    fn test_no_duplicate_commands() {
+        let mut names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), COMMANDS.len(), "Duplicate command names found");
+    }
 }
