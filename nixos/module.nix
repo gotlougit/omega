@@ -115,6 +115,8 @@ in
     packages = mkOption {
       type = types.listOf types.package;
       default = with pkgs; [
+        bashInteractive
+        coreutils
         git
         nix
         ripgrep
@@ -220,7 +222,7 @@ in
         # Security hardening
         NoNewPrivileges = true;
         PrivateTmp      = true;
-        ProtectSystem   = "strict";
+        ProtectSystem   = "full";
         ProtectHome     = false;        # needs access for project work
         ReadWritePaths  = [ clankerHome ];
         RuntimeDirectory = "omega";
@@ -261,7 +263,7 @@ in
         # Security hardening
         NoNewPrivileges = true;
         PrivateTmp      = true;
-        ProtectSystem   = "strict";
+        ProtectSystem   = "full";
         ProtectHome     = false;
         ReadWritePaths  = [ clankerHome ];
 
