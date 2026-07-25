@@ -36,6 +36,7 @@ const COMMANDS: &[CommandDef] = &[
     CommandDef { name: "/model", args: "<name>", desc: "Change the LLM model" },
     CommandDef { name: "/compact", args: "", desc: "Compact the current session" },
     CommandDef { name: "/help", args: "", desc: "Show this help" },
+    CommandDef { name: "/quit", args: "", desc: "Quit the program" },
 ];
 
 struct CommandDef {
@@ -111,6 +112,8 @@ struct TuiClient {
     selection_term_area: ratatui::layout::Rect,
     /// Flash message shown temporarily at the bottom of the chat.
     flash_message: Option<(String, Instant)>,
+    /// Timestamp of the first Ctrl+C press (for double-press-to-quit).
+    ctrl_c_pressed: Option<Instant>,
 }
 
 impl TuiClient {
@@ -144,6 +147,7 @@ impl TuiClient {
             session_list: Vec::new(),
             waiting_session_list: false,
             command_selection: None,
+            ctrl_c_pressed: None,
         }
     }
 
@@ -1579,7 +1583,12 @@ async fn show_until_quit(
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => client.running = false,
+                        KeyCode::Esc => {
+            if client.processing {
+                // Will be handled by the insert-mode Esc below;
+                // this just avoids quitting.
+            }
+        }
                         _ => {}
                     }
                 }
@@ -1923,9 +1932,12 @@ async fn run_loop(
                                                 );
                                             }
                                         }
+                                        "/quit" => {
+                                            client.running = false;
+                                        }
                                         "/help" => {
                                             client.add_system_msg(
-                                                "Available commands: /new, /resume, /model <name>, /compact, /help".to_string()
+                                                "Available commands: /new, /resume, /model <name>, /compact, /quit, /help".to_string()
                                             );
                                         }
                                         _ => {
@@ -1949,9 +1961,16 @@ async fn run_loop(
                         }
                         KeyCode::Char(c) => {
                             if key.modifiers == KeyModifiers::CONTROL && c == 'c' {
-                                client.add_system_msg("Interrupted".to_string());
-                                client.status = "Ready".to_string();
-                                client.processing = false;
+                                // Double Ctrl+C within 500ms quits, otherwise interrupt
+                                if client.ctrl_c_pressed.map_or(false, |t| t.elapsed() < Duration::from_millis(500)) {
+                                    client.running = false;
+                                } else {
+                                    let _ = daemon_writer.send_interrupt(&client.session_id).await;
+                                    client.add_system_msg("Interrupted (press Ctrl+C again within 500ms to quit)".to_string());
+                                    client.status = "Ready".to_string();
+                                    client.processing = false;
+                                    client.ctrl_c_pressed = Some(Instant::now());
+                                }
                             } else if key.modifiers == KeyModifiers::CONTROL && c == 'd' {
                                 client.running = false;
                             } else if key.modifiers == KeyModifiers::CONTROL && c == 'l' {
@@ -2065,7 +2084,14 @@ async fn run_loop(
                         // --- Input editing ---
                         KeyCode::Home => client.cursor_pos = 0,
                         KeyCode::End => client.cursor_pos = client.char_count(),
-                        KeyCode::Esc => client.running = false,
+                        KeyCode::Esc => {
+                            if client.processing {
+                                let _ = daemon_writer.send_interrupt(&client.session_id).await;
+                                client.add_system_msg("Interrupted".to_string());
+                                client.status = "Ready".to_string();
+                                client.processing = false;
+                            }
+                        }
                         _ => {}
                     }
                 }

@@ -204,6 +204,19 @@ async fn handle_connection(
             }
         };
 
+        // list_sessions doesn't need a session_id — handle it first.
+        if req.msg_type == "list_sessions" {
+            let list = match session_storage.list_top_level_sessions() {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    tracing::warn!("list_sessions error: {e}");
+                    Vec::new()
+                }
+            };
+            let _ = event_tx.send(ServerEvent::SessionList { sessions: list });
+            continue;
+        }
+
         let session_id = match req.session_id {
             Some(ref s) if !s.is_empty() => s.clone(),
             _ => {
@@ -331,15 +344,14 @@ async fn handle_connection(
                 });
             }
 
-            "list_sessions" => {
-                let list = match session_storage.list_top_level_sessions() {
-                    Ok(sessions) => sessions,
-                    Err(e) => {
-                        tracing::warn!("list_sessions error: {e}");
-                        Vec::new()
+            "interrupt" => {
+                let sessions_lock = sessions.lock().await;
+                if let Some(handle) = sessions_lock.get(&session_id) {
+                    let msg = picrust::core::InputMessage::Interrupt;
+                    if let Err(e) = handle.send(msg).await {
+                        tracing::warn!(%session_id, "send interrupt: {e}");
                     }
-                };
-                let _ = event_tx.send(ServerEvent::SessionList { sessions: list });
+                }
             }
 
             "resume_session" => {

@@ -615,6 +615,15 @@ impl DaemonWriter {
         self.write_json(&req).await
     }
 
+    /// Interrupt the current LLM response.
+    pub async fn send_interrupt(&mut self, session_id: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "interrupt",
+            "session_id": session_id,
+        });
+        self.write_json(&req).await
+    }
+
     async fn write_json(&mut self, value: &Value) -> Result<()> {
         let json = serde_json::to_string(value)?;
         self.writer.write_all(json.as_bytes()).await?;
