@@ -21,5 +21,6 @@ pub use tool::{Tool, ToolInfo, ToolResult, ToolResultData};
 
 // Re-export common tools for convenience
 pub use common::{
-    AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool,
+    AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, TransferDiffTool,
+    WriteTool,
 };

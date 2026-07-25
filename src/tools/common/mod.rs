@@ -15,6 +15,7 @@ pub mod edit_tool;
 pub mod glob_tool;
 pub mod grep_tool;
 pub mod read_tool;
+pub mod transfer_diff;
 pub mod write_tool;
 
 pub use ask_user_question::AskUserQuestionTool;
@@ -23,4 +24,5 @@ pub use edit_tool::EditTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use read_tool::ReadTool;
+pub use transfer_diff::TransferDiffTool;
 pub use write_tool::WriteTool;

@@ -87,10 +87,10 @@ struct TuiClient {
     waiting_session_list: bool,
     /// Currently highlighted command index in the command preview (None = no preview).
     command_selection: Option<usize>,
-    /// Maps tool-use ID → index into `chat_lines` so we can update
+    /// Maps tool-use ID → (line_index, tool_name) so we can update
     /// the correct line when the tool result arrives (handles multiple
-    /// concurrent tool calls correctly).
-    pending_tool_calls: HashMap<String, usize>,
+    /// concurrent tool calls correctly) and identify the tool type.
+    pending_tool_calls: HashMap<String, (usize, String)>,
     /// Index in `chat_lines` where the current streaming assistant
     /// response begins (set by first TextDelta, cleared on Done).
     pending_assistant_idx: Option<usize>,
@@ -453,18 +453,20 @@ impl TuiClient {
             line,
             Style::default().fg(Color::Yellow),
         )));
-        self.pending_tool_calls.insert(id.to_string(), idx);
+        self.pending_tool_calls.insert(id.to_string(), (idx, tool_name.to_string()));
         if self.auto_scroll {
             self.scroll_to_bottom();
         }
     }
 
-    fn add_tool_result(&mut self, id: &str, success: bool, _msg: &str) {
+    fn add_tool_result(&mut self, id: &str, success: bool, msg: &str) {
         let color = if success { Color::Green } else { Color::Red };
         let symbol = if success { "✓" } else { "✗" };
 
-        // Look up the chat line index for this tool ID and update it in-place
-        if let Some(&idx) = self.pending_tool_calls.get(id) {
+        // Look up the (line_index, tool_name) for this tool ID
+        let tool_name: Option<String> = self.pending_tool_calls.get(id).map(|e| e.1.clone());
+
+        if let Some(idx) = self.pending_tool_calls.get(id).map(|e| e.0) {
             if let Some(line) = self.chat_lines.get_mut(idx) {
                 if let Some(first) = line.spans.first_mut() {
                     let old = first.content.as_ref().to_string();
@@ -476,31 +478,69 @@ impl TuiClient {
             if self.auto_scroll {
                 self.scroll_to_bottom();
             }
-            return;
+        } else {
+            // Fallback: try the last line (backward compat)
+            if let Some(last) = self.chat_lines.last_mut() {
+                let first_span_content: Option<&str> =
+                    last.spans.first().map(|s| s.content.as_ref());
+                if first_span_content.map_or(false, |c| c.contains('⚡')) {
+                    let old = last.spans[0].content.as_ref().to_string();
+                    last.spans[0] = Span::styled(
+                        old.replacen('⚡', symbol, 1),
+                        Style::default().fg(color),
+                    );
+                    if self.auto_scroll {
+                        self.scroll_to_bottom();
+                    }
+                    return;
+                }
+            }
+            // Last resort: add as separate line
+            self.add_line(Line::from(Span::styled(
+                format!("  {}", symbol),
+                Style::default().fg(color),
+            )));
         }
 
-        // Fallback: try the last line (backward compat)
-        if let Some(last) = self.chat_lines.last_mut() {
-            let first_span_content: Option<&str> =
-                last.spans.first().map(|s| s.content.as_ref());
-            if first_span_content.map_or(false, |c| c.contains('⚡')) {
-                let old = last.spans[0].content.as_ref().to_string();
-                last.spans[0] = Span::styled(
-                    old.replacen('⚡', symbol, 1),
-                    Style::default().fg(color),
-                );
-                if self.auto_scroll {
-                    self.scroll_to_bottom();
-                }
-                return;
+        // --- TransferDiff: save the patch to PWD ---
+        if success && tool_name.as_deref() == Some("TransferDiff") && !msg.is_empty() {
+            self.save_transfer_diff(msg);
+        }
+    }
+
+    /// Save a patch file received via TransferDiff to the user's PWD.
+    fn save_transfer_diff(&mut self, patch: &str) {
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        // Sanitize session ID for use in a filename (replace non-alphanumeric chars)
+        let safe_session: String = self
+            .session_id
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let file_name = format!("transfer-{}-{}.patch", safe_session, timestamp);
+
+        match std::fs::write(&file_name, patch) {
+            Ok(_) => {
+                let abs_path = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(&file_name);
+                self.add_system_msg(format!(
+                    "⬆️ Patch saved to {}",
+                    abs_path.display()
+                ));
+                self.add_system_msg(format!(
+                    "   ({} KB, {} lines)",
+                    patch.len() / 1024,
+                    patch.lines().count(),
+                ));
+            }
+            Err(e) => {
+                self.add_system_msg(format!(
+                    "❌ Failed to save patch to '{}': {}",
+                    file_name, e
+                ));
             }
         }
-
-        // Last resort: add as separate line
-        self.add_line(Line::from(Span::styled(
-            format!("  {}", symbol),
-            Style::default().fg(color),
-        )));
     }
 
     fn add_separator(&mut self) {
