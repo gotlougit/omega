@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
@@ -90,7 +90,7 @@ impl TuiRenderer {
 
         // Show welcome banner
         self.app.add_system_message("=== Picrust TUI ===");
-        self.app.add_system_message("Type a message and press Enter. Press Esc to quit, Ctrl+C to interrupt.");
+        self.app.add_system_message("Type a message and press Enter. /quit to exit. Esc to interrupt, Ctrl+C twice to exit.");
         self.app.add_separator();
 
         // Run the event loop
@@ -181,8 +181,20 @@ impl TuiRenderer {
             // If permission or question was requested, handle it
             if self.app.mode() == AppMode::PermissionRequest {
                 self.handle_permission_prompt(terminal).await?;
+                if !self.app.is_running() {
+                    if let Some(ref h) = self.app.handle() {
+                        let _ = h.shutdown().await;
+                    }
+                    break;
+                }
             } else if self.app.mode() == AppMode::Question {
                 self.handle_question_prompt(terminal).await?;
+                if !self.app.is_running() {
+                    if let Some(ref h) = self.app.handle() {
+                        let _ = h.shutdown().await;
+                    }
+                    break;
+                }
             }
 
             // Check for keyboard events
@@ -207,7 +219,7 @@ impl TuiRenderer {
                             }
                             self.app.add_system_message("Interrupted");
                             self.app.set_mode(AppMode::Idle);
-                            self.app.set_status("Ready");
+                            // Status is already set by handle_event ("Press Ctrl+C again to exit" or "Ready")
                         }
                         Action::Quit => {
                             self.app.stop();
@@ -247,6 +259,20 @@ impl TuiRenderer {
                 let event = event::read()?;
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
+                        // Global: Ctrl+C double-press to quit
+                        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                            let now = Instant::now();
+                            let is_double = self.app.last_interrupt_time()
+                                .map_or(false, |t| now.duration_since(t).as_secs_f64() < 1.0);
+                            if is_double {
+                                self.app.stop();
+                                return Ok(());
+                            }
+                            self.app.set_last_interrupt_time(Some(now));
+                            self.app.set_status("Press Ctrl+C again to exit");
+                            continue;
+                        }
+
                         let (allowed, remember) = match key.code {
                             KeyCode::Char('y') => (true, false),
                             KeyCode::Char('n') | KeyCode::Esc => (false, false),
@@ -298,6 +324,20 @@ impl TuiRenderer {
                 let event = event::read()?;
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
+                        // Global: Ctrl+C double-press to quit
+                        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                            let now = Instant::now();
+                            let is_double = self.app.last_interrupt_time()
+                                .map_or(false, |t| now.duration_since(t).as_secs_f64() < 1.0);
+                            if is_double {
+                                self.app.stop();
+                                return Ok(());
+                            }
+                            self.app.set_last_interrupt_time(Some(now));
+                            self.app.set_status("Press Ctrl+C again to exit");
+                            continue;
+                        }
+
                         match key.code {
                             KeyCode::Char(c) if c.is_ascii_digit() => {
                                 let num = c.to_digit(10).unwrap_or(0) as usize;

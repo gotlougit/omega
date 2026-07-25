@@ -4,6 +4,7 @@
 //! handles keyboard events, and coordinates rendering via Ratatui.
 
 use std::io;
+use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -45,6 +46,9 @@ pub struct TuiApp {
 
     /// The request_id from the last AskUserQuestion (for sending response)
     pending_question_id: Option<String>,
+
+    /// Time of last Ctrl+C press (for double-press-to-quit detection)
+    last_interrupt_time: Option<Instant>,
 }
 
 /// Application mode
@@ -74,6 +78,7 @@ impl TuiApp {
             mode: AppMode::Idle,
             pending_permission_tool: None,
             pending_question_id: None,
+            last_interrupt_time: None,
         }
     }
 
@@ -90,6 +95,7 @@ impl TuiApp {
             mode: AppMode::Idle,
             pending_permission_tool: None,
             pending_question_id: None,
+            last_interrupt_time: None,
         }
     }
 
@@ -177,6 +183,16 @@ impl TuiApp {
         self.pending_question_id.as_deref()
     }
 
+    /// Get the last Ctrl+C press time (for double-press detection)
+    pub fn last_interrupt_time(&self) -> Option<Instant> {
+        self.last_interrupt_time
+    }
+
+    /// Set the last Ctrl+C press time
+    pub fn set_last_interrupt_time(&mut self, time: Option<Instant>) {
+        self.last_interrupt_time = time;
+    }
+
     /// Get the input text
     pub fn input_text(&self) -> &str {
         self.input.text()
@@ -225,6 +241,19 @@ impl TuiApp {
     pub fn handle_event(&mut self, event: &Event) -> io::Result<Option<Action>> {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Global: Ctrl+C double-press to quit (works in all modes)
+                if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+                    let now = Instant::now();
+                    let is_double = self.last_interrupt_time
+                        .map_or(false, |t| now.duration_since(t).as_secs_f64() < 1.0);
+                    if is_double {
+                        return Ok(Some(Action::Quit));
+                    }
+                    self.last_interrupt_time = Some(now);
+                    self.status.set_status("Press Ctrl+C again to exit");
+                    return Ok(Some(Action::Interrupt));
+                }
+
                 match self.mode {
                     AppMode::PermissionRequest => {
                         return self.handle_permission_key(key);
@@ -251,14 +280,16 @@ impl TuiApp {
             KeyCode::Enter => {
                 let text = self.input.text().to_string();
                 if !text.is_empty() {
+                    if text.trim() == "/quit" {
+                        self.clear_input();
+                        return Ok(Some(Action::Quit));
+                    }
                     self.clear_input();
                     return Ok(Some(Action::SendMessage(text)));
                 }
             }
             KeyCode::Char(c) => {
-                if key.modifiers == KeyModifiers::CONTROL && c == 'c' {
-                    return Ok(Some(Action::Interrupt));
-                }
+                // Ctrl+C is handled globally in handle_event
                 if key.modifiers == KeyModifiers::CONTROL && c == 'd' {
                     return Ok(Some(Action::Quit));
                 }
@@ -286,7 +317,9 @@ impl TuiApp {
                 self.input.move_cursor_end();
             }
             KeyCode::Esc => {
-                return Ok(Some(Action::Quit));
+                self.last_interrupt_time = None;
+                self.status.set_status("Ready");
+                return Ok(Some(Action::Interrupt));
             }
             _ => {}
         }
