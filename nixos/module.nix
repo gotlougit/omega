@@ -260,6 +260,9 @@ in
         ProtectHome     = false;
         ReadWritePaths  = [ clankerHome ];
 
+        RuntimeDirectory = "omega";
+        RuntimeDirectoryMode = "0770";
+
         StateDirectory   = "clanker/omega";
         StateDirectoryMode = "0770";
 
