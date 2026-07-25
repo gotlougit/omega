@@ -246,6 +246,11 @@ in
         Restart    = "on-failure";
         RestartSec = "5s";
 
+        # 0007 umask → sockets created with 0770 (srw-rw----)
+        # Without this, the default umask (0022) gives 0755 which
+        # prevents other omega group members from connecting.
+        UMask = "0007";
+
         Environment = [
           "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
           "OMEGA_SOCKET_PATH=${omegaShSocket}"
