@@ -200,7 +200,10 @@ in
       description = "Omega-sh daemon (filesystem/shell tools)";
       after       = [ "network.target" ];
       wantedBy    = [ "multi-user.target" ];
-      path        = cfg.packages;
+      # Always include bashInteractive and coreutils in the path so the
+      # shell tool (Command::new("bash")) and basic utilities are available,
+      # regardless of what the user puts in cfg.packages.
+      path        = with pkgs; [ bashInteractive coreutils ] ++ cfg.packages;
 
       serviceConfig = {
         User  = clankerUser;
@@ -236,7 +239,9 @@ in
       after       = [ "network.target" "omega-sh.service" ];
       requires    = [ "omega-sh.service" ];
       wantedBy    = [ "multi-user.target" ];
-      path        = cfg.packages;
+      # Always include bashInteractive and coreutils in the path so that
+      # the agent can execute shell commands via the omega-sh daemon.
+      path        = with pkgs; [ bashInteractive coreutils ] ++ cfg.packages;
 
       serviceConfig = {
         User  = clankerUser;
