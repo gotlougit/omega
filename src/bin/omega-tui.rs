@@ -1,9 +1,10 @@
-//! # picrust-tui — TUI client for picrust
+//! # omega — TUI client for the picrust omega services
 //!
 //! Terminal User Interface client that connects to the `omega-loop` daemon
 //! and renders streaming responses using Ratatui.
 //!
-//! This replaces the simple CLI client (main.rs) with a rich terminal UI.
+//! Connects using `OMEGA_LOOP_SOCKET_PATH` env var or defaults to
+//! `/tmp/omega-loop.sock`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

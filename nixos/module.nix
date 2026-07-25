@@ -1,10 +1,10 @@
 # ---------------------------------------------------------------------------
-# Picrust NixOS module
+# Omega NixOS module
 #
 # Sets up the omega-sh and omega-loop daemons as systemd services running
 # under a dedicated system user (default: "clanker").  The services
-# communicate over Unix sockets in /run/picrust/ — any user in the
-# "picrust" group can connect to omega-loop with the picrust-tui client.
+# communicate over Unix sockets in /run/omega/ — any user in the
+# "omega" group can connect to omega-loop with the omega-tui TUI client.
 #
 # The clanker user has git, nix, and ripgrep available so the agent can
 # clone repos, run nix flakes, etc., without ever needing sudo/wheel.
@@ -15,29 +15,33 @@
 let
   inherit (lib) mkIf mkEnableOption mkOption types literalExpression;
 
-  cfg = config.services.picrust;
+  cfg = config.services.omega;
 
   # Build picrust from the flake source (../. is the flake root when this
   # module is consumed via inputs.picrust.nixosModules.picrust).
-  picrustPkg = pkgs.rustPlatform.buildRustPackage {
+  omegaPkg = pkgs.rustPlatform.buildRustPackage {
     pname = "picrust";
     version = "0.1.0";
     src = ../.;
     cargoLock.lockFile = .././Cargo.lock;
-    nativeBuildInputs = with pkgs; [ pkg-config ];
+    nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
     buildInputs = with pkgs; [ openssl.dev ];
     doCheck = false;
+    postInstall = ''
+      wrapProgram $out/bin/omega-tui \
+        --set-default OMEGA_LOOP_SOCKET_PATH /run/omega/omega-loop.sock
+    '';
   };
 
   # Derived constants
   clankerUser  = cfg.user;
   clankerGroup = cfg.group;
   clankerHome  = "/var/lib/${clankerUser}";
-  picrustDir   = "${clankerHome}/picrust";
+  omegaDir     = "${clankerHome}/omega";
 
-  omegaShSocket   = "/run/picrust/omega-sh.sock";
-  omegaLoopSocket = "/run/picrust/omega-loop.sock";
-  systemPromptPath = "/etc/picrust/system-prompt.md";
+  omegaShSocket   = "/run/omega/omega-sh.sock";
+  omegaLoopSocket = "/run/omega/omega-loop.sock";
+  systemPromptPath = "/etc/omega/system-prompt.md";
 
   # Hardcoded system prompt injected into every new session.
   systemPrompt = ''
@@ -67,16 +71,16 @@ in
   # -----------------------------------------------------------------------
   # Options
   # -----------------------------------------------------------------------
-  options.services.picrust = {
-    enable = mkEnableOption "picrust agent services (omega-sh + omega-loop)";
+  options.services.omega = {
+    enable = mkEnableOption "omega agent services (omega-sh + omega-loop)";
 
     package = mkOption {
       type = types.package;
-      default = picrustPkg;
+      default = omegaPkg;
       defaultText = literalExpression ''
         pkgs.rustPlatform.buildRustPackage { src = ../.; }
       '';
-      description = "The picrust package providing omega-sh, omega-loop, picrust-tui.";
+      description = "Package providing omega-sh, omega-loop, and omega-tui.";
     };
 
     user = mkOption {
@@ -87,8 +91,8 @@ in
 
     group = mkOption {
       type = types.str;
-      default = "picrust";
-      description = "Group owning the picrust runtime directory and sockets.";
+      default = "omega";
+      description = "Group owning the omega runtime directory and sockets.";
     };
 
     humanUsers = mkOption {
@@ -96,8 +100,8 @@ in
       default = [ ];
       example = [ "gotlou" "alice" ];
       description = ''
-        Human users that should be added to the picrust group so they can
-        connect to omega-loop with picrust-tui.
+        Human users that should be added to the omega group so they can
+        connect to omega-loop with the omega-tui TUI client.
       '';
     };
 
@@ -108,7 +112,7 @@ in
       description = "Additional groups to add the clanker user to.";
     };
 
-    extraPackages = mkOption {
+    packages = mkOption {
       type = types.listOf types.package;
       default = with pkgs; [
         git
@@ -121,13 +125,17 @@ in
         curl
         wget
       ];
-      description = "Packages available in PATH for the omega services.";
+      description = "
+        Packages to add to the omega service users' PATH and to the system
+        environment.  The agent (omega-loop) uses these for Bash/Shell tool
+        calls.  Add any tools you want the agent to have access to here.
+      ";
     };
 
     envFile = mkOption {
       type = types.nullOr types.path;
       default = null;
-      example = "/var/lib/clanker/picrust/.env";
+      example = "/var/lib/clanker/omega/.env";
       description = ''
         Path to an EnvironmentFile loaded by the omega-loop systemd service.
         Put any environment variables omega-loop needs here, for example:
@@ -149,8 +157,8 @@ in
 
     sessionDir = mkOption {
       type = types.path;
-      default = "${picrustDir}/sessions";
-      defaultText = literalExpression ''"/var/lib/clanker/picrust/sessions"'';
+      default = "${omegaDir}/sessions";
+      defaultText = literalExpression ''"/var/lib/clanker/omega/sessions"'';
       description = "Directory where omega-loop stores session data.";
     };
   };
@@ -170,26 +178,27 @@ in
       home = clankerHome;
       group = clankerGroup;
       extraGroups = cfg.extraGroups;
+      packages = cfg.packages;
       createHome = true;
-      description = "Picrust agent service user";
+      description = "Omega agent service user";
     };
 
     # ----- system prompt file --------------------------------------------
-    environment.etc."picrust/system-prompt.md".text = systemPrompt;
+    environment.etc."omega/system-prompt.md".text = systemPrompt;
 
     # ----- tmpfiles: runtime directory with correct permissions ----------
     systemd.tmpfiles.rules = [
-      "d /run/picrust 0770 ${clankerUser} ${clankerGroup} -"
+      "d /run/omega 0770 ${clankerUser} ${clankerGroup} -"
     ];
 
     # ----- systemd services ----------------------------------------------
 
     # omega-sh — filesystem/shell tool daemon
     systemd.services.omega-sh = {
-      description = "Picrust omega-sh daemon (filesystem/shell tools)";
+      description = "Omega-sh daemon (filesystem/shell tools)";
       after       = [ "network.target" ];
       wantedBy    = [ "multi-user.target" ];
-      path        = cfg.extraPackages;
+      path        = cfg.packages;
 
       serviceConfig = {
         User  = clankerUser;
@@ -214,18 +223,18 @@ in
         ProtectSystem   = "strict";
         ProtectHome     = false;        # needs access for project work
         ReadWritePaths  = [ clankerHome ];
-        RuntimeDirectory = "picrust";
+        RuntimeDirectory = "omega";
         RuntimeDirectoryMode = "0770";
       };
     };
 
     # omega-loop — agent runtime daemon (depends on omega-sh)
     systemd.services.omega-loop = {
-      description = "Picrust omega-loop daemon (agent runtime)";
+      description = "Omega-loop daemon (agent runtime)";
       after       = [ "network.target" "omega-sh.service" ];
       requires    = [ "omega-sh.service" ];
       wantedBy    = [ "multi-user.target" ];
-      path        = cfg.extraPackages;
+      path        = cfg.packages;
 
       serviceConfig = {
         User  = clankerUser;
@@ -233,7 +242,7 @@ in
 
         Type  = "simple";
         ExecStart = "${cfg.package}/bin/omega-loop";
-        WorkingDirectory = picrustDir;
+        WorkingDirectory = omegaDir;
         Restart    = "on-failure";
         RestartSec = "5s";
 
@@ -251,7 +260,7 @@ in
         ProtectHome     = false;
         ReadWritePaths  = [ clankerHome ];
 
-        StateDirectory   = "clanker/picrust";
+        StateDirectory   = "clanker/omega";
         StateDirectoryMode = "0770";
 
       } // (if cfg.envFile != null then {
@@ -262,16 +271,13 @@ in
         # Create session directory and a symlink so omega-loop's default
         # relative path ./sessions resolves correctly.
         mkdir -p '${cfg.sessionDir}'
-        ln -sfT '${cfg.sessionDir}' "${picrustDir}/sessions" 2>/dev/null || true
+        ln -sfT '${cfg.sessionDir}' "${omegaDir}/sessions" 2>/dev/null || true
       '';
     };
 
-    # ----- extra packages installed on the system ------------------------
-    environment.systemPackages = with pkgs; [
-      cfg.package  # provides picrust-tui, picrust CLI
-      git
-      nix
-      ripgrep
+    # ----- omega binaries on the system ---------------------------------
+    environment.systemPackages = [
+      cfg.package  # omega-tui (TUI), picrust (CLI)
     ];
 
     # ----- allow clanker to use nix build etc. ---------------------------

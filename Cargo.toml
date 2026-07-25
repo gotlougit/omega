@@ -70,7 +70,7 @@ name = "omega-loop"
 path = "src/bin/omega-loop.rs"
 
 [[bin]]
-name = "picrust-tui"
-path = "src/bin/picrust-tui.rs"
+name = "omega-tui"
+path = "src/bin/omega-tui.rs"
 
 

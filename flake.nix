@@ -1,5 +1,5 @@
 {
-  description = "Picrust — AI coding agent with persistent omega services";
+  description = "Omega — AI coding agent with persistent omega services";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,7 +17,7 @@
     in
     {
       # --------------------------------------------------------------------------
-      # Packages — the four picrust binaries
+      # Packages — the four omega binaries
       # --------------------------------------------------------------------------
       packages = forAllSystems (
         system:
@@ -28,9 +28,13 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = with pkgs; [ pkg-config ];
+            nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
             buildInputs = with pkgs; [ openssl.dev ];
             doCheck = false;
+            postInstall = ''
+              wrapProgram $out/bin/omega-tui \
+                --set-default OMEGA_LOOP_SOCKET_PATH /run/omega/omega-loop.sock
+            '';
           };
         in
         {
@@ -38,7 +42,7 @@
           picrust = picrust;
           omega-sh = picrust;
           omega-loop = picrust;
-          picrust-tui = picrust;
+          omega-tui = picrust;
         }
       );
 
@@ -79,7 +83,7 @@
 
       # --------------------------------------------------------------------------
       # NixOS module — import this in your system configuration to set up
-      # the picrust omega services (omega-sh + omega-loop) as systemd units
+      # the omega services (omega-sh + omega-loop) as systemd units
       # running under the dedicated "clanker" user.
       #
       # Usage:
@@ -91,7 +95,7 @@
       #       modules = [
       #         picrust.nixosModules.picrust
       #         {
-      #           services.picrust = {
+      #           services.omega = {
       #             enable = true;
       #             humanUsers = [ "gotlou" ];
       #           };
