@@ -36,7 +36,7 @@ let
   # Derived constants
   clankerUser  = cfg.user;
   clankerGroup = cfg.group;
-  clankerHome  = "/var/lib/${clankerUser}";
+  clankerHome  = "/persist/${clankerUser}";
   omegaDir     = "${clankerHome}/omega";
 
   omegaShSocket   = "/run/omega/omega-sh.sock";
@@ -160,7 +160,7 @@ in
     sessionDir = mkOption {
       type = types.path;
       default = "${omegaDir}/sessions";
-      defaultText = literalExpression ''"/var/lib/clanker/omega/sessions"'';
+      defaultText = literalExpression ''"/persist/clanker/omega/sessions"'';
       description = "Directory where omega-loop stores session data.";
     };
   };
@@ -191,6 +191,7 @@ in
     # ----- tmpfiles: runtime directory with correct permissions ----------
     systemd.tmpfiles.rules = [
       "d /run/omega 0770 ${clankerUser} ${clankerGroup} -"
+      "d ${omegaDir} 0770 ${clankerUser} ${clankerGroup} -"
     ];
 
     # ----- systemd services ----------------------------------------------
@@ -283,8 +284,6 @@ in
       } else { });
 
       preStart = ''
-        # Create session directory and a symlink so omega-loop's default
-        # relative path ./sessions resolves correctly.
         mkdir -p '${cfg.sessionDir}'
         ln -sfT '${cfg.sessionDir}' "${omegaDir}/sessions" 2>/dev/null || true
       '';
