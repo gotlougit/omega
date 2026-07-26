@@ -1,8 +1,9 @@
-//! TransferDiff tool — sends a patch/diff to the TUI for the user to save.
+//! Transfer tool — sends a file from the agent's environment to the TUI.
 //!
-//! The LLM generates or captures a diff (e.g. via `git diff`) and passes the
-//! content to this tool.  The tool returns the patch as its result text; the
-//! TUI (omega-tui) intercepts the result and writes it to the user's PWD.
+//! The LLM uses this tool to transfer any file (patch, result, artifact) to
+//! the user's local machine. The tool reads the file from the agent-accessible
+//! path and returns its content; the TUI (omega-tui) intercepts the result
+//! and writes it to the user's PWD.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,72 +14,65 @@ use super::super::tool::{Tool, ToolInfo, ToolResult};
 use crate::llm::{ToolDefinition, ToolInputSchema};
 use crate::runtime::AgentInternals;
 
-/// Input for the TransferDiff tool
+/// Input for the Transfer tool
 #[derive(Debug, Deserialize)]
-struct TransferDiffInput {
-    /// The patch / diff content to transfer
-    patch: String,
-    /// Optional hint for the file name (without extension)
-    file_name: Option<String>,
+struct TransferInput {
+    /// Path to the file on the agent's filesystem to transfer
+    file_path: String,
 }
 
-/// TransferDiff tool — sends a patch/diff to the user's machine.
+/// Transfer tool — sends a file from the agent to the user's machine.
 ///
-/// The LLM calls this tool with the patch content.  The tool returns the
-/// patch as its result text.  When the TUI receives a `ToolEnd` for this
-/// tool it writes the patch to `./transfer-{session}-{timestamp}.patch`.
-pub struct TransferDiffTool;
+/// The LLM calls this tool with a file path. The tool reads the file and
+/// returns its content. When the TUI receives a `ToolEnd` for this tool
+/// it writes the content to the user's PWD with a session-timestamped name.
+pub struct TransferTool;
 
-impl TransferDiffTool {
+impl TransferTool {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Default for TransferDiffTool {
+impl Default for TransferTool {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Tool for TransferDiffTool {
+impl Tool for TransferTool {
     fn name(&self) -> &str {
-        "TransferDiff"
+        "Transfer"
     }
 
     fn description(&self) -> &str {
-        "Transfer a patch or diff to the user's local machine. The patch is saved as a file on the user's filesystem."
+        "Transfer a file from the agent's filesystem to the user's local machine."
     }
 
     fn definition(&self) -> ToolDefinition {
         use crate::llm::types::CustomTool;
 
         ToolDefinition::Custom(CustomTool {
-            name: "TransferDiff".to_string(),
+            name: "Transfer".to_string(),
             description: Some(
-                "Use this tool to transfer a patch, diff, or code change to the user.\n\
-                 The patch content will be saved as a file on the user's local machine.\n\n\
+                "Use this tool to transfer a file from the agent's environment to the user.\n\
+                 The file content will be saved as a file on the user's local machine.\n\n\
                  Typical usage:\n\
-                 1. Generate a diff with `git diff` or `git format-patch`\n\
-                 2. Pass the full diff output as the `patch` parameter\n\
-                 3. Optionally provide a `file_name` hint (without extension)\n\n\
-                 The file will be saved with a name like `transfer-<session>-<timestamp>.patch`."
+                 1. Generate or create a file (e.g. a patch, result, or artifact)\n\
+                 2. Pass the absolute path to the file as `file_path`\n\n\
+                 The file will be saved with a name like `<original-name>-<session>-<timestamp>`."
                     .to_string(),
             ),
             input_schema: ToolInputSchema {
                 schema_type: "object".to_string(),
                 properties: Some(json!({
-                    "patch": {
+                    "file_path": {
                         "type": "string",
-                        "description": "The full patch or diff content to transfer"
-                    },
-                    "file_name": {
-                        "type": "string",
-                        "description": "Optional hint for the base file name (without extension). Defaults to 'patch'."
+                        "description": "Absolute path to the file on the agent's filesystem to transfer"
                     }
                 })),
-                required: Some(vec!["patch".to_string()]),
+                required: Some(vec!["file_path".to_string()]),
             },
             tool_type: None,
             cache_control: None,
@@ -86,51 +80,57 @@ impl Tool for TransferDiffTool {
     }
 
     fn get_info(&self, input: &Value) -> ToolInfo {
-        let patch_preview = input
-            .get("patch")
+        let file_path = input
+            .get("file_path")
             .and_then(|v| v.as_str())
-            .map(|s| {
-                let preview: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                if s.len() > preview.len() {
-                    format!("{}...", preview)
-                } else {
-                    preview
-                }
-            })
-            .unwrap_or_else(|| "<empty>".to_string());
+            .unwrap_or("<unknown>");
 
         ToolInfo {
-            name: "TransferDiff".to_string(),
-            action_description: "Transfer a patch/diff to the user's local machine".to_string(),
-            details: Some(format!("Patch preview:\n{}", patch_preview)),
+            name: "Transfer".to_string(),
+            action_description: "Transfer a file to the user's local machine".to_string(),
+            details: Some(format!("File: {}", file_path)),
         }
     }
 
     async fn execute(&self, input: &Value, _internals: &mut AgentInternals) -> Result<ToolResult> {
-        let transfer_input: TransferDiffInput = serde_json::from_value(input.clone())
-            .map_err(|e| anyhow::anyhow!("Invalid TransferDiff input: {}", e))?;
+        let transfer_input: TransferInput = serde_json::from_value(input.clone())
+            .map_err(|e| anyhow::anyhow!("Invalid Transfer input: {}", e))?;
 
-        let patch = transfer_input.patch;
-        let file_name = transfer_input
-            .file_name
-            .unwrap_or_else(|| "patch".to_string());
+        let file_path = &transfer_input.file_path;
 
-        // Validate patch is non-empty
-        if patch.trim().is_empty() {
-            return Ok(ToolResult::error("Patch content is empty"));
+        if file_path.is_empty() {
+            return Ok(ToolResult::error("file_path is required"));
         }
 
-        let line_count = patch.lines().count();
-        let size_kb = patch.len() / 1024;
+        // Read the file from the agent's filesystem
+        let content = match tokio::fs::read_to_string(file_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult::error(format!(
+                    "Failed to read file '{}': {}",
+                    file_path, e
+                )));
+            }
+        };
+
+        if content.is_empty() {
+            return Ok(ToolResult::error(format!(
+                "File '{}' is empty",
+                file_path
+            )));
+        }
+
+        let line_count = content.lines().count();
+        let size_kb = content.len() / 1024;
 
         tracing::info!(
-            "TransferDiff: {} lines, ~{} KB, file_name_hint={}",
+            "Transfer: file={}, {} lines, ~{} KB",
+            file_path,
             line_count,
-            size_kb,
-            file_name
+            size_kb
         );
 
-        Ok(ToolResult::success(patch))
+        Ok(ToolResult::success(content))
     }
 
     fn requires_permission(&self) -> bool {

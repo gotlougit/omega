@@ -37,7 +37,7 @@ use picrust::{
     omega_client::OmegaClient,
     runtime::{AgentHandle, AgentRuntime},
     session::{AgentSession, SessionStorage},
-    tools::{AskUserQuestionTool, ToolRegistry, TransferDiffTool},
+    tools::{AskUserQuestionTool, ToolRegistry, TransferTool},
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ fn create_tools() -> Result<Arc<ToolRegistry>> {
     registry.register(GlobProxy::new(omega.clone()));
     registry.register(GrepProxy::new(omega.clone()));
     registry.register(AskUserQuestionTool::new());
-    registry.register(TransferDiffTool::new());
+    registry.register(TransferTool::new());
 
     Ok(Arc::new(registry))
 }

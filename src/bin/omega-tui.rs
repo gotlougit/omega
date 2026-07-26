@@ -87,10 +87,10 @@ struct TuiClient {
     waiting_session_list: bool,
     /// Currently highlighted command index in the command preview (None = no preview).
     command_selection: Option<usize>,
-    /// Maps tool-use ID → (line_index, tool_name) so we can update
-    /// the correct line when the tool result arrives (handles multiple
-    /// concurrent tool calls correctly) and identify the tool type.
-    pending_tool_calls: HashMap<String, (usize, String)>,
+    /// Maps tool-use ID → (line_index, tool_name, original_file_path)
+    /// so we can update the correct line and identify the tool type,
+    /// and for Transfer we know the original filename/extension.
+    pending_tool_calls: HashMap<String, (usize, String, Option<String>)>,
     /// Index in `chat_lines` where the current streaming assistant
     /// response begins (set by first TextDelta, cleared on Done).
     pending_assistant_idx: Option<usize>,
@@ -441,7 +441,7 @@ impl TuiClient {
         self.flush_thinking();
     }
 
-    fn add_tool_call(&mut self, id: &str, tool_name: &str, args: &str) {
+    fn add_tool_call(&mut self, id: &str, tool_name: &str, args: &str, input: &serde_json::Value) {
         // Indented with two spaces to match old CLI style.
         let line = if args.is_empty() {
             format!("  ⚡ {}", tool_name)
@@ -453,7 +453,9 @@ impl TuiClient {
             line,
             Style::default().fg(Color::Yellow),
         )));
-        self.pending_tool_calls.insert(id.to_string(), (idx, tool_name.to_string()));
+        // Extract the file_path from args if present (used by Transfer tool)
+        let orig_path = input.get("file_path").and_then(|v| v.as_str()).map(|s| s.to_string());
+        self.pending_tool_calls.insert(id.to_string(), (idx, tool_name.to_string(), orig_path));
         if self.auto_scroll {
             self.scroll_to_bottom();
         }
@@ -464,9 +466,11 @@ impl TuiClient {
         let symbol = if success { "✓" } else { "✗" };
 
         // Look up the (line_index, tool_name) for this tool ID
-        let tool_name: Option<String> = self.pending_tool_calls.get(id).map(|e| e.1.clone());
+        let tool_entry = self.pending_tool_calls.get(id).map(|e| e.clone());
+        let tool_name: Option<String> = tool_entry.as_ref().map(|e| e.1.clone());
+        let orig_path: Option<String> = tool_entry.as_ref().and_then(|e| e.2.clone());
 
-        if let Some(idx) = self.pending_tool_calls.get(id).map(|e| e.0) {
+        if let Some(idx) = tool_entry.as_ref().map(|e| e.0) {
             if let Some(line) = self.chat_lines.get_mut(idx) {
                 if let Some(first) = line.spans.first_mut() {
                     let old = first.content.as_ref().to_string();
@@ -502,41 +506,46 @@ impl TuiClient {
             )));
         }
 
-        // --- TransferDiff: save the patch to PWD ---
-        if success && tool_name.as_deref() == Some("TransferDiff") && !msg.is_empty() {
-            self.save_transfer_diff(msg);
+        // --- Transfer: save the file to PWD ---
+        if success && tool_name.as_deref() == Some("Transfer") && !msg.is_empty() {
+            self.save_transferred_file(msg, orig_path.as_deref());
         }
     }
 
-    /// Save a patch file received via TransferDiff to the user's PWD.
-    fn save_transfer_diff(&mut self, patch: &str) {
+    /// Save a file received via Transfer to the user's PWD.
+    fn save_transferred_file(&mut self, content: &str, orig_path: Option<&str>) {
         let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        // Sanitize session ID for use in a filename (replace non-alphanumeric chars)
         let safe_session: String = self
             .session_id
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
             .collect();
-        let file_name = format!("transfer-{}-{}.patch", safe_session, timestamp);
 
-        match std::fs::write(&file_name, patch) {
+        // Derive filename from original path or use a default
+        let base_name = orig_path
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("transfer");
+        let file_name = format!("{}-{}-{}", base_name, safe_session, timestamp);
+
+        match std::fs::write(&file_name, content) {
             Ok(_) => {
                 let abs_path = std::env::current_dir()
                     .unwrap_or_default()
                     .join(&file_name);
                 self.add_system_msg(format!(
-                    "⬆️ Patch saved to {}",
+                    "⬆️ File saved to {}",
                     abs_path.display()
                 ));
                 self.add_system_msg(format!(
                     "   ({} KB, {} lines)",
-                    patch.len() / 1024,
-                    patch.lines().count(),
+                    content.len() / 1024,
+                    content.lines().count(),
                 ));
             }
             Err(e) => {
                 self.add_system_msg(format!(
-                    "❌ Failed to save patch to '{}': {}",
+                    "❌ Failed to save file to '{}': {}",
                     file_name, e
                 ));
             }
@@ -796,7 +805,7 @@ impl TuiClient {
                 self.finish_thinking();
             }
             OutputChunk::ToolStart { id, name, input, .. } => {
-                self.add_tool_call(id, name, &tool_input_preview(input));
+                self.add_tool_call(id, name, &tool_input_preview(input), input);
             }
             OutputChunk::ToolProgress { .. } => {
                 // Tool progress output — could be rendered inline if desired
