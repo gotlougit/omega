@@ -158,6 +158,12 @@ async fn main() -> Result<()> {
                 Some(ServerEvent::ModelChanged { model }) => {
                     println!("Model changed to: {model}");
                 }
+                Some(ServerEvent::ModelList { models }) => {
+                    println!("Available models:");
+                    for m in &models {
+                        println!("  {m}");
+                    }
+                }
                 Some(ServerEvent::SessionCompacted { .. }) => {
                     println!("Session compacted.");
                 }

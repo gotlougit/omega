@@ -745,6 +745,54 @@ impl LlmProvider for OpenAIProvider {
         "openai"
     }
 
+    async fn list_models(&self) -> Result<Vec<String>> {
+        // Derive the models endpoint URL from the chat completions URL.
+        // The standard OpenAI models endpoint is at:
+        //   https://api.openai.com/v1/models
+        // while the chat completions endpoint is at:
+        //   https://api.openai.com/v1/chat/completions
+        let auth_config = self
+            .auth
+            .get_auth()
+            .await
+            .context("Failed to get authentication credentials")?;
+
+        let base_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
+        let models_url = derive_models_url(base_url);
+
+        let response = self
+            .client
+            .get(&models_url)
+            .header("Authorization", format!("Bearer {}", auth_config.api_key))
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {models_url}"))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("Failed to read response body")?;
+
+        if !status.is_success() {
+            anyhow::bail!("Models API error ({}): {}", status, body);
+        }
+
+        let models_response: serde_json::Value = serde_json::from_str(&body)
+            .context("Failed to parse models response")?;
+
+        let model_ids = models_response["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(model_ids)
+    }
+
     fn create_variant(&self, model: &str, max_tokens: u32) -> Arc<dyn LlmProvider> {
         Arc::new(self.with_model_and_tokens_override(model, max_tokens))
     }
@@ -1015,4 +1063,22 @@ fn convert_response_to_internal(response: OpenAIResponse) -> Result<MessageRespo
             thoughts_token_count: None,
         },
     })
+}
+
+/// Derive the models list URL from the chat completions base URL.
+///
+/// For standard OpenAI: `https://api.openai.com/v1/chat/completions` → `https://api.openai.com/v1/models`
+/// For a custom proxy: `https://proxy.example.com/v1/chat/completions` → `https://proxy.example.com/v1/models`
+fn derive_models_url(chat_url: &str) -> String {
+    // If the URL ends with /chat/completions, replace it with /models
+    if let Some(base) = chat_url.strip_suffix("/chat/completions") {
+        return format!("{}/models", base);
+    }
+    // If the URL ends with /v1/chat/completions (alternate), same logic
+    if let Some(base) = chat_url.strip_suffix("chat/completions") {
+        return format!("{}models", base);
+    }
+    // Otherwise, try appending /models to the base (stripping trailing slash)
+    let trimmed = chat_url.trim_end_matches('/');
+    format!("{}/models", trimmed)
 }

@@ -91,6 +91,9 @@ enum ServerEvent {
     SessionCompacted {
         session_id: String,
     },
+    ModelList {
+        models: Vec<String>,
+    },
     SystemMsg {
         message: String,
     },
@@ -215,6 +218,26 @@ async fn handle_connection(
                 }
             };
             let _ = event_tx.send(ServerEvent::SessionList { sessions: list });
+            continue;
+        }
+
+        // list_models doesn't need a session_id either — ask the current provider.
+        if req.msg_type == "list_models" {
+            let prov = {
+                let lock = current_provider.read().unwrap();
+                Arc::clone(&lock)
+            };
+            match prov.list_models().await {
+                Ok(models) => {
+                    let _ = event_tx.send(ServerEvent::ModelList { models });
+                }
+                Err(e) => {
+                    tracing::warn!("list_models error: {e}");
+                    let _ = event_tx.send(ServerEvent::ModelList {
+                        models: Vec::new(),
+                    });
+                }
+            }
             continue;
         }
 

@@ -44,6 +44,10 @@ pub enum ServerEvent {
     SessionCompacted {
         session_id: String,
     },
+    /// A list of available models from the daemon.
+    ModelList {
+        models: Vec<String>,
+    },
     /// A system message from the daemon.
     SystemMsg(String),
     /// An unrecognised variant (forward-compatibility).
@@ -369,6 +373,17 @@ impl ServerEvent {
                     .unwrap_or("")
                     .to_string(),
             }),
+            "ModelList" => Ok(ServerEvent::ModelList {
+                models: obj
+                    .get("models")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
             "SystemMsg" => Ok(ServerEvent::SystemMsg(
                 obj.get("message")
                     .and_then(|v| v.as_str())
@@ -577,6 +592,14 @@ impl DaemonWriter {
     pub async fn send_list_sessions(&mut self) -> Result<()> {
         let req = serde_json::json!({
             "type": "list_sessions",
+        });
+        self.write_json(&req).await
+    }
+
+    /// Request the list of available models from the daemon.
+    pub async fn send_list_models(&mut self) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "list_models",
         });
         self.write_json(&req).await
     }

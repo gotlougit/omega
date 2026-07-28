@@ -58,6 +58,16 @@ pub trait LlmProvider: Send + Sync {
         session_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>>;
 
+    /// List available models from the API.
+    ///
+    /// Returns a list of model IDs. The default implementation returns an
+    /// empty vec with an error, since not all providers support listing models.
+    async fn list_models(&self) -> Result<Vec<String>> {
+        Err(anyhow::anyhow!(
+            "listing models is not supported by this provider"
+        ))
+    }
+
     /// Get the current model name.
     fn model(&self) -> String;
 
