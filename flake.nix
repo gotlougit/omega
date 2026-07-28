@@ -14,40 +14,57 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
+
+      mkOmegaPkg =
+        { pkgs, pname, cargoBuildFlags }:
+        pkgs.rustPlatform.buildRustPackage {
+          inherit pname cargoBuildFlags;
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
+          buildInputs = with pkgs; [ openssl.dev ];
+          doCheck = false;
+        };
     in
     {
       # --------------------------------------------------------------------------
-      # Packages — the four omega binaries
+      # Packages — each omega binary built from the workspace
       # --------------------------------------------------------------------------
       packages = forAllSystems (
         system:
         let
           pkgs = nixpkgsFor.${system};
-          picrust = pkgs.rustPlatform.buildRustPackage {
-            pname = "picrust";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
-            buildInputs = with pkgs; [ openssl.dev ];
-            doCheck = false;
+        in
+        {
+          default = self.packages.${system}.omega-sh;
+
+          omega-sh = mkOmegaPkg {
+            inherit pkgs;
+            pname = "omega-sh";
+            cargoBuildFlags = [ "-p" "omega-sh" ];
+          };
+
+          omega-loop = mkOmegaPkg rec {
+            inherit pkgs;
+            pname = "omega-loop";
+            cargoBuildFlags = [ "-p" "omega-loop" ];
             postInstall = ''
               wrapProgram $out/bin/omega-tui \
                 --set-default OMEGA_LOOP_SOCKET_PATH /run/omega/omega-loop.sock
             '';
           };
-        in
-        {
-          default = picrust;
-          picrust = picrust;
-          omega-sh = picrust;
-          omega-loop = picrust;
-          omega-tui = picrust;
+
+          omega-tui = mkOmegaPkg {
+            inherit pkgs;
+            pname = "omega-tui";
+            cargoBuildFlags = [ "-p" "omega-tui" ];
+          };
         }
       );
 
       # --------------------------------------------------------------------------
-      # Dev shells (retained from original config)
+      # Dev shells
       # --------------------------------------------------------------------------
       devShells = forAllSystems (
         system:
@@ -82,28 +99,8 @@
       );
 
       # --------------------------------------------------------------------------
-      # NixOS module — import this in your system configuration to set up
-      # the omega services (omega-sh + omega-loop) as systemd units
-      # running under the dedicated "clanker" user.
-      #
-      # Usage:
-      #   # flake.nix
-      #   inputs.picrust.url = "path:/home/gotlou/Code/picrust";
-      #
-      #   outputs = { self, nixpkgs, picrust, ... }: {
-      #     nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
-      #       modules = [
-      #         picrust.nixosModules.picrust
-      #         {
-      #           services.omega = {
-      #             enable = true;
-      #             humanUsers = [ "gotlou" ];
-      #           };
-      #         }
-      #       ];
-      #     };
-      #   };
+      # NixOS module
       # --------------------------------------------------------------------------
-      nixosModules.picrust = import ./nixos/module.nix;
+      nixosModules.omega = import ./nixos/module.nix;
     };
 }

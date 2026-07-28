@@ -17,13 +17,14 @@ let
 
   cfg = config.services.omega;
 
-  # Build picrust from the flake source (../. is the flake root when this
-  # module is consumed via inputs.picrust.nixosModules.picrust).
+  # Build omega from the flake source — use a single build that includes all
+  # workspace binaries, one of which we wrap for the TUI socket path.
   omegaPkg = pkgs.rustPlatform.buildRustPackage {
-    pname = "picrust";
+    pname = "omega";
     version = "0.1.0";
     src = ../.;
     cargoLock.lockFile = .././Cargo.lock;
+    cargoBuildFlags = [ "-p" "omega-loop" "-p" "omega-sh" "-p" "omega-tui" ];
     nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
     buildInputs = with pkgs; [ openssl.dev ];
     doCheck = false;
@@ -291,7 +292,7 @@ in
 
     # ----- omega binaries on the system ---------------------------------
     environment.systemPackages = [
-      cfg.package  # omega-tui (TUI), picrust (CLI)
+      cfg.package  # omega-tui, omega-loop, omega-sh
     ];
 
     # ----- allow clanker to use nix build etc. ---------------------------
