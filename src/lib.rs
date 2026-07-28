@@ -24,3 +24,6 @@ pub mod omega_client;
 
 // omega-loop client for UI processes
 pub mod omega_loop_client;
+
+// Minimal TUI primitives (styled text/blocks adapted from tau)
+pub mod tui;
