@@ -20,9 +20,6 @@ pub struct AgentConfig {
     /// Whether to enable debug logging (API calls, tool calls)
     pub debug_enabled: bool,
 
-    /// Whether to enable streaming responses from the LLM
-    pub streaming_enabled: bool,
-
     /// Whether to enable prompt caching
     pub enable_prompt_caching: bool,
 
@@ -55,7 +52,6 @@ impl AgentConfig {
             max_tool_iterations: 100,
             auto_save_session: true,
             debug_enabled: false,
-            streaming_enabled: false,
             enable_prompt_caching: true,
             turn_retry: TurnRetryConfig {
                 enabled: true,
@@ -69,14 +65,6 @@ impl AgentConfig {
     /// Set the tool registry
     pub fn with_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
         self.tools = Some(tools);
-        self
-    }
-
-
-
-    /// Enable or disable streaming responses
-    pub fn with_streaming(mut self, enabled: bool) -> Self {
-        self.streaming_enabled = enabled;
         self
     }
 
@@ -113,7 +101,6 @@ impl std::fmt::Debug for AgentConfig {
             .field("tools", &self.tools.as_ref().map(|t| t.tool_names()))
             .field("max_tool_iterations", &self.max_tool_iterations)
             .field("debug_enabled", &self.debug_enabled)
-            .field("streaming_enabled", &self.streaming_enabled)
             .field("enable_prompt_caching", &self.enable_prompt_caching)
             .field("turn_retry", &self.turn_retry)
             .field("thinking", &self.thinking)

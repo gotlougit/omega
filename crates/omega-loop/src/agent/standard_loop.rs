@@ -312,25 +312,14 @@ impl StandardAgent {
                 }
             }
 
-            // Choose streaming or non-streaming based on config
-            // Pass the already-cache-controlled data
-            let (content_blocks, stop_reason) = if self.config.streaming_enabled {
-                self.call_llm_streaming_with_cache(
-                    internals,
-                    messages_with_cache,
-                    tools_with_cache,
-                    system_with_cache,
-                )
-                .await?
-            } else {
-                self.call_llm_non_streaming_with_cache(
-                    internals,
-                    messages_with_cache,
-                    tools_with_cache,
-                    system_with_cache,
-                )
-                .await?
-            };
+            // Call LLM with streaming (always enabled)
+            let (content_blocks, stop_reason) = self.call_llm_streaming_with_cache(
+                internals,
+                messages_with_cache,
+                tools_with_cache,
+                system_with_cache,
+            )
+            .await?;
 
             tracing::info!(
                 "[StandardAgent] LLM response: stop_reason={:?}",
@@ -612,60 +601,7 @@ impl StandardAgent {
         (tool_definitions, system_prompt, messages)
     }
 
-    /// Call LLM without streaming (with pre-applied cache control)
-    async fn call_llm_non_streaming_with_cache(
-        &self,
-        internals: &mut AgentInternals,
-        messages: Vec<Message>,
-        tools: Vec<omega_llm::ToolDefinition>,
-        system: Option<SystemPrompt>,
-    ) -> Result<(Vec<ContentBlock>, Option<StopReason>)> {
-        // Get session ID
-        let session_id = {
-            let session = internals.session.read().await;
-            session.session_id().to_string()
-        };
-
-        let response = self
-            .llm
-            .send_with_tools_and_system(
-                messages,
-                system,
-                tools,
-                None,
-                self.config.thinking.clone(),
-                Some(&session_id),
-            )
-            .await?;
-
-        // Log API response if debugger is enabled
-        if let Some(debugger) = internals.context.get_resource::<Debugger>() {
-            if let Ok(response_json) = serde_json::to_value(&response) {
-                if let Err(e) = debugger.log_api_response(&response_json) {
-                    tracing::warn!("[StandardAgent] Failed to log API response: {}", e);
-                }
-            }
-        }
-
-        // Send text and thinking content to output
-        for block in &response.content {
-            match block {
-                ContentBlock::Text { text, .. } => {
-                    internals.send_text(text);
-                    internals.send_text_complete(text);
-                }
-                ContentBlock::Thinking { thinking, .. } => {
-                    internals.send_thinking(thinking);
-                    internals.send_thinking_complete(thinking);
-                }
-                _ => {}
-            }
-        }
-
-        Ok((response.content, response.stop_reason))
-    }
-
-    /// Call LLM with streaming (with pre-applied cache control) - sends deltas in real-time
+    /// Call LLM with streaming - sends deltas in real-time
     async fn call_llm_streaming_with_cache(
         &self,
         internals: &mut AgentInternals,

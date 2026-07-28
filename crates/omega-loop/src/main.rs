@@ -66,6 +66,7 @@ struct ClientRequest {
 
 #[derive(Deserialize, Default)]
 struct SessionConfig {
+    #[allow(dead_code)]
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -290,7 +291,6 @@ async fn handle_connection(
                     // --- build agent config -------------------------------
                     let mut agent_cfg = AgentConfig::new()
                         .with_tools(tools.clone())
-                        .with_streaming(config.stream)
                         .with_prompt_caching(!config.no_cache);
 
                     if config.think {
@@ -406,8 +406,7 @@ async fn handle_connection(
 
                         let prov = current_provider.read().unwrap().clone();
                         let agent_cfg = AgentConfig::new()
-                            .with_tools(tools.clone())
-                            .with_streaming(true);
+                            .with_tools(tools.clone());
                         let agent = StandardAgent::new(agent_cfg, prov);
 
                         let handle = runtime
@@ -527,8 +526,7 @@ async fn handle_connection(
                     Ok(agent_session) => {
                         let prov = current_provider.read().unwrap().clone();
                         let agent_cfg = AgentConfig::new()
-                            .with_tools(tools.clone())
-                            .with_streaming(true);
+                            .with_tools(tools.clone());
                         let agent = StandardAgent::new(agent_cfg, prov);
 
                         let handle = runtime
