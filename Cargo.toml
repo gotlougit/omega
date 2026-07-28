@@ -25,15 +25,9 @@ async-trait = "0.1"
 # Glob pattern matching for file tools
 glob = "0.3"
 
-# Text wrapping for TUI
-textwrap = "0.16"
 
 # Terminal colors and formatting
-colored = "2.0"
-
-# Terminal UI (TUI) framework
-ratatui = "0.26"
-crossterm = { version = "0.27", features = ["bracketed-paste"] }
+colored = "3.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -68,9 +62,5 @@ path = "src/bin/omega-sh.rs"
 [[bin]]
 name = "omega-loop"
 path = "src/bin/omega-loop.rs"
-
-[[bin]]
-name = "omega-tui"
-path = "src/bin/omega-tui.rs"
 
 
