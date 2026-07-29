@@ -69,6 +69,9 @@ struct SharedState {
     input_history: Vec<String>,
     history_index: Option<usize>,
 
+    // --- kill ring ---
+    kill_ring: Vec<String>,
+
     // --- terminal ---
     width: usize,
     height: usize,
@@ -102,6 +105,7 @@ impl SharedState {
             status_line: None,
             input_history: Vec::new(),
             history_index: None,
+            kill_ring: Vec::new(),
             width,
             height,
             shutdown: false,
@@ -705,6 +709,15 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
             'd' => {
                 if st.buffer.is_empty() {
                     let _ = tx.send(InputMessage::Event(Event::Eof));
+                } else {
+                    let cur = st.cursor;
+                    if cur < st.buffer.len() {
+                        let next = next_char_boundary(&st.buffer, cur);
+                        let killed = st.buffer[cur..next].to_string();
+                        st.buffer.drain(cur..next);
+                        st.kill_ring.push(killed);
+                        let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                    }
                 }
             }
             'e' => {
@@ -727,6 +740,99 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                 st.cursor = 0;
                 let _ = tx.send(InputMessage::Event(Event::BufferChanged));
             }
+            'h' => {
+                let cur = st.cursor;
+                if cur > 0 {
+                    let prev = prev_char_boundary(&st.buffer, cur);
+                    st.buffer.drain(prev..cur);
+                    st.cursor = prev;
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            'k' => {
+                let cur = st.cursor;
+                if cur < st.buffer.len() {
+                    let killed = st.buffer[cur..].to_string();
+                    st.buffer.truncate(cur);
+                    st.kill_ring.push(killed);
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            'n' => {
+                if st.history_index.is_some() {
+                    let idx = st.history_index.unwrap() + 1;
+                    if idx >= st.input_history.len() {
+                        st.buffer.clear();
+                        st.cursor = 0;
+                        st.history_index = None;
+                    } else {
+                        st.buffer = st.input_history[idx].clone();
+                        st.cursor = st.buffer.len();
+                        st.history_index = Some(idx);
+                    }
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            'p' => {
+                if !st.input_history.is_empty() {
+                    let idx = match st.history_index {
+                        None => st.input_history.len() - 1,
+                        Some(0) => 0,
+                        Some(i) => i - 1,
+                    };
+                    st.buffer = st.input_history[idx].clone();
+                    st.cursor = st.buffer.len();
+                    st.history_index = Some(idx);
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            't' => {
+                let cur = st.cursor;
+                let len = st.buffer.len();
+                if len >= 2 {
+                    if cur >= len {
+                        // Transpose last two chars
+                        let chars: Vec<(usize, char)> = st.buffer.char_indices().collect();
+                        let last = chars.len() - 1;
+                        let second_last = chars.len() - 2;
+                        let mut buf = String::new();
+                        for (i, (_, ch)) in chars.iter().enumerate() {
+                            if i == second_last {
+                                buf.push(chars[last].1);
+                            } else if i == last {
+                                buf.push(chars[second_last].1);
+                            } else {
+                                buf.push(*ch);
+                            }
+                        }
+                        st.buffer = buf;
+                        st.cursor = len;
+                        let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                    } else if cur >= 1 {
+                        // Transpose chars before cursor
+                        let chars: Vec<(usize, char)> = st.buffer.char_indices().collect();
+                        let pos = chars.iter().position(|&(i, _)| i == cur)
+                            .unwrap_or(chars.len());
+                        if pos >= 2 {
+                            let a = pos - 2;
+                            let b = pos - 1;
+                            let mut buf = String::new();
+                            for (i, (_, ch)) in chars.iter().enumerate() {
+                                if i == a {
+                                    buf.push(chars[b].1);
+                                } else if i == b {
+                                    buf.push(chars[a].1);
+                                } else {
+                                    buf.push(*ch);
+                                }
+                            }
+                            st.buffer = buf;
+                            st.cursor = cur;
+                            let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                        }
+                    }
+                }
+            }
             'w' => {
                 let cur = st.cursor;
                 if cur > 0 {
@@ -734,23 +840,105 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                     let before = &st.buffer[..cur];
                     // Skip trailing whitespace.
                     let trimmed_end = before.trim_end_matches(|c: char| c.is_ascii_whitespace());
-                    let _non_ws_len = trimmed_end.len();
                     // Find the last whitespace before that (word boundary).
-                    if let Some(last_space) = trimmed_end.rfind(|c: char| c.is_ascii_whitespace()) {
-                        // Delete from after the space to cursor.
-                        let delete_start = last_space + 1;
-                        st.buffer.drain(delete_start..cur);
-                        st.cursor = delete_start;
-                    } else {
-                        // No whitespace: delete entire prefix up to cursor.
-                        st.buffer.drain(..cur);
-                        st.cursor = 0;
-                    }
+                    let delete_start =
+                        if let Some(last_space) = trimmed_end.rfind(|c: char| c.is_ascii_whitespace()) {
+                            last_space + 1
+                        } else {
+                            0
+                        };
+                    let killed = st.buffer[delete_start..cur].to_string();
+                    st.buffer.drain(delete_start..cur);
+                    st.cursor = delete_start;
+                    st.kill_ring.push(killed);
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            'y' => {
+                if let Some(killed) = st.kill_ring.last() {
+                    let cur = st.cursor;
+                    let mut new_buf = st.buffer[..cur].to_string();
+                    new_buf.push_str(killed);
+                    new_buf.push_str(&st.buffer[cur..]);
+                    st.buffer = new_buf;
+                    st.cursor = cur + killed.len();
                     let _ = tx.send(InputMessage::Event(Event::BufferChanged));
                 }
             }
             _ => {}
         },
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => match c {
+            'b' => {
+                // Move backward one word
+                let cur = st.cursor;
+                if cur > 0 {
+                    let before = &st.buffer[..cur];
+                    // Skip trailing whitespace before cursor
+                    let trimmed = before.trim_end_matches(|c: char| c.is_ascii_whitespace());
+                    if let Some(prev_space) = trimmed.rfind(|c: char| c.is_ascii_whitespace()) {
+                        let word_start = prev_space + 1;
+                        st.cursor = word_start;
+                    } else {
+                        st.cursor = 0;
+                    }
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            'd' => {
+                // Delete word forward
+                let cur = st.cursor;
+                let after = &st.buffer[cur..];
+                // Skip leading whitespace
+                let trimmed_start = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let skipped = after.len() - trimmed_start.len();
+                if let Some(next_space) = trimmed_start.find(|c: char| c.is_ascii_whitespace()) {
+                    let end = cur + skipped + next_space;
+                    let killed = st.buffer[cur..end].to_string();
+                    st.buffer.drain(cur..end);
+                    st.kill_ring.push(killed);
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                } else if !trimmed_start.is_empty() {
+                    // Delete from cursor to end
+                    let killed = st.buffer[cur..].to_string();
+                    st.buffer.truncate(cur);
+                    st.kill_ring.push(killed);
+                    let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+                }
+            }
+            'f' => {
+                // Move forward to start of next word
+                let cur = st.cursor;
+                let after = &st.buffer[cur..];
+                // Skip leading whitespace first
+                let trimmed_start = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let skipped = after.len() - trimmed_start.len();
+                // Now find the end of the next word (next whitespace after it)
+                if let Some(next_space) = trimmed_start.find(|c: char| c.is_ascii_whitespace()) {
+                    // Skip the word AND the following whitespace to land at start of next word
+                    let word_end = cur + skipped + next_space;
+                    let rest = &st.buffer[word_end..];
+                    let after_word_ws = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                    let ws_skipped = rest.len() - after_word_ws.len();
+                    if ws_skipped > 0 || after_word_ws.is_empty() {
+                        st.cursor = word_end + ws_skipped;
+                    } else {
+                        st.cursor = word_end;
+                    }
+                } else if !trimmed_start.is_empty() {
+                    if skipped > 0 {
+                        // We were on whitespace before a word — land at the word start
+                        st.cursor = cur + skipped;
+                    } else {
+                        // No whitespace: we're on the last word, go to end
+                        st.cursor = st.buffer.len();
+                    }
+                } else {
+                    st.cursor = st.buffer.len();
+                }
+                let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+            }
+            _ => {}
+        }
         KeyCode::Char(c) => {
             let pos = st.cursor;
             st.buffer.insert(pos, c);
@@ -798,6 +986,20 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                 let _ = tx.send(InputMessage::Event(Event::BufferChanged));
             }
         }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+Left: move backward one word
+            let cur = st.cursor;
+            if cur > 0 {
+                let before = &st.buffer[..cur];
+                let trimmed = before.trim_end_matches(|c: char| c.is_ascii_whitespace());
+                if let Some(prev_space) = trimmed.rfind(|c: char| c.is_ascii_whitespace()) {
+                    st.cursor = prev_space + 1;
+                } else {
+                    st.cursor = 0;
+                }
+                let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+            }
+        }
         KeyCode::Left => {
             let cur = st.cursor;
             if cur > 0 {
@@ -805,10 +1007,60 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                 let _ = tx.send(InputMessage::Event(Event::BufferChanged));
             }
         }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+Right: move forward to start of next word
+            let cur = st.cursor;
+            let after = &st.buffer[cur..];
+            // Skip leading whitespace first
+            let trimmed_start = after.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let skipped = after.len() - trimmed_start.len();
+            // Now find the end of the next word (next whitespace after it)
+            if let Some(next_space) = trimmed_start.find(|c: char| c.is_ascii_whitespace()) {
+                // Skip the word AND the following whitespace to land at start of next word
+                let word_end = cur + skipped + next_space;
+                let rest = &st.buffer[word_end..];
+                let after_word_ws = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let ws_skipped = rest.len() - after_word_ws.len();
+                if ws_skipped > 0 || after_word_ws.is_empty() {
+                    st.cursor = word_end + ws_skipped;
+                } else {
+                    st.cursor = word_end;
+                }
+            } else if !trimmed_start.is_empty() {
+                if skipped > 0 {
+                    // We were on whitespace before a word — land at the word start
+                    st.cursor = cur + skipped;
+                } else {
+                    // No whitespace: we're on the last word, go to end
+                    st.cursor = st.buffer.len();
+                }
+            } else {
+                st.cursor = st.buffer.len();
+            }
+            let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+        }
         KeyCode::Right => {
             let cur = st.cursor;
             if cur < st.buffer.len() {
                 st.cursor = next_char_boundary(&st.buffer, cur);
+                let _ = tx.send(InputMessage::Event(Event::BufferChanged));
+            }
+        }
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+            // Alt+Backspace: delete previous word
+            let cur = st.cursor;
+            if cur > 0 {
+                let before = &st.buffer[..cur];
+                let trimmed = before.trim_end_matches(|c: char| c.is_ascii_whitespace());
+                let delete_start = if let Some(prev_space) = trimmed.rfind(|c: char| c.is_ascii_whitespace()) {
+                    prev_space + 1
+                } else {
+                    0
+                };
+                let killed = st.buffer[delete_start..cur].to_string();
+                st.buffer.drain(delete_start..cur);
+                st.cursor = delete_start;
+                st.kill_ring.push(killed);
                 let _ = tx.send(InputMessage::Event(Event::BufferChanged));
             }
         }
@@ -961,11 +1213,18 @@ fn layout_frame(snap: &Snapshot) -> FrameLayout {
     let log_end = all_lines.len();
 
     // --- Status line (between log and prompt, fixed) ---
-    if let Some(ref status) = snap.status_line {
+    let status_h = if let Some(ref status) = snap.status_line {
         if !status.content.is_empty() {
-            all_lines.extend(layout_block(status, width));
+            let lines = layout_block(status, width);
+            let h = lines.len();
+            all_lines.extend(lines);
+            h
+        } else {
+            0
         }
-    }
+    } else {
+        0
+    };
 
     // --- Prompt ---
     let prompt_text = {
@@ -987,7 +1246,7 @@ fn layout_frame(snap: &Snapshot) -> FrameLayout {
         width,
         snap.left_prompt.char_count(),
     );
-    let cursor_row = log_end + cursor_row_in_input;
+    let cursor_row = log_end + status_h + cursor_row_in_input;
     all_lines.extend(prompt_lines);
 
     // --- Rest of the fixed tail ---

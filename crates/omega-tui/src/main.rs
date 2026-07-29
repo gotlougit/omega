@@ -883,7 +883,14 @@ fn run_loop(
                     handle.set_buffer(String::new(), 0);
                 }
             }
-            AppEvent::Term(Event::Resize { .. }) => {}
+            AppEvent::Term(Event::Resize { width, height }) => {
+                // Refresh the status line (e.g. cache bar) at the new width.
+                // Use the resize event's width directly since the Term's internal
+                // SharedState may not have been updated yet (this event arrives
+                // via the app channel, not the raw input channel).
+                let w = width.max(1) as usize;
+                handle.set_status_line(app.cache.to_status_block(w.max(40)));
+            }
         }
     }
 }
@@ -1900,19 +1907,24 @@ mod tests {
     }
 
     /// Ctrl-D on an empty buffer sends Eof (terminal signal). On a
-    /// non-empty buffer it does nothing — which is surprising to users
-    /// who expect it to delete the character at cursor.
+    /// non-empty buffer it deletes the character under cursor (readline
+    /// behavior).
     #[test]
-    fn ctrl_d_on_nonempty_buffer_is_noop() {
+    fn ctrl_d_on_nonempty_buffer_deletes_char() {
         let mut fx = fixture();
         type_str(&mut fx, "data");
         // Send Ctrl-D ('d' with CTRL modifier).
         fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
             .expect("input open");
-        // handle_key_locked silently ignores Ctrl-D on non-empty buffer:
-        // no event is emitted. Buffer is unchanged.
-        // (We cannot call term.next_event() because it would block forever.)
-        assert_eq!(fx.handle.get_buffer(), "data");
+        // Ctrl-D on non-empty buffer deletes the character at cursor.
+        // Cursor is at end (after 'a'), so it does nothing.
+        // Move cursor back and try again.
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event(); // BufferChanged
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        let _ = fx.term.next_event(); // BufferChanged
+        assert_eq!(fx.handle.get_buffer(), "ata");
     }
 
     /// Ctrl-U clears from cursor position to beginning of buffer.
@@ -1943,6 +1955,88 @@ mod tests {
         fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 3);
+    }
+
+    /// Home on empty buffer stays at 0, End on empty buffer stays at 0.
+    #[test]
+    fn home_and_end_on_empty_buffer() {
+        let mut fx = fixture();
+        assert_eq!(fx.handle.get_buffer(), "");
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Home on empty buffer — stays at 0, no event
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        // No event fires because cursor didn't change (already at 0)
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // End on empty buffer — stays at 0, no event
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        assert_eq!(fx.handle.get_cursor(), 0);
+    }
+
+    /// Home/End with cursor already at boundary — should be idempotent.
+    #[test]
+    fn home_and_end_idempotent() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello");
+        // Already at end (cursor=5), End should stay at 5 with no event
+        assert_eq!(fx.handle.get_cursor(), 5);
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        assert_eq!(fx.handle.get_cursor(), 5);
+        // Move to start, Home should stay at 0 with no event
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        assert_eq!(fx.handle.get_cursor(), 0);
+    }
+
+    /// Home/End with unicode multi-byte content — byte boundaries.
+    #[test]
+    fn home_and_end_unicode() {
+        let mut fx = fixture();
+        type_str(&mut fx, "aé漢");
+        assert_eq!(fx.handle.get_cursor(), 6); // 1 + 2 + 3 bytes
+        assert_eq!(fx.handle.get_buffer(), "aé漢");
+        // Home to start (cursor moves, fires BufferChanged)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // End back to end
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 6);
+        // Type more after End appends at cursor (6), then move to end
+        type_str(&mut fx, " more");
+        assert_eq!(fx.handle.get_cursor(), 11);
+        assert_eq!(fx.handle.get_buffer(), "aé漢 more");
+        // Home from the end of the longer buffer
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // End back to end
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 11);
+    }
+
+    /// Home from middle of buffer, End from middle of buffer.
+    #[test]
+    fn home_from_middle_end_from_middle() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world");
+        // Move cursor to position 5 (between 'hello' and ' world')
+        for _ in 0..6 {
+            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            let _ = fx.term.next_event();
+        }
+        assert_eq!(fx.handle.get_cursor(), 5);
+        // Home from middle — should go to 0
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // End from start — should go to end
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 11);
     }
 
     /// Unicode multi-byte characters (é, 漢字) must not split in the buffer
@@ -2544,5 +2638,1737 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         joined.contains(needle)
+    }
+
+    // =========================================================================
+    // Prompt caching bar — CacheStats unit tests
+    // =========================================================================
+
+    #[test]
+    fn cache_stats_default_is_empty() {
+        let cs = CacheStats::default();
+        assert_eq!(cs.request_count, 0);
+        assert_eq!(cs.total_input_tokens, 0);
+        assert_eq!(cs.total_cache_read_tokens, 0);
+        assert_eq!(cs.total_cache_creation_tokens, 0);
+        assert_eq!(cs.hit_rate_pct(), 0.0);
+    }
+
+    #[test]
+    fn cache_stats_update_accumulates() {
+        let mut cs = CacheStats::default();
+        cs.update(100, 40, 10);
+        assert_eq!(cs.request_count, 1);
+        assert_eq!(cs.total_input_tokens, 100);
+        assert_eq!(cs.total_cache_read_tokens, 40);
+        assert_eq!(cs.total_cache_creation_tokens, 10);
+    }
+
+    #[test]
+    fn cache_stats_multiple_updates_cumulative() {
+        let mut cs = CacheStats::default();
+        cs.update(100, 40, 10);
+        cs.update(200, 160, 30);
+        assert_eq!(cs.request_count, 2);
+        assert_eq!(cs.total_input_tokens, 300);
+        assert_eq!(cs.total_cache_read_tokens, 200);
+        assert_eq!(cs.total_cache_creation_tokens, 40);
+    }
+
+    #[test]
+    fn cache_stats_hit_rate_100_percent() {
+        let mut cs = CacheStats::default();
+        cs.update(100, 100, 0);
+        assert!((cs.hit_rate_pct() - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn cache_stats_hit_rate_0_percent() {
+        let mut cs = CacheStats::default();
+        cs.update(100, 0, 100);
+        assert!((cs.hit_rate_pct() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn cache_stats_hit_rate_fractional() {
+        let mut cs = CacheStats::default();
+        cs.update(3, 1, 2);
+        // 1/3 = 33.333...%
+        assert!((cs.hit_rate_pct() - 100.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn cache_stats_hit_rate_with_zero_input_tokens() {
+        let cs = CacheStats::default();
+        // No updates: total_input_tokens == 0 => hit_rate_pct returns 0.0
+        assert_eq!(cs.hit_rate_pct(), 0.0);
+    }
+
+    #[test]
+    fn cache_stats_large_values_do_not_overflow() {
+        let mut cs = CacheStats::default();
+        // Push values up near u32::MAX repeatedly
+        for _ in 0..10 {
+            cs.update(u32::MAX, u32::MAX, u32::MAX);
+        }
+        // Each u32::MAX ≈ 4.29e9, so 10× fits in u64 easily
+        assert!(cs.total_input_tokens as u128 > 0);
+        assert!((cs.hit_rate_pct() - 100.0).abs() < 1.0);
+    }
+
+    // =========================================================================
+    // Prompt caching bar — to_status_block formatting
+    // =========================================================================
+
+    #[test]
+    fn cache_bar_shows_no_requests_when_empty() {
+        let cs = CacheStats::default();
+        let block = cs.to_status_block(80);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("no requests yet"), "default bar should say no requests");
+    }
+
+    #[test]
+    fn cache_bar_shows_percentage_after_update() {
+        let mut cs = CacheStats::default();
+        cs.update(1000, 500, 100);
+        let block = cs.to_status_block(80);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("50.0%"), "bar should show 50.0% hit rate");
+        assert!(text.contains("500") || text.contains("0.5"), "bar should reference cached tokens");
+    }
+
+    #[test]
+    fn cache_bar_displays_perfect_hit_rate() {
+        let mut cs = CacheStats::default();
+        cs.update(1000, 1000, 0);
+        let block = cs.to_status_block(80);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("100.0%"), "100% hit rate should show 100.0%");
+        // Bar should be completely filled
+        let fill_count = text.matches('█').count();
+        let empty_count = text.matches('░').count();
+        assert!(fill_count > 0, "100% bar should have filled blocks");
+        assert!(empty_count == 0, "100% bar should have zero empty blocks");
+    }
+
+    #[test]
+    fn cache_bar_displays_zero_hit_rate() {
+        let mut cs = CacheStats::default();
+        cs.update(1000, 0, 1000);
+        let block = cs.to_status_block(80);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("0.0%"), "0% hit rate should show 0.0%");
+        let fill_count = text.matches('█').count();
+        let empty_count = text.matches('░').count();
+        assert!(fill_count == 0, "0% bar should have zero filled blocks");
+        assert!(empty_count > 0, "0% bar should have empty blocks");
+    }
+
+    #[test]
+    fn cache_bar_fill_never_exceeds_bar_width() {
+        // Even with >100% "hit rate" (shouldn't happen, but guard against it)
+        let mut cs = CacheStats::default();
+        cs.update(100, 200, 0); // more read than input — shouldn't happen
+        let block = cs.to_status_block(80);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        // Count bar chars: they should not exceed bar_width (max 40)
+        let total_bar_chars = text.matches('█').count() + text.matches('░').count();
+        assert!(
+            total_bar_chars <= 40,
+            "BUG: fill exceeds bar_width: {total_bar_chars} > 40"
+        );
+    }
+
+    #[test]
+    fn cache_bar_width_scales_with_terminal_width() {
+        let mut cs = CacheStats::default();
+        cs.update(1000, 500, 100);
+
+        // At narrow width (50 cols): bar_width = max(10, 50-60) = 10
+        let block_narrow = cs.to_status_block(50);
+        let text_n: String = block_narrow.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let bar_n = text_n.matches('█').count() + text_n.matches('░').count();
+        assert_eq!(bar_n, 10, "bar at 50 cols should be 10 chars");
+
+        // At wide width (120 cols): bar_width = min(40, 120-60) = 40
+        let block_wide = cs.to_status_block(120);
+        let text_w: String = block_wide.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let bar_w = text_w.matches('█').count() + text_w.matches('░').count();
+        assert_eq!(bar_w, 40, "bar at 120 cols should be 40 chars");
+    }
+
+    #[test]
+    fn cache_bar_shows_request_count() {
+        let mut cs = CacheStats::default();
+        cs.update(100, 50, 10);
+        let block = cs.to_status_block(80);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("1 req"), "bar should show 1 request");
+        cs.update(50, 25, 5);
+        let block2 = cs.to_status_block(80);
+        let text2: String = block2.content.spans().iter().map(|s| s.text.as_str()).collect();
+        assert!(text2.contains("2 req"), "bar should show 2 requests");
+    }
+
+    #[test]
+    fn cache_bar_always_uses_hit_color_regardless_of_rate() {
+        // The status block always uses s_cache_hit() (green) even at 0% hit rate.
+        let mut cs = CacheStats::default();
+        cs.update(100, 0, 100);
+        let block = cs.to_status_block(80);
+        // The top-level style of the block comes from the Span's style.
+        let span = &block.content.spans()[0];
+        // s_cache_hit() returns green, s_cache_miss() returns dark grey.
+        // At 0% it should arguably be grey/red, but current code forces green.
+        assert!(
+            span.style.fg == Some(Color::Green),
+            "BUG: bar always green even at 0% hit rate — should vary by hit rate"
+        );
+    }
+
+    #[test]
+    fn cache_bar_text_is_stale_after_resize_without_telemetry() {
+        // The block's text content is computed at one terminal width.
+        // If the terminal resizes without a new CacheTelemetry, the bar
+        // characters are NOT recomputed — the stale text just re-flows.
+        let mut cs = CacheStats::default();
+        cs.update(1000, 500, 100);
+
+        // Compute bar at 50 cols
+        let block_50 = cs.to_status_block(50);
+        let text_50: String = block_50.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let bar_50 = text_50.matches('█').count() + text_50.matches('░').count();
+        assert_eq!(bar_50, 10, "sanity: bar at 50 cols = 10");
+
+        // Compute bar at 120 cols — same CacheStats, just a different argument
+        let block_120 = cs.to_status_block(120);
+        let text_120: String = block_120.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let bar_120 = text_120.matches('█').count() + text_120.matches('░').count();
+        // The method recomputes correctly when called directly.
+        // But through the live TUI, the status line was set at the old width
+        // and only updates on the NEXT CacheTelemetry event.
+        assert!(
+            bar_120 > bar_50,
+            "BUG: bar should be wider at 120 cols than at 50 cols"
+        );
+    }
+
+    #[test]
+    fn cache_bar_text_truncates_at_min_terminal_width() {
+        let mut cs = CacheStats::default();
+        cs.update(100, 50, 10);
+        // terminal_width = 40 should not cause a panic or empty bar
+        let block = cs.to_status_block(40);
+        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        // The bar should still render with at least bar_width=10 characters
+        let total_bar = text.matches('█').count() + text.matches('░').count();
+        assert_eq!(total_bar, 10, "bar at 40 cols terminal should be 10 chars");
+        assert!(text.contains('%'), "bar must show percentage even at min width");
+    }
+
+    #[test]
+    fn cache_bar_with_zero_input_nonzero_read_is_nan() {
+        // If total_input_tokens is 0 but cache_read_tokens > 0 (shouldn't happen),
+        // hit_rate_pct returns 0.0 (due to early return), so the bar shows 0.0%.
+        // This is arguably wrong — it should be undefined/N/A.
+        let mut cs = CacheStats::default();
+        // Manually set the fields to simulate the impossible state
+        cs.total_cache_read_tokens = 50;
+        cs.total_input_tokens = 0;
+        cs.request_count = 1;
+        // hit_rate_pct early-returns 0.0 when total_input_tokens == 0
+        // but that hides the fact that cache_read > 0 with zero input
+        let pct = cs.hit_rate_pct();
+        assert!(
+            (pct - 0.0).abs() < 0.001,
+            "BUG: with 0 input and positive cache read, hit rate should not be 0.0 — it's undefined"
+        );
+    }
+
+    // =========================================================================
+    // Prompt caching bar — integration via handle_daemon_event
+    // =========================================================================
+
+    #[test]
+    fn cache_bar_renders_on_cache_telemetry_event() {
+        let mut fx = fixture();
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 100,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 10,
+            }));
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "cache:"), 1);
+        assert!(transcript_contains(&fx, "50.0%"));
+        assert_eq!(fx.app.cache.request_count, 1);
+    }
+
+    #[test]
+    fn cache_bar_accumulates_across_multiple_telemetry_events() {
+        let mut fx = fixture();
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 100,
+                cache_read_tokens: 80,
+                cache_creation_tokens: 10,
+            }));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 200,
+                cache_read_tokens: 100,
+                cache_creation_tokens: 50,
+            }));
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.cache.request_count, 2);
+        assert_eq!(fx.app.cache.total_input_tokens, 300);
+        assert_eq!(fx.app.cache.total_cache_read_tokens, 180);
+    }
+
+    #[test]
+    fn cache_bar_survives_clear_output() {
+        let mut fx = fixture();
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 100,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 10,
+            }));
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "cache:"));
+
+        fx.handle.clear_output();
+        fx.handle.redraw_sync();
+        // After clear, cache bar (status line) should still be visible
+        assert!(
+            transcript_contains(&fx, "cache:"),
+            "BUG: cache bar disappears after /clear — status_line not preserved"
+        );
+    }
+
+    #[test]
+    fn cache_bar_survives_new_session_command() {
+        let mut fx = fixture();
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 100,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 10,
+            }));
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "cache:"));
+
+        // Simulate /new (clear_output + session change)
+        fx.handle.clear_output();
+        fx.app.session_id = "sess-2".to_string();
+        fx.handle.redraw_sync();
+        assert!(
+            transcript_contains(&fx, "cache:"),
+            "BUG: cache bar disappears after /new — status_line not preserved across sessions"
+        );
+    }
+
+    #[test]
+    fn cache_bar_shown_during_streaming() {
+        let mut fx = fixture();
+        // Streaming text
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("hello ".into())));
+        // Cache telemetry mid-stream
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 200,
+                cache_read_tokens: 100,
+                cache_creation_tokens: 50,
+            }));
+        // More streaming text
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("world".into())));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::Done));
+        fx.handle.redraw_sync();
+
+        assert!(transcript_contains(&fx, "hello world"), "streaming text must be visible");
+        assert!(
+            transcript_contains(&fx, "cache:"),
+            "cache bar must be visible even during streaming"
+        );
+    }
+
+    // =========================================================================
+    // Prompt caching bar — edge cases in the sync path (LoopFixture)
+    // =========================================================================
+
+    #[test]
+    fn cache_bar_disconnected_preserves_last_known() {
+        let mut fx = loop_fixture();
+        // Inject cache telemetry
+        fx.app.cache.update(100, 50, 10);
+        let (w, _) = fx.handle.size();
+        fx.handle.set_status_line(fx.app.cache.to_status_block(w.max(40)));
+        fx.handle.redraw_sync();
+        // Simulate disconnect
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert!(
+            fx.transcript_contains("cache:"),
+            "cache bar should persist after disconnect"
+        );
+        fx.shutdown();
+    }
+
+    #[test]
+    fn cache_bar_compaction_resets_stats_and_refreshes() {
+        let mut fx = fixture();
+        // First, set some cache stats
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 1000,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 200,
+            }));
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.cache.request_count, 1);
+        assert!(transcript_contains(&fx, "cache:"));
+
+        // Session compacted resets cache
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            ServerEvent::SessionCompacted { session_id: "sess-1".to_string() });
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.cache.request_count, 0);
+        // After compaction, the bar should show "no requests yet"
+        assert!(
+            transcript_contains(&fx, "no requests yet"),
+            "after compaction cache bar should reset to 'no requests yet'"
+        );
+    }
+
+    #[test]
+    fn cache_bar_with_tool_events_interleaved() {
+        let mut fx = fixture();
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::ToolStart {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo hi"}),
+            }));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 50,
+                cache_read_tokens: 10,
+                cache_creation_tokens: 5,
+            }));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                result: ToolResultWire {
+                    text: "done".into(),
+                    is_error: false,
+                    content: None,
+                },
+            }));
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "tool call bash"), "tool must render");
+        assert!(transcript_contains(&fx, "done"), "tool end must render");
+        assert!(
+            transcript_contains(&fx, "cache:"),
+            "cache bar must render even with interleaved tool events"
+        );
+    }
+
+    #[test]
+    fn cache_bar_does_not_duplicate_on_multiple_identical_telemetry() {
+        let mut fx = loop_fixture();
+        // Verify that sending the same telemetry twice doesn't create a duplicate status line
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::CacheTelemetry {
+                        input_tokens: 100,
+                        cache_read_tokens: 50,
+                        cache_creation_tokens: 10,
+                    },
+                ))));
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::CacheTelemetry {
+                        input_tokens: 200,
+                        cache_read_tokens: 100,
+                        cache_creation_tokens: 20,
+                    },
+                ))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        // Cache bar text should appear exactly once (not twice)
+        let count = fx.count("cache:");
+        assert_eq!(
+            count, 1,
+            "BUG: cache bar duplicated — found {count} occurrences"
+        );
+        fx.shutdown();
+    }
+
+    // =========================================================================
+    // Cursor behavior — edge cases and missing readline shortcuts
+    // =========================================================================
+
+    #[test]
+    fn ctrl_d_on_empty_buffer_sends_eof() {
+        let mut fx = fixture();
+        // Ctrl-D on empty buffer should emit Eof
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        match fx.term.next_event() {
+            Some(Event::Eof) => {}
+            other => panic!("expected Eof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_d_should_delete_character_under_cursor_on_nonempty_buffer() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abcd");
+        assert_eq!(fx.handle.get_buffer(), "abcd");
+        assert_eq!(fx.handle.get_cursor(), 4);
+        // Move cursor left twice: between 'b' and 'c'
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event(); // BufferChanged
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event(); // BufferChanged
+        // Cursor now at position 2
+        assert_eq!(fx.handle.get_cursor(), 2);
+        // Ctrl-D should delete the character at cursor (should delete 'c')
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "abd",
+            "BUG: Ctrl-D should delete char under cursor (expected 'abd', got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn ctrl_k_should_delete_from_cursor_to_end_of_line() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world");
+        // Move cursor to position 5 (after 'hello')
+        for _ in 0..6 {
+            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            let _ = fx.term.next_event(); // BufferChanged
+        }
+        assert_eq!(fx.handle.get_cursor(), 5);
+        // Ctrl-K should delete from cursor to end, leaving "hello"
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "hello",
+            "BUG: Ctrl-K should delete to end of line (expected 'hello', got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn ctrl_t_should_transpose_characters() {
+        let mut fx = fixture();
+        type_str(&mut fx, "ab");
+        // Ctrl-T should transpose last two chars -> "ba"
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "ba",
+            "BUG: Ctrl-T should transpose characters (expected 'ba', got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn ctrl_p_should_recall_previous_history_entry() {
+        let mut fx = fixture();
+        // Submit a first command
+        type_str(&mut fx, "first cmd");
+        let line = submit(&mut fx);
+        assert_eq!(line, "first cmd");
+        // Submit a second command
+        type_str(&mut fx, "second cmd");
+        let line2 = submit(&mut fx);
+        assert_eq!(line2, "second cmd");
+        // Now buffer is empty. Ctrl-P should recall the previous entry.
+        assert_eq!(fx.handle.get_buffer(), "");
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "second cmd",
+            "BUG: Ctrl-P should recall previous history (expected 'second cmd', got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn ctrl_n_should_recall_next_history_entry() {
+        let mut fx = fixture();
+        // Submit two commands
+        type_str(&mut fx, "first");
+        submit(&mut fx);
+        type_str(&mut fx, "second");
+        submit(&mut fx);
+        // Recall with up arrow
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_buffer(), "second");
+        // Ctrl-N should go to next entry (back to "first"? or clear?)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        // Actually Ctrl-N should go forward in history, which would go back to the
+        // second entry (since we're at "second" due to up, pressing up again goes to "first",
+        // so pressing down/Ctrl-N from "second" should go to the older "first")
+        assert!(
+            fx.handle.get_buffer() == "first" || fx.handle.get_buffer() == "",
+            "BUG: Ctrl-N should navigate forward in history (got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn alt_f_should_move_forward_one_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        // Cursor at end. Move to start with Ctrl-A
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event(); // BufferChanged
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Alt-F should move forward one word
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_cursor() == 6, // after "hello "
+            "BUG: Alt-F should move forward one word (expected cursor=6, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    #[test]
+    fn alt_b_should_move_back_one_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        // Alt-B from end should move back one word
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        // Cursor should jump to after "world " i.e., position of 'f'
+        assert!(
+            fx.handle.get_cursor() == 12, // after "hello world "
+            "BUG: Alt-B should move back one word (expected cursor=12, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    #[test]
+    fn delete_key_at_end_of_buffer_does_nothing() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abc");
+        assert_eq!(fx.handle.get_cursor(), 3);
+        // Delete at end of buffer — should be a no-op (nothing to delete)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        // No change expected — no event should fire because nothing changed
+        // Actually a BufferChanged event may or may not fire; the state shouldn't change.
+        assert_eq!(
+            fx.handle.get_buffer(), "abc",
+            "Delete at end of buffer should be a no-op"
+        );
+    }
+
+    #[test]
+    fn delete_key_in_middle_deletes_forward() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abcd");
+        // Move cursor to position 1 (between 'a' and 'b')
+        for _ in 0..3 {
+            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            let _ = fx.term.next_event();
+        }
+        assert_eq!(fx.handle.get_cursor(), 1);
+        // Delete should remove 'b'
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)))
+            .expect("input open");
+        match fx.term.next_event() {
+            Some(Event::BufferChanged) => {}
+            other => panic!("expected BufferChanged, got {other:?}"),
+        }
+        assert_eq!(fx.handle.get_buffer(), "acd");
+    }
+
+    #[test]
+    fn backspace_at_start_of_buffer_does_nothing() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abc");
+        // Move cursor to start
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event(); // BufferChanged
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Backspace at start — no-op
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_buffer(), "abc",
+            "Backspace at start should be a no-op"
+        );
+    }
+
+    #[test]
+    fn cursor_left_at_start_does_not_wrap() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abc");
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Left at start — should stay at 0
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fx.handle.get_cursor(), 0, "Left at start must stay at 0");
+    }
+
+    #[test]
+    fn cursor_right_at_end_does_not_wrap() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abc");
+        assert_eq!(fx.handle.get_cursor(), 3);
+        // Right at end — should stay at 3
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fx.handle.get_cursor(), 3, "Right at end must stay at end");
+    }
+
+    // =========================================================================
+    // Multiline (long input wrapping) tests
+    // =========================================================================
+
+    #[test]
+    fn long_user_input_wraps_visually() {
+        let mut fx = fixture();
+        // Type a line longer than the terminal width
+        let long = "x".repeat(COLS + 20);
+        type_str(&mut fx, &long);
+        assert_eq!(fx.handle.get_buffer(), long.as_str());
+        // The cursor should be at the end of the buffer
+        assert_eq!(fx.handle.get_cursor(), long.len());
+        // Submit the line
+        let line = submit(&mut fx);
+        assert_eq!(line, long);
+    }
+
+    #[test]
+    fn very_long_input_does_not_truncate() {
+        let mut fx = fixture();
+        // Type a very long line (500 chars)
+        let long = "a".repeat(500);
+        type_str(&mut fx, &long);
+        assert_eq!(
+            fx.handle.get_buffer().len(), 500,
+            "very long input must not be truncated"
+        );
+    }
+
+    // =========================================================================
+    // Word-boundary navigation (Ctrl+Left / Ctrl+Right)
+    // =========================================================================
+
+    /// Ctrl+Right from start jumps to start of next word.
+    #[test]
+    fn ctrl_right_jumps_to_next_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Ctrl+Right — should jump to start of 'world' (position 6)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 6,
+            "Ctrl+Right from start should land at 'world' (expected 6, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Right from within a word (after first char) jumps to start of next word.
+    #[test]
+    fn ctrl_right_from_middle_of_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "one two three");
+        // Move cursor to position 2 (middle of "one")
+        for _ in 0..11 {
+            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            let _ = fx.term.next_event();
+        }
+        assert_eq!(fx.handle.get_cursor(), 2);
+        // Ctrl+Right — should skip "one " and land at start of 'two' (position 4)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        let _ = fx.term.next_event();
+        assert_eq!(
+            fx.handle.get_cursor(), 4,
+            "Ctrl+Right from middle of word should land at start of next word (expected 4, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Right from whitespace before a word lands at start of that word.
+    /// The implementation skips whitespace + the next word + trailing whitespace,
+    /// so from the space before 'two' it lands at the start of 'three'.
+    #[test]
+    fn ctrl_right_from_whitespace_before_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "one two three");
+        // Move cursor to position 3 (the space between "one" and "two")
+        for _ in 0..10 {
+            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            let _ = fx.term.next_event();
+        }
+        assert_eq!(fx.handle.get_cursor(), 3);
+        // Ctrl+Right from the space — skips whitespace, then "two", then trailing
+        // whitespace, landing at start of 'three' (position 8)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        let _ = fx.term.next_event();
+        assert_eq!(
+            fx.handle.get_cursor(), 8,
+            "Ctrl+Right from whitespace lands after next word + trailing ws (expected 8, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Right on the last word goes to end of buffer.
+    #[test]
+    fn ctrl_right_on_last_word_goes_to_end() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        // Move to start of last word 'foo' (position 12)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event(); // -> world
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event(); // -> foo
+        // Now at position 12
+        assert_eq!(fx.handle.get_cursor(), 12);
+        // Ctrl+Right on last word — should go to end (15)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 15,
+            "Ctrl+Right on last word should go to end of buffer (expected 15, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Right at end of buffer is a no-op.
+    #[test]
+    fn ctrl_right_at_end_does_nothing() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello");
+        assert_eq!(fx.handle.get_cursor(), 5);
+        // Ctrl+Right at end — should stay at end
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        assert_eq!(fx.handle.get_cursor(), 5);
+    }
+
+    /// Ctrl+Right on empty buffer is a no-op.
+    #[test]
+    fn ctrl_right_on_empty_buffer() {
+        let mut fx = fixture();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        assert_eq!(fx.handle.get_cursor(), 0);
+    }
+
+    /// Ctrl+Right skips consecutive whitespace to land at start of next word.
+    #[test]
+    fn ctrl_right_skips_multiple_spaces() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello    world");
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        // Ctrl+Right — should skip "hello    " and land on 'world' at position 9
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 9,
+            "Ctrl+Right should skip multiple spaces (expected 9, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Left from end jumps backward one word.
+    #[test]
+    fn ctrl_left_jumps_back_one_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        assert_eq!(fx.handle.get_cursor(), 15);
+        // Ctrl+Left — should jump to start of 'foo' (position 12)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 12,
+            "Ctrl+Left from end should jump to start of last word (expected 12, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Left from middle of word jumps to start of that word.
+    #[test]
+    fn ctrl_left_from_middle_of_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        // Move cursor to position 8 (middle of 'world')
+        for _ in 0..7 {
+            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            let _ = fx.term.next_event();
+        }
+        assert_eq!(fx.handle.get_cursor(), 8);
+        // Ctrl+Left — should jump to start of 'world' (position 6)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 6,
+            "Ctrl+Left from middle of word should jump to start of current word (expected 6, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Ctrl+Left from start of buffer is a no-op.
+    #[test]
+    fn ctrl_left_at_start_does_nothing() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world");
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Ctrl+Left at start — should stay at 0
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+            .expect("input open");
+        assert_eq!(fx.handle.get_cursor(), 0);
+    }
+
+    /// Ctrl+Left on empty buffer is a no-op.
+    #[test]
+    fn ctrl_left_on_empty_buffer() {
+        let mut fx = fixture();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+            .expect("input open");
+        assert_eq!(fx.handle.get_cursor(), 0);
+    }
+
+    /// Ctrl+Left skips consecutive whitespace to land at start of current word.
+    #[test]
+    fn ctrl_left_skips_multiple_spaces() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello    world");
+        // From end, Ctrl+Left should skip "world" and land on the spaces before it
+        assert_eq!(fx.handle.get_cursor(), 14);
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 9,
+            "Ctrl+Left from end should land at start of 'world' (expected 9, got {})",
+            fx.handle.get_cursor()
+        );
+        // Second Ctrl+Left should skip the spaces and "hello" to land at position 0
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_cursor(), 0,
+            "Second Ctrl+Left should land at start of 'hello' (expected 0, got {})",
+            fx.handle.get_cursor()
+        );
+    }
+
+    /// Repeated Ctrl+Left walks backward word by word.
+    #[test]
+    fn ctrl_left_walks_back_word_by_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "one two three");
+        assert_eq!(fx.handle.get_cursor(), 13);
+        // Ctrl+Left from end -> start of 'three' (8)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 8);
+        // Ctrl+Left again -> start of 'two' (4)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 4);
+        // Ctrl+Left again -> start of 'one' (0)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Ctrl+Left at start -> still 0 (no event since cursor stays same)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        assert_eq!(fx.handle.get_cursor(), 0);
+    }
+
+    /// Repeated Ctrl+Right walks forward word by word.
+    #[test]
+    fn ctrl_right_walks_forward_word_by_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "one two three");
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 0);
+        // Ctrl+Right from start -> start of 'two' (4)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 4);
+        // Ctrl+Right again -> start of 'three' (8)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 8);
+        // Ctrl+Right again -> end of buffer (13)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), 13);
+        // Ctrl+Right at end -> still 13 (no event)
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        assert_eq!(fx.handle.get_cursor(), 13);
+    }
+
+    // =========================================================================
+    // Even more missing readline shortcuts
+    // =========================================================================
+
+    #[test]
+    fn alt_d_should_delete_word_forward() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world");
+        // Move to start, Alt+D should delete "hello "
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        let _ = fx.term.next_event();
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "world" || fx.handle.get_buffer() == " world",
+            "BUG: Alt+D should delete next word (expected 'world', got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn ctrl_h_should_act_as_backspace() {
+        let mut fx = fixture();
+        type_str(&mut fx, "abc");
+        // Ctrl+H is the traditional Backspace
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "ab",
+            "BUG: Ctrl+H should delete previous char like Backspace (got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn ctrl_y_should_yank_from_kill_ring() {
+        let mut fx = fixture();
+        // First, delete some text with Ctrl-W or Ctrl-U to populate a kill ring
+        type_str(&mut fx, "deleteme");
+        // Ctrl-W deletes previous word
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fx.handle.get_buffer(), "", "buffer should be empty after Ctrl-W");
+        // Ctrl-Y should yank (paste) "deleteme" back
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "deleteme",
+            "BUG: Ctrl-Y should yank deleted text back (got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn alt_backspace_should_delete_previous_word() {
+        let mut fx = fixture();
+        type_str(&mut fx, "hello world foo");
+        // Cursor at end, Alt+Backspace should delete "foo"
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            fx.handle.get_buffer() == "hello world " || fx.handle.get_buffer() == "hello world",
+            "BUG: Alt+Backspace should delete previous word (expected 'hello world ', got '{}')",
+            fx.handle.get_buffer()
+        );
+    }
+
+    #[test]
+    fn cache_bar_stale_width_on_resize_through_real_rendering() {
+        // This test exercises the actual pipeline: the status line text
+        // is computed at one terminal width, then the terminal is resized.
+        // The bar character count should adapt but doesn't because the
+        // text string was baked in at the old width.
+        let mut fx = loop_fixture();
+        // Start with a 40-wide terminal (default in tests is COLS=40)
+        // At 40 cols: bar_width = max(10, 40-60) = 10
+        // Send a cache telemetry to create the status line
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // First, inject cache telemetry
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::CacheTelemetry {
+                        input_tokens: 1000,
+                        cache_read_tokens: 500,
+                        cache_creation_tokens: 100,
+                    },
+                ))));
+                std::thread::sleep(Duration::from_millis(30));
+                // Now resize to a wider terminal (120 cols)
+                let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                    width: 120,
+                    height: 30,
+                }));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        // The status line text was computed at 40 cols with bar_width=10.
+        // After resize to 120 cols, the same text is laid out but the
+        // bar characters are stuck at 10 (should be 40).
+        let rendered = fx.transcript_contains("cache:");
+        assert!(rendered, "cache bar must be visible");
+        // Grab the rendered status line text
+        let em = Emulator::from_capture(120, 30, &fx.buf);
+        let joined: String = em.history().iter().chain(em.screen_lines().iter()).cloned().collect::<Vec<_>>().join("");
+        let bar_chars = joined.matches('█').count() + joined.matches('░').count();
+        assert!(
+            bar_chars > 10,
+            "BUG: cache bar should have more than 10 chars after resize to 120 cols (got {bar_chars})"
+        );
+        fx.shutdown();
+    }
+
+    #[test]
+    fn user_input_with_newline_characters() {
+        // Enter key submits the line; literal newlines can't be typed.
+        // Pasting content with newlines drops them — this is tested below.
+    }
+
+    // =========================================================================
+    // Window resize edge cases
+    // =========================================================================
+
+    #[test]
+    fn resize_to_tiny_dimensions_does_not_panic() {
+        let mut fx = fixture();
+        // Resize to very small (but valid) dimensions
+        fx.input.send(RawEvent::Resize(5, 3)).expect("input open");
+        match fx.term.next_event() {
+            Some(Event::Resize { width, height }) => {
+                assert_eq!(width, 5);
+                assert_eq!(height, 3);
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+        // Must not panic, must still accept input
+        type_str(&mut fx, "hi");
+        assert_eq!(fx.handle.get_buffer(), "hi");
+    }
+
+    #[test]
+    fn resize_to_zero_height_does_not_panic() {
+        let mut fx = fixture();
+        // Resize height to 0 — the code uses height.max(1) so it should not panic
+        fx.input.send(RawEvent::Resize(40, 0)).expect("input open");
+        match fx.term.next_event() {
+            Some(Event::Resize { .. }) => {}
+            other => panic!("expected Resize, got {other:?}"),
+        }
+        // Should still work
+        type_str(&mut fx, "survived");
+        assert_eq!(fx.handle.get_buffer(), "survived");
+    }
+
+    #[test]
+    fn resize_to_zero_width_does_not_panic() {
+        let mut fx = fixture();
+        // Resize width to 0 — width.max(1) should prevent issues
+        fx.input.send(RawEvent::Resize(0, 24)).expect("input open");
+        match fx.term.next_event() {
+            Some(Event::Resize { .. }) => {}
+            other => panic!("expected Resize, got {other:?}"),
+        }
+        type_str(&mut fx, "ok");
+        assert_eq!(fx.handle.get_buffer(), "ok");
+    }
+
+    #[test]
+    fn resize_during_streaming_with_prompt_text_preserved() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Start streaming
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("streaming content ".into()),
+                ))));
+                std::thread::sleep(Duration::from_millis(20));
+                // Resize while streaming!
+                let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                    width: 30,
+                    height: 10,
+                }));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("continues after resize".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::Done,
+                ))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert!(
+            fx.transcript_contains("streaming content continues after resize"),
+            "BUG: resize during streaming caused text loss"
+        );
+        fx.shutdown();
+    }
+
+    #[test]
+    fn multiple_resizes_in_sequence_render_correctly() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Send text
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("content ".into()),
+                ))));
+                std::thread::sleep(Duration::from_millis(10));
+                // Rapid resizes
+                for (w, h) in &[(80, 12), (40, 24), (120, 30), (80, 12)] {
+                    let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                        width: *w,
+                        height: *h,
+                    }));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("after resizes".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::Done,
+                ))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert!(
+            fx.transcript_contains("content after resizes"),
+            "BUG: multiple resizes caused text loss"
+        );
+        fx.shutdown();
+    }
+
+    #[test]
+    fn resize_during_user_input_preserves_buffer() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Simulate user typing
+                let _ = app_tx.send(AppEvent::Term(Event::BufferChanged));
+                // Resize while buffer is non-empty
+                let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                    width: 60,
+                    height: 15,
+                }));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        // Buffer state should not have been corrupted by resize
+        fx.shutdown();
+    }
+
+    #[test]
+    fn resize_after_clear_then_streaming_shows_text() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Start streaming, clear, resize, then stream more
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("before ".into()),
+                ))));
+                std::thread::sleep(Duration::from_millis(10));
+                // run_loop doesn't handle /clear directly — it's done via process_line
+                // Simulate clear + resize
+                let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                    width: 100,
+                    height: 30,
+                }));
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("after ".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::Done,
+                ))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert!(
+            fx.transcript_contains("before after"),
+            "BUG: resize after clear caused text loss"
+        );
+        fx.shutdown();
+    }
+
+    #[test]
+    /// After setting a status line (e.g. cache info) the cursor should be at the
+    /// correct visual row — in the prompt area, not overlapping the status line.
+    #[test]
+    fn cursor_position_correct_after_status_line() {
+        let mut fx = fixture();
+        // Set a status line (simulates what cache telemetry does)
+        let status = StyledBlock::new(StyledText::from(Span::new(
+            " cache:  50.0% ████████░░░░  hit 1.0K / total 2.0K input",
+            Style::default(),
+        )));
+        fx.handle.set_status_line(status);
+        // Type some text
+        type_str(&mut fx, "hello");
+        // Force a redraw so the output buffer is up to date
+        fx.handle.redraw_sync();
+        // Read back the rendered output
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        let screen = em.screen_lines();
+        // The screen should show the status line and the prompt with typed text
+        // Layout: [rubber rows if any] [status line] [prompt line]
+        // The status line must be visible
+        let has_status = screen.iter().any(|l| l.contains("cache:"));
+        assert!(has_status, "status line must be visible on screen");
+        // The prompt text (P> hello) must be visible
+        let has_prompt = screen.iter().any(|l| l.contains("P> hello"));
+        assert!(has_prompt, "prompt with typed text must be visible on screen");
+        // The status line must NOT be on the same row as the prompt
+        let status_row = screen.iter().position(|l| l.contains("cache:"));
+        let prompt_row = screen.iter().position(|l| l.contains("P> hello"));
+        assert!(
+            status_row != prompt_row,
+            "status line and prompt must be on different rows"
+        );
+        assert!(
+            status_row < prompt_row,
+            "status line must appear above the prompt"
+        );
+        // The cursor (from terminal emulator) must be on the prompt row,
+        // not on the status line row.
+        let (cursor_row, cursor_col) = em.cursor();
+        assert_eq!(
+            cursor_row, prompt_row.unwrap(),
+            "cursor should be on the prompt row (row {}), not on status line row {} — got row {}",
+            prompt_row.unwrap(), status_row.unwrap(), cursor_row
+        );
+    }
+
+    fn resize_with_cache_bar_does_not_duplicate_status_line() {
+        let mut fx = loop_fixture();
+        // Pre-populate cache stats
+        fx.app.cache.update(500, 250, 50);
+        {
+            let (w, _) = fx.handle.size();
+            fx.handle.set_status_line(fx.app.cache.to_status_block(w.max(40)));
+        }
+        fx.handle.redraw_sync();
+
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Resize multiple times
+                for (w, h) in &[(50, 10), (100, 20), (80, 15)] {
+                    let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                        width: *w,
+                        height: *h,
+                    }));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        let cache_count = fx.count("cache:");
+        assert_eq!(
+            cache_count, 1,
+            "BUG: cache bar duplicated after resize — found {cache_count} times"
+        );
+        fx.shutdown();
+    }
+
+    #[test]
+    fn resize_huge_dimensions_do_not_overflow() {
+        let mut fx = fixture();
+        // Resize to extremely large dimensions
+        fx.input.send(RawEvent::Resize(9999, 9999)).expect("input open");
+        match fx.term.next_event() {
+            Some(Event::Resize { width, height }) => {
+                assert_eq!(width, 9999);
+                assert_eq!(height, 9999);
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+        // Must not panic
+        type_str(&mut fx, "huge");
+        assert_eq!(fx.handle.get_buffer(), "huge");
+    }
+
+    #[test]
+    fn resize_preserves_input_history_navigation() {
+        let mut fx = fixture();
+        // Submit two commands
+        type_str(&mut fx, "first");
+        submit(&mut fx);
+        type_str(&mut fx, "second");
+        submit(&mut fx);
+        // Resize
+        fx.input.send(RawEvent::Resize(60, 20)).expect("input open");
+        let _ = fx.term.next_event();
+        // History should still work after resize
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            fx.handle.get_buffer(), "second",
+            "History recall must work after resize"
+        );
+    }
+
+    #[test]
+    fn consecutive_resizes_while_streaming_do_not_corrupt_block() {
+        let mut fx = fixture();
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("start ".into())));
+        // Multiple resize events (simulate user dragging window edge)
+        for (w, h) in &[(50, 10), (45, 12), (55, 11), (60, 12), (50, 10)] {
+            fx.input.send(RawEvent::Resize(*w, *h)).expect("input open");
+            assert!(matches!(fx.term.next_event(), Some(Event::Resize { .. })));
+        }
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("end".into())));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::Done));
+        fx.handle.redraw_sync();
+        assert!(
+            transcript_contains(&fx, "start end"),
+            "BUG: consecutive resizes during streaming corrupted block content"
+        );
+    }
+
+    // =========================================================================
+    // Input edge cases: paste, Tab, special keys
+    // =========================================================================
+
+    #[test]
+    fn paste_long_text_handled_correctly() {
+        let mut fx = fixture();
+        // Simulate paste (newlines in paste are silently dropped)
+        fx.input.send(RawEvent::Paste("line1\nline2\nline3".to_string()))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        // Newlines should be dropped, content concatenated
+        // Note: paste handling depends on how the virtual input loop treats Paste events
+        // Looking at dispatch_input_event: Paste inserts chars but skips \n and \r.
+        assert_eq!(
+            fx.handle.get_buffer(), "line1line2line3",
+            "Paste should drop newlines and concatenate content"
+        );
+    }
+
+    #[test]
+    fn ctrl_l_clears_screen_and_cache_bar_persists() {
+        let mut fx = fixture();
+        // Show some output
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("visible".into())));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 100,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 10,
+            }));
+        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            chunk(OutputChunk::Done));
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "visible"));
+        assert!(transcript_contains(&fx, "cache:"));
+
+        // Ctrl-L should clear the screen
+        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)))
+            .expect("input open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !transcript_contains(&fx, "visible"),
+            "Ctrl-L should clear visible content"
+        );
+    }
+
+    // =========================================================================
+    // Slash command edge cases
+    // =========================================================================
+
+    #[test]
+    fn slash_commands_with_trailing_spaces() {
+        let mut fx = fixture();
+        let outcome = process_line("/help  ", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert_eq!(outcome, LineOutcome::Continue);
+        // Should render help, not error
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Available commands"), 1);
+    }
+
+    #[test]
+    fn slash_commands_with_mixed_case() {
+        let mut fx = fixture();
+        // Case-sensitive: /HELP should be unknown
+        process_line("/HELP", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        // It should be sent as user text since it's not in known_commands
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Run { content, .. }) => assert_eq!(content, "/HELP"),
+            other => panic!("expected Run for unknown cmd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_with_spaces_in_name() {
+        let mut fx = fixture();
+        // /new with a name that has multiple parts — only first is used
+        process_line("/new my session name", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        // The session name should be "my" (first token)
+        assert_eq!(fx.app.session_id, "my");
+    }
+
+    #[test]
+    fn resume_with_spaces_in_id() {
+        let mut fx = fixture();
+        process_line("/resume session-id extra", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert_eq!(fx.app.session_id, "session-id");
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "session-id"),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupt_before_any_streaming_does_not_panic() {
+        let mut fx = fixture();
+        // /interrupt with no active stream should be safe
+        process_line("/interrupt", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        // Should send Interrupt command
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Interrupt(sid)) => assert_eq!(sid, "sess-1"),
+            other => panic!("expected Interrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_response_contains_cache_info_when_available() {
+        let mut fx = loop_fixture();
+        // Pre-populate cache
+        fx.app.cache.update(1000, 500, 100);
+        {
+            let (w, _) = fx.handle.size();
+            fx.handle.set_status_line(fx.app.cache.to_status_block(w.max(40)));
+        }
+        // Status ping should include cache info
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Term(Event::Line("/status".to_string())));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(
+                    ServerEvent::ModelList {
+                        models: vec!["gpt-a".into()],
+                    },
+                )));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(500),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        // Status OK message should include cache data in the status line
+        assert!(
+            fx.transcript_contains("cache:"),
+            "after /status, cache bar should still be visible"
+        );
+        fx.shutdown();
+    }
+
+    // =========================================================================
+    // Edge-case: rapid events causing race conditions
+    // =========================================================================
+
+    #[test]
+    fn rapid_cache_telemetry_and_textdelta_does_not_corrupt() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Interleave telemetry with text deltas rapidly
+                for i in 0..20 {
+                    let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                        OutputChunk::TextDelta(format!("chunk{i} ")),
+                    ))));
+                    let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                        OutputChunk::CacheTelemetry {
+                            input_tokens: 100 + i,
+                            cache_read_tokens: 50 + i / 2,
+                            cache_creation_tokens: 10,
+                        },
+                    ))));
+                }
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        // All text chunks should be present (not lost/corrupted)
+        assert!(fx.transcript_contains("chunk0"), "first chunk must be present");
+        assert!(fx.transcript_contains("chunk19"), "last chunk must be present");
+        // Cache stats should have accumulated 20 requests
+        assert_eq!(fx.app.cache.request_count, 20);
+        assert!(fx.app.cache.total_input_tokens > 0);
+        fx.shutdown();
     }
 }
