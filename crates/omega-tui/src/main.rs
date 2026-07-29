@@ -17,6 +17,8 @@ use omega_loop_client::{
 };
 use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
 
+mod markdown;
+
 // ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
@@ -52,6 +54,15 @@ fn s_cache_miss() -> Style {
     sty(Color::DarkGrey)
 }
 
+
+/// Render `text` as markdown into a [`StyledBlock`], using the current
+/// terminal width (obtained from the handle) for line wrapping.
+fn render_md_block(handle: &TermHandle, text: &str) -> StyledBlock {
+    let (w, _) = handle.size();
+    let width = w.max(40); // never go below 40 columns
+    let styled = markdown::render_markdown(text, width);
+    StyledBlock::new(styled)
+}
 
 // ---------------------------------------------------------------------------
 // Slash commands
@@ -317,8 +328,8 @@ fn handle_daemon_event(
                 // ignored — the block must first be created via TextDelta.
                 if let Some(id) = streaming.block_id.take() {
                     streaming.buf.clear();
-                    let block =
-                        StyledBlock::new(StyledText::from(Span::new(s, s_assistant())));
+                    // Render the complete text as markdown.
+                    let block = render_md_block(handle, &s);
                     handle.set_block(id, block);
                     handle.redraw();
                     streaming.finalized = true;
@@ -405,8 +416,8 @@ fn handle_daemon_event(
                 if let Some(id) = streaming.block_id.take() {
                     let buf = std::mem::take(&mut streaming.buf);
                     if !buf.is_empty() {
-                        let block =
-                            StyledBlock::new(StyledText::from(Span::new(buf, s_assistant())));
+                        // Render accumulated streaming text as markdown.
+                        let block = render_md_block(handle, &buf);
                         handle.set_block(id, block);
                         handle.redraw();
                     }
