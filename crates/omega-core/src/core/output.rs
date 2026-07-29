@@ -150,6 +150,36 @@ pub enum OutputChunk {
 
     /// Agent completed this turn
     Done,
+
+    // --- Prompt Caching Telemetry ---
+    /// Prompt caching statistics for the most recent LLM call
+    CacheTelemetry(CacheTelemetry),
+}
+
+/// Prompt caching statistics for a single LLM request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheTelemetry {
+    /// Total input tokens sent in this request
+    pub input_tokens: u32,
+    /// Tokens read from cache in this request (cache hit)
+    pub cache_read_tokens: u32,
+    /// Tokens written to cache in this request (cache creation)
+    pub cache_creation_tokens: u32,
+}
+
+impl CacheTelemetry {
+    /// Compute the cache hit rate (0.0 – 100.0) for this request
+    pub fn hit_rate_pct(&self) -> f64 {
+        if self.input_tokens == 0 {
+            return 0.0;
+        }
+        (self.cache_read_tokens as f64 / self.input_tokens as f64) * 100.0
+    }
+
+    /// Check whether any caching happened in this request
+    pub fn has_caching(&self) -> bool {
+        self.cache_read_tokens > 0 || self.cache_creation_tokens > 0
+    }
 }
 
 /// Content type for tool results

@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use omega_core::core::{
-    output::UserQuestion, AgentContext, AgentState, FrameworkError, FrameworkResult, InputMessage,
-    OutputChunk,
+    output::UserQuestion, AgentContext, AgentState, CacheTelemetry, FrameworkError, FrameworkResult,
+    InputMessage, OutputChunk,
 };
 use crate::runtime::channels::{InputReceiver, OutputSender};
 use crate::session::AgentSession;
@@ -140,6 +140,11 @@ impl AgentInternals {
     /// Send an error message
     pub fn send_error(&self, text: impl Into<String>) {
         self.send(OutputChunk::Error(text.into()));
+    }
+
+    /// Send a cache telemetry update
+    pub fn send_cache_telemetry(&self, telemetry: CacheTelemetry) {
+        self.send(OutputChunk::CacheTelemetry(telemetry));
     }
 
     /// Send Done signal

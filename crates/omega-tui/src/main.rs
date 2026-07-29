@@ -45,6 +45,13 @@ fn s_thinking() -> Style {
 fn s_highlight() -> Style {
     sty(Color::Green).bold()
 }
+fn s_cache_hit() -> Style {
+    sty(Color::Green)
+}
+fn s_cache_miss() -> Style {
+    sty(Color::DarkGrey)
+}
+
 
 // ---------------------------------------------------------------------------
 // Slash commands
@@ -275,6 +282,11 @@ fn handle_daemon_event(
     streaming: &mut Streaming,
     event: ServerEvent,
 ) {
+    // Helper to refresh the cache status line after any change.
+    let refresh_cache_status = |handle: &TermHandle, app: &AppState| {
+        let (w, _) = handle.size();
+        handle.set_status_line(app.cache.to_status_block(w.max(40)));
+    };
     match event {
         ServerEvent::Chunk { chunk, .. } => match chunk {
             OutputChunk::TextDelta(s) => {
@@ -401,6 +413,14 @@ fn handle_daemon_event(
                 }
                 streaming.reset();
             }
+            OutputChunk::CacheTelemetry {
+                input_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            } => {
+                app.cache.update(input_tokens, cache_read_tokens, cache_creation_tokens);
+                refresh_cache_status(handle, app);
+            }
             OutputChunk::Unknown => {}
         },
         ServerEvent::Created {
@@ -411,6 +431,7 @@ fn handle_daemon_event(
                 format!("Session ready: {session_name} ({session_id})"),
                 s_system(),
             ))));
+            refresh_cache_status(handle, app);
         }
         ServerEvent::SessionList { sessions } => {
             if sessions.is_empty() {
@@ -435,6 +456,7 @@ fn handle_daemon_event(
                 format!("Resumed: {session_name} ({session_id})"),
                 s_system(),
             ))));
+            refresh_cache_status(handle, app);
         }
         ServerEvent::ModelChanged { model } => {
             app.model = model.clone();
@@ -448,6 +470,9 @@ fn handle_daemon_event(
                 "Session compacted.",
                 s_system(),
             ))));
+            // Reset cache stats when session is compacted
+            app.cache = CacheStats::default();
+            refresh_cache_status(handle, app);
         }
         ServerEvent::ModelList { models } => {
             if models.is_empty() {
@@ -483,9 +508,64 @@ fn handle_daemon_event(
 // App state
 // ---------------------------------------------------------------------------
 
+/// Accumulated prompt-cache telemetry across the session.
+#[derive(Debug, Default, Clone, Copy)]
+struct CacheStats {
+    total_input_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    request_count: u64,
+}
+
+impl CacheStats {
+    fn update(&mut self, input: u32, read: u32, created: u32) {
+        self.total_input_tokens += input as u64;
+        self.total_cache_read_tokens += read as u64;
+        self.total_cache_creation_tokens += created as u64;
+        self.request_count += 1;
+    }
+
+    fn hit_rate_pct(&self) -> f64 {
+        if self.total_input_tokens == 0 {
+            return 0.0;
+        }
+        (self.total_cache_read_tokens as f64 / self.total_input_tokens as f64) * 100.0
+    }
+
+    /// Render a compact one-line status summary.
+    fn to_status_block(&self, terminal_width: usize) -> StyledBlock {
+        if self.request_count == 0 {
+            return StyledBlock::new(StyledText::from(Span::new(
+                " cache: — (no requests yet)",
+                s_cache_miss(),
+            )));
+        }
+        let pct = self.hit_rate_pct();
+        let bar_width = (terminal_width.saturating_sub(60)).max(10).min(40);
+        let fill = ((pct / 100.0) * bar_width as f64).round() as usize;
+        let empty = bar_width.saturating_sub(fill);
+        let bar: String = format!(
+            "{}{}",
+            "█".repeat(fill),
+            "░".repeat(empty),
+        );
+
+        let total_k = self.total_input_tokens as f64 / 1000.0;
+        let cached_k = self.total_cache_read_tokens as f64 / 1000.0;
+        let created_k = self.total_cache_creation_tokens as f64 / 1000.0;
+        let reqs = self.request_count;
+
+        let text = format!(
+            " cache: {pct:>5.1}% {bar}  hit {cached_k:.1}K / total {total_k:.1}K input  (created {created_k:.1}K · {reqs} req)"
+        );
+        StyledBlock::new(StyledText::from(Span::new(text, s_cache_hit())))
+    }
+}
+
 struct AppState {
     session_id: String,
     model: String,
+    cache: CacheStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +939,11 @@ fn main() -> Result<()> {
         })
         .ok();
 
-    let mut app = AppState { session_id, model };
+    let mut app = AppState {
+        session_id,
+        model,
+        cache: CacheStats::default(),
+    };
 
     // ── Create terminal ────────────────────────────────────────────────
     let prompt = StyledText::from(Span::new("▸ ", Style::default().fg(Color::DarkYellow)));
@@ -945,6 +1029,7 @@ mod tests {
             app: AppState {
                 session_id: "sess-1".to_string(),
                 model: "gpt-a".to_string(),
+                cache: CacheStats::default(),
             },
             streaming: Streaming {
                 block_id: None,
@@ -1300,6 +1385,7 @@ mod tests {
             app: AppState {
                 session_id: "sess-1".to_string(),
                 model: "gpt-a".to_string(),
+                cache: CacheStats::default(),
             },
             app_tx,
             app_rx,

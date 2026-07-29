@@ -194,249 +194,236 @@ fn convert_result(tr: OmegaToolResult) -> ToolResult {
 // ---------------------------------------------------------------------------
 
 /// Proxy tool implementations that delegate to the omega-sh daemon.
+// ---------------------------------------------------------------------------
+// Generic proxy tool  –  forwards execution to omega-sh
+// ---------------------------------------------------------------------------
+
 pub mod proxy {
     use async_trait::async_trait;
     use serde_json::Value;
+    use std::ops::Deref;
+    use std::sync::LazyLock;
 
     use super::OmegaClient;
     use omega_core::core::{ToolInfo, ToolResult, ToolRuntime};
+    use omega_tool_defs::ToolDef;
     use omega_tools::Tool;
-    use omega_llm::{types::CustomTool, ToolDefinition};
 
-    macro_rules! proxy_tool {
-        ($name:ident, $tool_name:expr, $description:expr, $schema_json:expr) => {
-            pub struct $name {
-                client: OmegaClient,
-            }
-
-            impl $name {
-                pub fn new(client: OmegaClient) -> Self {
-                    Self { client }
-                }
-            }
-
-            #[async_trait]
-            impl Tool for $name {
-                fn name(&self) -> &str {
-                    $tool_name
-                }
-
-                fn description(&self) -> &str {
-                    $description
-                }
-
-                fn definition(&self) -> ToolDefinition {
-                    ToolDefinition::Custom(CustomTool {
-                        name: $tool_name.to_string(),
-                        description: Some($description.to_string()),
-                        input_schema: serde_json::from_value($schema_json)
-                            .expect(concat!("invalid ToolInputSchema JSON for ", $tool_name)),
-                        tool_type: None,
-                        cache_control: None,
-                    })
-                }
-
-                fn get_info(&self, _input: &Value) -> ToolInfo {
-                    ToolInfo {
-                        name: $tool_name.to_string(),
-                        action_description: String::new(),
-                        details: None,
-                    }
-                }
-
-                async fn execute(
-                    &self,
-                    input: &Value,
-                    _rt: &mut dyn ToolRuntime,
-                ) -> anyhow::Result<ToolResult> {
-                    match self.client.execute($tool_name, input.clone()).await {
-                        Ok(r) => Ok(r),
-                        Err(e) => Ok(ToolResult::error(e)),
-                    }
-                }
-            }
-        };
+    /// A tool whose execution is forwarded to a running `omega-sh` daemon.
+    ///
+    /// One instance handles any proxy-able tool — the name, description,
+    /// and schema come from the canonical `ToolDef` in `omega-tool-defs`.
+    pub struct ProxyTool {
+        client: OmegaClient,
+        def: &'static LazyLock<ToolDef>,
     }
 
-    proxy_tool!(
-        ReadProxy,
-        "Read",
-        "Read a file from the local filesystem. Supports text files, images (PNG, JPEG, GIF, WebP), and PDFs.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute path to the file to read"
-                },
-                "offset": {
-                    "type": "number",
-                    "description": "The line number to start reading from (1-indexed)"
-                },
-                "limit": {
-                    "type": "number",
-                    "description": "The number of lines to read"
-                }
-            },
-            "required": ["file_path"]
-        })
-    );
+    impl ProxyTool {
+        pub fn new(client: OmegaClient, def: &'static LazyLock<ToolDef>) -> Self {
+            Self { client, def }
+        }
+    }
 
-    proxy_tool!(
-        WriteProxy,
-        "Write",
-        "Write content to a file on the local filesystem.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute path to the file to write (must be absolute, not relative)"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write to the file"
-                }
-            },
-            "required": ["file_path", "content"]
-        })
-    );
+    #[async_trait]
+    impl Tool for ProxyTool {
+        fn name(&self) -> &str {
+            self.def.name
+        }
 
-    proxy_tool!(
-        EditProxy,
-        "Edit",
-        "Perform exact string replacements in files.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute path to the file to modify"
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "The text to replace"
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The text to replace it with (must be different from old_string)"
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Replace all occurrences of old_string (default false)"
-                }
-            },
-            "required": ["file_path", "old_string", "new_string"]
-        })
-    );
+        fn description(&self) -> &str {
+            self.def.description
+        }
 
-    proxy_tool!(
-        BashProxy,
-        "Bash",
-        "Execute a bash command in the shell. Use for terminal operations like git, npm, docker, etc.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The command to execute"
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Optional timeout in milliseconds (max 600000). Default is 120000ms (2 minutes)."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Clear, concise description of what this command does in 5-10 words, in active voice."
-                }
-            },
-            "required": ["command"]
-        })
-    );
+        fn definition(&self) -> omega_llm::ToolDefinition {
+            let def: &ToolDef = self.def.deref();
+            omega_tools::def_to_tool_definition(def)
+        }
 
-    proxy_tool!(
-        GlobProxy,
-        "Glob",
-        "Fast file pattern matching tool. Supports glob patterns like **/*.js or src/**/*.ts.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The glob pattern to match files against"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "The directory to search in. If not specified, uses the daemon's current working directory."
-                }
-            },
-            "required": ["pattern"]
-        })
-    );
+        fn get_info(&self, _input: &Value) -> ToolInfo {
+            ToolInfo {
+                name: self.def.name.to_string(),
+                action_description: String::new(),
+                details: None,
+            }
+        }
 
-    proxy_tool!(
-        GrepProxy,
-        "Grep",
-        "Search file contents using regex patterns. Uses ripgrep for fast searching.",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The regular expression pattern to search for in file contents"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File or directory to search in. Defaults to daemon's working directory."
-                },
-                "glob": {
-                    "type": "string",
-                    "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\")"
-                },
-                "output_mode": {
-                    "type": "string",
-                    "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode: 'content', 'files_with_matches' (default), or 'count'"
-                },
-                "-B": {
-                    "type": "number",
-                    "description": "Number of lines to show before each match"
-                },
-                "-A": {
-                    "type": "number",
-                    "description": "Number of lines to show after each match"
-                },
-                "-C": {
-                    "type": "number",
-                    "description": "Number of lines to show before and after each match"
-                },
-                "-n": {
-                    "type": "boolean",
-                    "description": "Show line numbers in output. Defaults to true."
-                },
-                "-i": {
-                    "type": "boolean",
-                    "description": "Case insensitive search"
-                },
-                "type": {
-                    "type": "string",
-                    "description": "File type to search (e.g. 'js', 'py', 'rust')"
-                },
-                "head_limit": {
-                    "type": "number",
-                    "description": "Limit output to first N lines/entries"
-                },
-                "offset": {
-                    "type": "number",
-                    "description": "Skip first N lines/entries"
-                },
-                "multiline": {
-                    "type": "boolean",
-                    "description": "Enable multiline mode where . matches newlines"
-                }
-            },
-            "required": ["pattern"]
-        })
-    );
+        async fn execute(
+            &self,
+            input: &Value,
+            _rt: &mut dyn ToolRuntime,
+        ) -> anyhow::Result<ToolResult> {
+            match self.client.execute(self.def.name, input.clone()).await {
+                Ok(r) => Ok(r),
+                Err(e) => Ok(ToolResult::error(e)),
+            }
+        }
+    }
+}
+
+use omega_tools::ToolRegistry;
+
+/// Register all proxy tools that delegate to an omega-sh daemon.
+///
+/// Iterates `omega_tool_defs::ALL` and registers every tool marked
+/// `ToolKind::Proxy` as a generic `ProxyTool`.
+pub fn register_proxy_tools(registry: &mut ToolRegistry, client: OmegaClient) {
+    for &def in omega_tool_defs::ALL {
+        if def.kind == omega_tool_defs::ToolKind::Proxy {
+            registry.register(proxy::ProxyTool::new(client.clone(), def));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omega_tools::Tool;
+
+    // -----------------------------------------------------------------------
+    // register_proxy_tools
+    // -----------------------------------------------------------------------
+
+    /// register_proxy_tools registers all 6 proxy tools.
+    #[test]
+    fn test_register_proxy_tools_registers_all_proxies() {
+        let mut registry = ToolRegistry::new();
+        let client = OmegaClient::with_socket("/tmp/nonexistent-test-socket.sock");
+        register_proxy_tools(&mut registry, client);
+
+        for proxy_name in &["Bash", "Read", "Write", "Edit", "Glob", "Grep"] {
+            assert!(
+                registry.get(proxy_name).is_some(),
+                "{} should be registered as a proxy tool",
+                proxy_name
+            );
+        }
+        assert_eq!(registry.len(), 6);
+    }
+
+    /// register_proxy_tools does NOT register native tools.
+    #[test]
+    fn test_register_proxy_tools_skips_native() {
+        let mut registry = ToolRegistry::new();
+        let client = OmegaClient::with_socket("/tmp/nonexistent-test-socket.sock");
+        register_proxy_tools(&mut registry, client);
+
+        assert!(
+            registry.get("AskUserQuestion").is_none(),
+            "AskUserQuestion is native and should not be in proxy registry"
+        );
+        assert!(
+            registry.get("Transfer").is_none(),
+            "Transfer is native and should not be in proxy registry"
+        );
+    }
+
+    /// register_proxy_tools works with an empty registry.
+    #[test]
+    fn test_register_proxy_tools_onto_empty() {
+        let mut registry = ToolRegistry::new();
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
+        assert!(registry.is_empty());
+        register_proxy_tools(&mut registry, client);
+        assert!(!registry.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ProxyTool unit tests
+    // -----------------------------------------------------------------------
+
+    /// ProxyTool::name() returns the canonical name.
+    #[test]
+    fn test_proxy_tool_name() {
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
+        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::bash::DEF);
+        assert_eq!(tool.name(), "Bash");
+    }
+
+    /// ProxyTool::description() returns the canonical description.
+    #[test]
+    fn test_proxy_tool_description() {
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
+        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::read::DEF);
+        assert_eq!(tool.description(), omega_tool_defs::read::DEF.description);
+    }
+
+    /// ProxyTool::definition() matches def_to_tool_definition of the canonical def.
+    #[test]
+    fn test_proxy_tool_definition_matches_canonical() {
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
+        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::grep::DEF);
+        let expected = omega_tools::def_to_tool_definition(&omega_tool_defs::grep::DEF);
+        let actual = tool.definition();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    /// ProxyTool::get_info returns a stub with the tool name.
+    #[test]
+    fn test_proxy_tool_get_info() {
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
+        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::bash::DEF);
+        let info = tool.get_info(&serde_json::json!({}));
+        assert_eq!(info.name, "Bash");
+    }
+
+    /// Two ProxyTools with different defs are independent.
+    #[test]
+    fn test_proxy_tool_independence() {
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
+        let bash = proxy::ProxyTool::new(client.clone(), &omega_tool_defs::bash::DEF);
+        let read = proxy::ProxyTool::new(client, &omega_tool_defs::read::DEF);
+        assert_eq!(bash.name(), "Bash");
+        assert_eq!(read.name(), "Read");
+        assert_ne!(bash.name(), read.name());
+    }
+
+    // -----------------------------------------------------------------------
+    // Execute error handling (no real omega-sh running)
+    // -----------------------------------------------------------------------
+
+    /// Helper: a do-nothing ToolRuntime for execute tests.
+    struct DummyRuntime;
+
+    #[async_trait::async_trait]
+    impl omega_core::core::ToolRuntime for DummyRuntime {
+        fn send_output(&self, _chunk: omega_core::core::OutputChunk) {}
+
+        async fn ask_user_question(
+            &mut self,
+            _request_id: &str,
+            _questions: Vec<omega_core::core::UserQuestion>,
+        ) -> omega_core::core::FrameworkResult<std::collections::HashMap<String, String>> {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn is_interrupted(&self) -> bool {
+            false
+        }
+    }
+
+    /// ProxyTool::execute on a non-existent socket returns an error ToolResult.
+    #[tokio::test]
+    async fn test_proxy_tool_execute_no_daemon() {
+        let client = OmegaClient::with_socket("/tmp/omega-sh-test-does-not-exist-382917.sock");
+        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::bash::DEF);
+        let input = serde_json::json!({ "command": "echo hi" });
+        let result = tool.execute(&input, &mut DummyRuntime).await.unwrap();
+        assert!(result.is_error, "execute with no daemon should return error");
+    }
+
+    /// Executing with no arguments still fails gracefully (not a panic).
+    #[tokio::test]
+    async fn test_proxy_tool_execute_empty_args() {
+        let client = OmegaClient::with_socket("/tmp/omega-sh-test-empty-291837.sock");
+        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::bash::DEF);
+        let result = tool.execute(&serde_json::json!({}), &mut DummyRuntime).await.unwrap();
+        assert!(result.is_error, "should error, not panic");
+    }
 }

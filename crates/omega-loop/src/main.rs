@@ -37,15 +37,12 @@ mod session;
 
 use omega_core::core::{InputMessage, OutputChunk};
 use omega_llm::{AuthConfig, LlmProvider, OpenAIProvider};
-use omega_tools::{AskUserQuestionTool, ToolRegistry, TransferTool};
+use omega_tools::ToolRegistry;
 
 use crate::agent::{AgentConfig, StandardAgent};
 use crate::runtime::{AgentHandle, AgentRuntime};
 use crate::session::{AgentSession, SessionStorage};
-use omega_sh_client::{
-    proxy::{BashProxy, EditProxy, GlobProxy, GrepProxy, ReadProxy, WriteProxy},
-    OmegaClient,
-};
+use omega_sh_client::OmegaClient;
 
 // ---------------------------------------------------------------------------
 // Wire protocol
@@ -135,14 +132,8 @@ fn create_tools() -> Result<Arc<ToolRegistry>> {
                 .unwrap_or_else(|_| "?".to_string()),
         );
 
-    registry.register(ReadProxy::new(omega.clone()));
-    registry.register(WriteProxy::new(omega.clone()));
-    registry.register(EditProxy::new(omega.clone()));
-    registry.register(BashProxy::new(omega.clone()));
-    registry.register(GlobProxy::new(omega.clone()));
-    registry.register(GrepProxy::new(omega.clone()));
-    registry.register(AskUserQuestionTool::new());
-    registry.register(TransferTool::new());
+    omega_sh_client::register_proxy_tools(&mut registry, omega);
+    omega_tools::register_default_tools(&mut registry);
 
     Ok(Arc::new(registry))
 }

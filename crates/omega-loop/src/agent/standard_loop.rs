@@ -523,7 +523,13 @@ impl StandardAgent {
         Ok(())
     }
 
-    /// Apply cache control to tools, system prompt, and messages (if enabled)
+    /// Apply cache control to tools, system prompt, and messages (if enabled).
+    ///
+    /// Strategy:
+    ///   - Up to 2 system/developer messages from the front
+    ///   - Last 2 user/assistant messages from the end
+    ///   - Cache control on the last tool definition
+    ///   - 1-hour TTL for stable hot cache across long sessions
     fn apply_cache_control(
         &self,
         system_prompt_text: &str,
@@ -542,6 +548,9 @@ impl StandardAgent {
                 messages,
             );
         }
+
+        // Use ephemeral cache control with 1-hour TTL
+        let marker = CacheControl::ephemeral_1h();
 
         // IMPORTANT: Strip ALL existing cache_control from messages first
         // This ensures we don't accidentally create duplicate cache breakpoints
@@ -565,38 +574,42 @@ impl StandardAgent {
         if let Some(last_tool) = tool_definitions.last_mut() {
             *last_tool = last_tool
                 .clone()
-                .with_cache_control(CacheControl::ephemeral());
+                .with_cache_control(marker.clone());
         }
 
-        // 2. Create system prompt with cache control
-        let system_prompt = Some(SystemPrompt::Blocks(vec![SystemBlock::new(
-            system_prompt_text.to_string(),
-        )
-        .with_cache_control(CacheControl::ephemeral())]));
-
-        // 3. Add cache control to the last content block of the LAST message
-        // This caches everything including the current user input, creating a stable growing cache
-        // Next request will have this content cached, allowing prefix matching
-        if let Some(last_message) = messages.last_mut() {
-            match &mut last_message.content {
-                omega_llm::MessageContent::Text(text) => {
-                    // Convert to blocks format with cache control on the text
-                    last_message.content =
-                        omega_llm::MessageContent::Blocks(vec![ContentBlock::Text {
-                            text: text.clone(),
-                            cache_control: Some(CacheControl::ephemeral()),
-                        }]);
+        // 2. Stamp up to 2 system messages from the front
+        let mut system_stamped = 0;
+        for msg in messages.iter_mut() {
+            if msg.role == "system" || msg.role == "developer" {
+                if stamp_message_end(&marker, msg) {
+                    system_stamped += 1;
+                    if system_stamped >= 2 {
+                        break;
+                    }
                 }
-                omega_llm::MessageContent::Blocks(blocks) => {
-                    // Add cache control to the last block
-                    if let Some(last_block) = blocks.last_mut() {
-                        *last_block = last_block
-                            .clone()
-                            .with_cache_control(CacheControl::ephemeral());
+            } else {
+                break;
+            }
+        }
+
+        // 3. Stamp last 2 user/assistant messages from the end
+        let mut final_stamped = 0;
+        for msg in messages.iter_mut().rev() {
+            if msg.role == "user" || msg.role == "assistant" {
+                if stamp_message_end(&marker, msg) {
+                    final_stamped += 1;
+                    if final_stamped >= 2 {
+                        break;
                     }
                 }
             }
         }
+
+        // 4. System prompt with cache control (as a single block with marker)
+        let system_prompt = Some(SystemPrompt::Blocks(vec![
+            SystemBlock::new(system_prompt_text.to_string())
+                .with_cache_control(marker.clone()),
+        ]));
 
         (tool_definitions, system_prompt, messages)
     }
@@ -646,8 +659,8 @@ impl StandardAgent {
         let mut current_tool_id = String::new();
         let mut current_tool_name = String::new();
         let mut current_tool_signature: Option<String> = None;
-        // Some providers (e.g. OpenAI) send the full tool input upfront in
-        // ContentBlockStart, unlike Anthropic which streams it incrementally
+        // Some providers send the full tool input upfront in
+        // ContentBlockStart, unlike others which stream it incrementally
         // via InputJsonDelta.  We store it here as a fallback.
         let mut current_tool_start_input: Option<Value> = None;
 
@@ -689,7 +702,7 @@ impl StandardAgent {
                                     // Save the start input – it is the full input for
                                     // providers that send it upfront (OpenAI) but an
                                     // empty object for providers that stream it via
-                                    // InputJsonDelta (Anthropic).
+                                    // InputJsonDelta.
                                     current_tool_start_input = Some(input.clone());
                                 }
                             }
@@ -741,10 +754,9 @@ impl StandardAgent {
                                 {
                                     // Determine the tool input:
                                     //   1. If we have accumulated InputJsonDelta events
-                                    //      (Anthropic-style), parse those.
+                                    //      (incremental streaming), parse those.
                                     //   2. Otherwise, fall back to the input that was
-                                    //      provided upfront in ContentBlockStart
-                                    //      (OpenAI-style).
+                                    //      provided upfront in ContentBlockStart.
                                     //   3. If neither is available, use default.
                                     let input: Value = if !tool_input_accum.is_empty() {
                                         serde_json::from_str(&tool_input_accum).unwrap_or_default()
@@ -846,7 +858,7 @@ impl StandardAgent {
             });
 
             // Add usage information if we captured it
-            if let Some(usage) = initial_usage {
+            if let Some(ref usage) = initial_usage {
                 let usage_obj = serde_json::json!({
                     "input_tokens": usage.input_tokens,
                     "output_tokens": output_tokens,
@@ -864,6 +876,46 @@ impl StandardAgent {
             }
         }
 
+        // Emit cache telemetry for this LLM call
+        if let Some(ref usage) = initial_usage {
+            let telemetry = omega_core::core::CacheTelemetry {
+                input_tokens: usage.input_tokens,
+                cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            };
+            internals.send_cache_telemetry(telemetry);
+        }
+
         Ok((content_blocks, stop_reason))
+    }
+}
+
+/// Stamp cache_control on the last content block of a message.
+/// Returns true if a marker was placed.
+fn stamp_message_end(marker: &CacheControl, msg: &mut Message) -> bool {
+    match &mut msg.content {
+        omega_llm::MessageContent::Text(text) => {
+            if text.is_empty() {
+                return false;
+            }
+            msg.content = omega_llm::MessageContent::Blocks(vec![ContentBlock::Text {
+                text: text.clone(),
+                cache_control: Some(marker.clone()),
+            }]);
+            true
+        }
+        omega_llm::MessageContent::Blocks(blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                let had_content = match last {
+                    ContentBlock::Text { text, .. } => !text.is_empty(),
+                    _ => true,
+                };
+                if had_content {
+                    *last = last.clone().with_cache_control(marker.clone());
+                    return true;
+                }
+            }
+            false
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! LLM Provider trait
 //!
-//! Abstracts the LLM interface so that different providers (Anthropic, Gemini, etc.)
-//! can be used interchangeably with the StandardAgent.
+//! Abstracts the LLM interface so that different providers can be used
+//! interchangeably with the StandardAgent.
 
 use anyhow::Result;
 use futures::stream::Stream;
@@ -15,11 +15,10 @@ use super::types::{
 /// Trait for LLM providers that can be used with StandardAgent.
 ///
 /// This trait abstracts the interface needed by the agent loop, allowing
-/// different LLM backends (Anthropic, Gemini, etc.) to be used interchangeably.
+/// different LLM backends to be used interchangeably.
 ///
-/// All providers work with the same internal message types (which follow Anthropic's
-/// format). Providers that use a different wire format (e.g., Gemini) handle
-/// translation internally.
+/// All providers work with the same internal message types, handling
+/// translation to their own wire format internally.
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Stream a request with tools and system prompt.
@@ -49,7 +48,7 @@ pub trait LlmProvider: Send + Sync {
     /// Get the current model name.
     fn model(&self) -> String;
 
-    /// Get the provider name (e.g., "anthropic").
+    /// Get the provider name (e.g., "openai").
     fn provider_name(&self) -> &str;
 
     /// Create a lightweight variant of this provider with a different model and max tokens.

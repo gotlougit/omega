@@ -7,12 +7,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use omega_core::core::{QuestionOption, ToolInfo, ToolResult, UserQuestion};
 use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
-use omega_llm::{ToolDefinition, ToolInputSchema};
+use omega_llm::ToolDefinition;
 
 /// Input for a single question option
 #[derive(Debug, Deserialize)]
@@ -70,83 +70,7 @@ impl Tool for AskUserQuestionTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        use omega_llm::types::CustomTool;
-
-        ToolDefinition::Custom(CustomTool {
-            name: "AskUserQuestion".to_string(),
-            description: Some(
-                "Use this tool to ask the user questions during execution. This allows you to:\n\
-                1. Gather user preferences or requirements\n\
-                2. Clarify ambiguous instructions\n\
-                3. Get decisions on implementation choices as you work\n\
-                4. Offer choices to the user about what direction to take.\n\n\
-                Usage notes:\n\
-                - Users will always be able to select \"Other\" to provide custom text input\n\
-                - Use multiSelect: true to allow multiple answers to be selected for a question\n\
-                - If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label"
-                    .to_string(),
-            ),
-            input_schema: ToolInputSchema {
-                schema_type: "object".to_string(),
-                properties: Some(json!({
-                    "questions": {
-                        "type": "array",
-                        "description": "Questions to ask the user (1-4 questions)",
-                        "minItems": 1,
-                        "maxItems": 4,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark."
-                                },
-                                "header": {
-                                    "type": "string",
-                                    "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\"."
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "description": "The available choices for this question. Must have 2-4 options.",
-                                    "minItems": 2,
-                                    "maxItems": 4,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {
-                                                "type": "string",
-                                                "description": "The display text for this option (1-5 words)."
-                                            },
-                                            "description": {
-                                                "type": "string",
-                                                "description": "Explanation of what this option means or what will happen if chosen."
-                                            }
-                                        },
-                                        "required": ["label", "description"]
-                                    }
-                                },
-                                "multiSelect": {
-                                    "type": "boolean",
-                                    "default": false,
-                                    "description": "Set to true to allow the user to select multiple options."
-                                }
-                            },
-                            "required": ["question", "header", "options", "multiSelect"]
-                        }
-                    },
-                    "answers": {
-                        "type": "object",
-                        "description": "Optional pre-filled answers (header -> selected label)",
-                        "additionalProperties": {
-                            "type": "string"
-                        }
-                    }
-                })),
-                required: Some(vec!["questions".to_string()]),
-            },
-            tool_type: None,
-            cache_control: None,
-        })
+        crate::def_to_tool_definition(&omega_tool_defs::ask_user_question::DEF)
     }
 
     fn get_info(&self, input: &Value) -> ToolInfo {

@@ -651,11 +651,11 @@ mod tests {
         )
         .unwrap();
 
-        session.set_model("claude-opus-4-5-20251101");
-        session.set_provider("anthropic");
+        session.set_model("gpt-4o");
+        session.set_provider("openai");
 
-        assert_eq!(session.model(), "claude-opus-4-5-20251101");
-        assert_eq!(session.provider(), "anthropic");
+        assert_eq!(session.model(), "gpt-4o");
+        assert_eq!(session.provider(), "openai");
     }
 
     #[test]

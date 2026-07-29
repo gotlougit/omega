@@ -1,0 +1,8 @@
+[package]
+name = "omega-tool-defs"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical tool definitions (name, description, input schema) shared across omega-sh, omega-sh-client, and omega-tools"
+
+[dependencies]
+serde_json = "1.0"

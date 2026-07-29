@@ -46,7 +46,7 @@ pub struct SessionMetadata {
     /// Model being used
     pub model: String,
 
-    /// Provider (e.g., "anthropic")
+    /// Provider (e.g., "openai")
     pub provider: String,
 
     // --- Timestamps ---

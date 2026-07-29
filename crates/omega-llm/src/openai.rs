@@ -1,8 +1,8 @@
 //! OpenAI Chat Completions API client
 //!
 //! Implements the `LlmProvider` trait for OpenAI's Chat Completions API,
-//! handling translation between the internal Anthropic-shaped types and
-//! OpenAI's wire format.
+//! handling translation between the internal message types and OpenAI's
+//! wire format.
 //!
 //! # Authentication
 //!
@@ -121,6 +121,12 @@ struct OpenAIRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Per-session prompt cache key (supported by some gateways)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    /// Prompt cache retention (supported by some gateways)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<String>,
 }
 
 /// OpenAI usage info
@@ -299,8 +305,17 @@ impl OpenAIProvider {
     /// Stream a request and return SSE events
     async fn send_streaming_request(
         &self,
-        request: &OpenAIRequest,
+        mut request: OpenAIRequest,
+        session_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        // When a session_id is provided, use it as the prompt cache key
+        // so that the cache is scoped per session. Some gateways
+        // accept these extra fields; others silently ignore them.
+        if let Some(sid) = session_id {
+            request.prompt_cache_key = Some(sid.to_string());
+            request.prompt_cache_retention = Some("24h".to_string());
+        }
+
         let auth_config = self
             .auth
             .get_auth()
@@ -370,10 +385,10 @@ impl OpenAIProvider {
                                 let usage = chunk.usage.as_ref().map(|u| Usage {
                                     input_tokens: u.prompt_tokens,
                                     output_tokens: u.completion_tokens,
-                                    cache_creation_input_tokens: u.prompt_tokens_details
+                                    cache_creation_input_tokens: None,
+                                    cache_read_input_tokens: u.prompt_tokens_details
                                         .as_ref()
                                         .map(|d| d.cached_tokens),
-                                    cache_read_input_tokens: None,
                                     thoughts_token_count: None,
                                 });
 
@@ -559,9 +574,11 @@ impl LlmProvider for OpenAIProvider {
             temperature: None,
             max_tokens: Some(self.max_tokens),
             stream: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
 
-        self.send_streaming_request(&request).await
+        self.send_streaming_request(request, _session_id).await
     }
 
     fn model(&self) -> String {
@@ -782,29 +799,20 @@ fn convert_to_openai_messages(msg: &Message, out: &mut Vec<OpenAIMessage>) {
 fn convert_tools_to_openai(tools: &[ToolDefinition]) -> Vec<OpenAITool> {
     tools
         .iter()
-        .filter_map(|tool| match tool {
-            ToolDefinition::Custom(custom) => {
-                let description = custom.description.clone().unwrap_or_default();
-                let parameters = serde_json::to_value(&custom.input_schema).unwrap_or(json!({
-                    "type": "object"
-                }));
+        .map(|tool| {
+            let ToolDefinition::Custom(custom) = tool;
+            let description = custom.description.clone().unwrap_or_default();
+            let parameters = serde_json::to_value(&custom.input_schema).unwrap_or(json!({
+                "type": "object"
+            }));
 
-                Some(OpenAITool {
-                    tool_type: "function".to_string(),
-                    function: OpenAIFunction {
-                        name: custom.name.clone(),
-                        description: Some(description),
-                        parameters,
-                    },
-                })
-            }
-            ToolDefinition::Bash(_) | ToolDefinition::TextEditor(_) => {
-                // These are Anthropic-specific built-in tools; skip for OpenAI
-                tracing::warn!(
-                    "OpenAI provider: skipping Anthropic-specific tool '{:?}'",
-                    tool
-                );
-                None
+            OpenAITool {
+                tool_type: "function".to_string(),
+                function: OpenAIFunction {
+                    name: custom.name.clone(),
+                    description: Some(description),
+                    parameters,
+                },
             }
         })
         .collect()

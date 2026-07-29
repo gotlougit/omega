@@ -10,5 +10,6 @@ members = [
     "crates/omega-tui",
     "crates/omega-sh-client",
     "crates/omega-tools",
+    "crates/omega-tool-defs",
     "crates/clankersh",
 ]

@@ -88,6 +88,12 @@ pub enum OutputChunk {
     Status(String),
     Error(String),
     Done,
+    /// Prompt caching telemetry from the last LLM call
+    CacheTelemetry {
+        input_tokens: u32,
+        cache_read_tokens: u32,
+        cache_creation_tokens: u32,
+    },
     Unknown,
 }
 
@@ -239,6 +245,25 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                         .as_str()
                         .map(|s| OutputChunk::Error(s.to_string()))
                         .unwrap_or(OutputChunk::Unknown),
+                    "CacheTelemetry" => {
+                        let input_tokens = inner
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
+                        let cache_read_tokens = inner
+                            .get("cache_read_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
+                        let cache_creation_tokens = inner
+                            .get("cache_creation_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
+                        OutputChunk::CacheTelemetry {
+                            input_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
+                        }
+                    }
                     "StateChange" => OutputChunk::Unknown,
                     _ => OutputChunk::Unknown,
                 };

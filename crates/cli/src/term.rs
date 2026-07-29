@@ -62,6 +62,9 @@ struct SharedState {
     cursor: usize,
     left_prompt: StyledText,
 
+    // --- status line ---
+    status_line: Option<StyledBlock>,
+
     // --- history ---
     input_history: Vec<String>,
     history_index: Option<usize>,
@@ -96,6 +99,7 @@ impl SharedState {
             buffer: String::new(),
             cursor: 0,
             left_prompt,
+            status_line: None,
             input_history: Vec::new(),
             history_index: None,
             width,
@@ -328,6 +332,22 @@ impl TermHandle {
     pub fn set_left_prompt(&self, text: impl Into<StyledText>) {
         self.lock().left_prompt = text.into();
     }
+
+    // --- status line ---
+
+    /// Set the persistent status line shown between the log and the prompt.
+    /// Pass an empty block to clear.
+    pub fn set_status_line(&self, block: StyledBlock) {
+        self.lock().status_line = Some(block);
+        self.redraw.notify();
+    }
+
+    /// Remove the status line.
+    pub fn clear_status_line(&self) {
+        self.lock().status_line = None;
+        self.redraw.notify();
+    }
+
 
     pub fn get_buffer(&self) -> String {
         self.lock().buffer.clone()
@@ -894,6 +914,7 @@ struct Snapshot {
     height: usize,
     history: Vec<StyledBlock>,
     above: Vec<StyledBlock>,
+    status_line: Option<StyledBlock>,
     suggestions: Vec<StyledBlock>,
     below: Vec<StyledBlock>,
     left_prompt: StyledText,
@@ -913,6 +934,7 @@ fn take_snapshot(st: &mut SharedState) -> Snapshot {
         height: st.height.max(1),
         history: grab(&st.history, &st.blocks),
         above: grab(&st.above, &st.blocks),
+        status_line: st.status_line.clone(),
         suggestions: grab(&st.suggestions, &st.blocks),
         below: grab(&st.below, &st.blocks),
         left_prompt: st.left_prompt.clone(),
@@ -937,6 +959,13 @@ fn layout_frame(snap: &Snapshot) -> FrameLayout {
         all_lines.extend(layout_block(block, width));
     }
     let log_end = all_lines.len();
+
+    // --- Status line (between log and prompt, fixed) ---
+    if let Some(ref status) = snap.status_line {
+        if !status.content.is_empty() {
+            all_lines.extend(layout_block(status, width));
+        }
+    }
 
     // --- Prompt ---
     let prompt_text = {

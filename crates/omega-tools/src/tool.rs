@@ -20,7 +20,7 @@ pub trait Tool: Send + Sync {
     /// Get a description of this tool
     fn description(&self) -> &str;
 
-    /// Get the tool definition for the Anthropic API
+    /// Get the tool definition for the LLM API
     fn definition(&self) -> ToolDefinition;
 
     /// Get information about what this tool invocation will do

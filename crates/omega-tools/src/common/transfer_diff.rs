@@ -8,12 +8,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use omega_core::core::{ToolInfo, ToolResult};
 use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
-use omega_llm::{ToolDefinition, ToolInputSchema};
+use omega_llm::ToolDefinition;
 
 /// Input for the Transfer tool
 #[derive(Debug, Deserialize)]
@@ -52,32 +52,7 @@ impl Tool for TransferTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        use omega_llm::types::CustomTool;
-
-        ToolDefinition::Custom(CustomTool {
-            name: "Transfer".to_string(),
-            description: Some(
-                "Use this tool to transfer a file from the agent's environment to the user.\n\
-                 The file content will be saved as a file on the user's local machine.\n\n\
-                 Typical usage:\n\
-                 1. Generate or create a file (e.g. a patch, result, or artifact)\n\
-                 2. Pass the absolute path to the file as `file_path`\n\n\
-                 The file will be saved with a name like `<original-name>-<session>-<timestamp>`."
-                    .to_string(),
-            ),
-            input_schema: ToolInputSchema {
-                schema_type: "object".to_string(),
-                properties: Some(json!({
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute path to the file on the agent's filesystem to transfer"
-                    }
-                })),
-                required: Some(vec!["file_path".to_string()]),
-            },
-            tool_type: None,
-            cache_control: None,
-        })
+        crate::def_to_tool_definition(&omega_tool_defs::transfer::DEF)
     }
 
     fn get_info(&self, input: &Value) -> ToolInfo {

@@ -1,6 +1,7 @@
-//! Anthropic API types matching the official REST API specification
+//! LLM message types supporting structured content blocks, tools, and streaming events.
 //!
-//! These types are designed to serialize/deserialize correctly with the Anthropic Messages API.
+//! These types support message formats with content blocks, tool use,
+//! tool results, cache control, and streaming deltas.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -91,7 +92,7 @@ impl SystemBlock {
     }
 }
 
-/// Request body for the Anthropic Messages API
+/// Request body for an LLM messages API call
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageRequest {
     /// The model to use
@@ -512,30 +513,16 @@ impl ContentBlock {
 
 /// Tool definition for the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
 pub enum ToolDefinition {
     /// Custom tool with JSON schema
     Custom(CustomTool),
-    /// Built-in bash tool
-    Bash(BashTool),
-    /// Built-in text editor tool
-    TextEditor(TextEditorTool),
 }
 
 impl ToolDefinition {
     /// Add cache control to this tool definition
     pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
-        match &mut self {
-            ToolDefinition::Custom(tool) => {
-                tool.cache_control = Some(cache_control);
-            }
-            ToolDefinition::Bash(tool) => {
-                tool.cache_control = Some(cache_control);
-            }
-            ToolDefinition::TextEditor(tool) => {
-                tool.cache_control = Some(cache_control);
-            }
-        }
+        let ToolDefinition::Custom(tool) = &mut self;
+        tool.cache_control = Some(cache_control);
         self
     }
 }
@@ -604,56 +591,6 @@ impl ToolInputSchema {
 impl Default for ToolInputSchema {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Built-in bash tool (bash_20250124)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BashTool {
-    /// Tool name (always "bash")
-    pub name: String,
-
-    /// Tool type (always "bash_20250124")
-    #[serde(rename = "type")]
-    pub tool_type: String,
-
-    /// Cache control (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
-}
-
-impl Default for BashTool {
-    fn default() -> Self {
-        Self {
-            name: "bash".to_string(),
-            tool_type: "bash_20250124".to_string(),
-            cache_control: None,
-        }
-    }
-}
-
-/// Built-in text editor tool (text_editor_20250124)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextEditorTool {
-    /// Tool name (always "str_replace_editor")
-    pub name: String,
-
-    /// Tool type
-    #[serde(rename = "type")]
-    pub tool_type: String,
-
-    /// Cache control (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
-}
-
-impl Default for TextEditorTool {
-    fn default() -> Self {
-        Self {
-            name: "str_replace_editor".to_string(),
-            tool_type: "text_editor_20250124".to_string(),
-            cache_control: None,
-        }
     }
 }
 
@@ -761,32 +698,6 @@ pub struct Usage {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thoughts_token_count: Option<u32>,
-}
-
-// ============================================================================
-// Error Types
-// ============================================================================
-
-/// Error response from the Anthropic API
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiError {
-    /// Error type
-    #[serde(rename = "type")]
-    pub error_type: String,
-
-    /// Error details
-    pub error: ApiErrorDetails,
-}
-
-/// Details of an API error
-#[derive(Debug, Clone, Deserialize)]
-pub struct ApiErrorDetails {
-    /// Error type
-    #[serde(rename = "type")]
-    pub error_type: String,
-
-    /// Error message
-    pub message: String,
 }
 
 // ============================================================================
