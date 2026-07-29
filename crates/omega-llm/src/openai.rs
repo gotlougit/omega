@@ -39,7 +39,7 @@ use super::provider::LlmProvider;
 use super::types::{
     ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
     ContentBlockStopEvent, ContentDelta, DeltaUsage, Message, MessageContent, MessageDeltaData,
-    MessageDeltaEvent, MessageResponse, MessageStartData, MessageStartEvent, StopReason,
+    MessageDeltaEvent, MessageStartData, MessageStartEvent, StopReason,
     StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice, ToolDefinition, Usage,
 };
 
@@ -121,39 +121,6 @@ struct OpenAIRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
-}
-
-/// OpenAI Chat Completions response (non-streaming)
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct OpenAIResponse {
-    id: String,
-    object: String,
-    created: u64,
-    model: String,
-    choices: Vec<OpenAIChoice>,
-    #[serde(default)]
-    usage: Option<OpenAIUsage>,
-}
-
-/// A choice in the OpenAI response
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct OpenAIChoice {
-    index: u32,
-    message: OpenAIAssistantMessage,
-    finish_reason: Option<String>,
-}
-
-/// Assistant message in the response
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct OpenAIAssistantMessage {
-    role: String,
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<OpenAIToolCall>>,
 }
 
 /// OpenAI usage info
@@ -327,94 +294,6 @@ impl OpenAIProvider {
             model: model.into(),
             max_tokens,
         }
-    }
-
-    /// Simple send_message (text in, text out, no tools)
-    pub async fn send_message(
-        &self,
-        user_message: &str,
-        conversation_history: &[Message],
-        system_prompt: Option<&str>,
-        _session_id: Option<&str>,
-    ) -> Result<String> {
-        tracing::info!("Sending message to OpenAI API");
-
-        let mut openai_messages = Vec::new();
-
-        // System prompt
-        if let Some(sp) = system_prompt {
-            openai_messages.push(OpenAIMessage::System {
-                role: "system".to_string(),
-                content: sp.to_string(),
-            });
-        }
-
-        // Conversation history
-        for msg in conversation_history {
-            convert_to_openai_messages(msg, &mut openai_messages);
-        }
-
-        // Current user message
-        openai_messages.push(OpenAIMessage::User {
-            role: "user".to_string(),
-            content: user_message.to_string(),
-        });
-
-        let request = OpenAIRequest {
-            model: self.model.clone(),
-            messages: openai_messages,
-            tools: None,
-            tool_choice: None,
-            temperature: None,
-            max_tokens: Some(self.max_tokens),
-            stream: None,
-        };
-
-        let response = self.send_request(&request).await?;
-
-        Ok(response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("")
-            .to_string())
-    }
-
-    /// Core non-streaming request
-    async fn send_request(&self, request: &OpenAIRequest) -> Result<OpenAIResponse> {
-        let auth_config = self
-            .auth
-            .get_auth()
-            .await
-            .context("Failed to get authentication credentials")?;
-        let api_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
-
-        let body = serde_json::to_string(request)?;
-
-        let response = self
-            .client
-            .post(api_url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", auth_config.api_key))
-            .body(body)
-            .send()
-            .await
-            .context("Failed to send request to OpenAI API")?;
-
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .context("Failed to read response body")?;
-
-        if !status.is_success() {
-            anyhow::bail!("OpenAI API error ({}): {}", status, text);
-        }
-
-        let resp: OpenAIResponse =
-            serde_json::from_str(&text).context("Failed to parse OpenAI response")?;
-
-        Ok(resp)
     }
 
     /// Stream a request and return SSE events
@@ -651,58 +530,6 @@ struct AccumulatedToolCall {
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAIProvider {
-    async fn send_message(
-        &self,
-        user_message: &str,
-        conversation_history: &[Message],
-        system_prompt: Option<&str>,
-        session_id: Option<&str>,
-    ) -> Result<String> {
-        self.send_message(
-            user_message,
-            conversation_history,
-            system_prompt,
-            session_id,
-        )
-        .await
-    }
-
-    async fn send_with_tools_and_system(
-        &self,
-        messages: Vec<Message>,
-        system: Option<SystemPrompt>,
-        tools: Vec<ToolDefinition>,
-        tool_choice: Option<ToolChoice>,
-        thinking: Option<ThinkingConfig>,
-        _session_id: Option<&str>,
-    ) -> Result<MessageResponse> {
-        if thinking.is_some() {
-            tracing::warn!("OpenAI Chat Completions does not support extended thinking; ignoring");
-        }
-
-        let openai_messages = convert_messages_to_openai(&messages, &system);
-        let openai_tools = convert_tools_to_openai(&tools);
-        let openai_tool_choice = convert_tool_choice_to_openai(&tool_choice);
-
-        let request = OpenAIRequest {
-            model: self.model.clone(),
-            messages: openai_messages,
-            tools: if openai_tools.is_empty() {
-                None
-            } else {
-                Some(openai_tools)
-            },
-            tool_choice: openai_tool_choice,
-            temperature: None,
-            max_tokens: Some(self.max_tokens),
-            stream: None,
-        };
-
-        let response = self.send_request(&request).await?;
-
-        convert_response_to_internal(response)
-    }
-
     async fn stream_with_tools_and_system(
         &self,
         messages: Vec<Message>,
@@ -994,75 +821,6 @@ fn convert_tool_choice_to_openai(choice: &Option<ToolChoice>) -> Option<Value> {
         })),
         Some(ToolChoice::None) => Some(json!("none")),
     }
-}
-
-/// Convert OpenAI response to internal MessageResponse
-fn convert_response_to_internal(response: OpenAIResponse) -> Result<MessageResponse> {
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .context("OpenAI response has no choices")?;
-
-    let mut content = Vec::new();
-
-    // Text content
-    if let Some(text) = &choice.message.content {
-        if !text.is_empty() {
-            content.push(ContentBlock::Text {
-                text: text.clone(),
-                cache_control: None,
-            });
-        }
-    }
-
-    // Tool calls
-    if let Some(tool_calls) = choice.message.tool_calls {
-        for tc in tool_calls {
-            let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
-            content.push(ContentBlock::ToolUse {
-                id: tc.id,
-                name: tc.function.name,
-                input,
-                signature: None,
-            });
-        }
-    }
-
-    let stop_reason = choice.finish_reason.as_deref().map(|r| match r {
-        "stop" => StopReason::EndTurn,
-        "length" => StopReason::MaxTokens,
-        "tool_calls" => StopReason::ToolUse,
-        "content_filter" => StopReason::Refusal,
-        _ => StopReason::EndTurn,
-    });
-
-    let usage = response.usage.unwrap_or(OpenAIUsage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        prompt_tokens_details: None,
-    });
-
-    Ok(MessageResponse {
-        id: response.id,
-        response_type: "message".to_string(),
-        role: "assistant".to_string(),
-        content,
-        model: response.model,
-        stop_reason,
-        stop_sequence: None,
-        usage: Usage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            cache_creation_input_tokens: usage
-                .prompt_tokens_details
-                .as_ref()
-                .map(|d| d.cached_tokens),
-            cache_read_input_tokens: None,
-            thoughts_token_count: None,
-        },
-    })
 }
 
 /// Derive the models list URL from the chat completions base URL.

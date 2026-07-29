@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::types::{
-    Message, MessageResponse, StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice, ToolDefinition,
+    Message, StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice, ToolDefinition,
 };
 
 /// Trait for LLM providers that can be used with StandardAgent.
@@ -22,28 +22,6 @@ use super::types::{
 /// translation internally.
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
-    /// Send a simple message and get a text response (no tool calling).
-    async fn send_message(
-        &self,
-        user_message: &str,
-        conversation_history: &[Message],
-        system_prompt: Option<&str>,
-        session_id: Option<&str>,
-    ) -> Result<String>;
-
-    /// Send a request with tools and system prompt, returning the full response.
-    ///
-    /// This is the primary method used by the agent loop for non-streaming requests.
-    async fn send_with_tools_and_system(
-        &self,
-        messages: Vec<Message>,
-        system: Option<SystemPrompt>,
-        tools: Vec<ToolDefinition>,
-        tool_choice: Option<ToolChoice>,
-        thinking: Option<ThinkingConfig>,
-        session_id: Option<&str>,
-    ) -> Result<MessageResponse>;
-
     /// Stream a request with tools and system prompt.
     ///
     /// Returns an async stream of StreamEvent that yields events as they arrive.

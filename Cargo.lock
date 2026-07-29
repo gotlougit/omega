@@ -933,18 +933,13 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "base64 0.23.0",
- "chrono",
  "futures",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
- "uuid",
 ]
 
 [[package]]

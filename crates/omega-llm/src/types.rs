@@ -722,69 +722,6 @@ impl ToolChoice {
 }
 
 // ============================================================================
-// Response Types
-// ============================================================================
-
-/// Response from the Anthropic Messages API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageResponse {
-    /// Unique message ID
-    pub id: String,
-
-    /// Type (always "message")
-    #[serde(rename = "type")]
-    pub response_type: String,
-
-    /// Role (always "assistant")
-    pub role: String,
-
-    /// Content blocks in the response
-    pub content: Vec<ContentBlock>,
-
-    /// Model used
-    pub model: String,
-
-    /// Reason for stopping
-    pub stop_reason: Option<StopReason>,
-
-    /// Stop sequence that was matched (if any)
-    pub stop_sequence: Option<String>,
-
-    /// Token usage
-    pub usage: Usage,
-}
-
-impl MessageResponse {
-    /// Get all text content from the response
-    pub fn text(&self) -> String {
-        self.content
-            .iter()
-            .filter_map(|block| block.as_text())
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// Get all tool use blocks from the response
-    pub fn tool_uses(&self) -> Vec<(&str, &str, &Value)> {
-        self.content
-            .iter()
-            .filter_map(|block| block.as_tool_use())
-            .collect()
-    }
-
-    /// Check if the response contains tool use
-    pub fn has_tool_use(&self) -> bool {
-        self.content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-    }
-
-    /// Check if the model wants to stop
-    pub fn is_end_turn(&self) -> bool {
-        matches!(self.stop_reason, Some(StopReason::EndTurn))
-    }
-}
-
 /// Reason why the model stopped generating
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]

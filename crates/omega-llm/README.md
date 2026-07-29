@@ -2,9 +2,9 @@
 
 LLM provider abstraction with unified types and multiple backends.
 
-Provides the `LlmProvider` trait that abstracts over different LLM APIs, along
-with a shared type system (messages, content blocks, tool definitions, streaming
-events) modelled after the Anthropic Messages API format.
+Provides the `LlmProvider` trait that abstracts over different LLM streaming
+APIs, along with a shared type system (messages, content blocks, tool definitions,
+streaming events) modelled after the Anthropic Messages API format.
 
 ## Providers
 
@@ -14,10 +14,8 @@ events) modelled after the Anthropic Messages API format.
 
 ### Adding a new provider
 
-Implement `LlmProvider` and its three required methods:
-- `send_message` — simple text-in/text-out
-- `send_with_tools_and_system` — full non-streaming request
-- `stream_with_tools_and_system` — streaming request
+Implement `LlmProvider` and its required method:
+- `stream_with_tools_and_system` — streaming request with tools and system prompt
 
 The trait's internal types follow Anthropic's schema; providers with a different
 wire format handle translation internally.
