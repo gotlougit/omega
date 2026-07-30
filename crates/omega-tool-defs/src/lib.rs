@@ -149,87 +149,6 @@ tool!(edit, Proxy, "Edit",
     }
 );
 
-tool!(glob, Proxy, "Glob",
-    "Fast file pattern matching tool. Supports glob patterns like **/*.js or src/**/*.ts.",
-    {
-        "type": "object",
-        "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "The glob pattern to match files against"
-            },
-            "path": {
-                "type": "string",
-                "description": "The directory to search in. If not specified, uses the daemon's current working directory."
-            }
-        },
-        "required": ["pattern"]
-    }
-);
-
-tool!(grep, Proxy, "Grep",
-    "Search file contents using regex patterns. Uses ripgrep for fast searching.",
-    {
-        "type": "object",
-        "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "The regular expression pattern to search for in file contents"
-            },
-            "path": {
-                "type": "string",
-                "description": "File or directory to search in. Defaults to daemon's working directory."
-            },
-            "glob": {
-                "type": "string",
-                "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\")"
-            },
-            "output_mode": {
-                "type": "string",
-                "enum": ["content", "files_with_matches", "count"],
-                "description": "Output mode: 'content', 'files_with_matches' (default), or 'count'"
-            },
-            "-B": {
-                "type": "number",
-                "description": "Number of lines to show before each match"
-            },
-            "-A": {
-                "type": "number",
-                "description": "Number of lines to show after each match"
-            },
-            "-C": {
-                "type": "number",
-                "description": "Number of lines to show before and after each match"
-            },
-            "-n": {
-                "type": "boolean",
-                "description": "Show line numbers in output. Defaults to true."
-            },
-            "-i": {
-                "type": "boolean",
-                "description": "Case insensitive search"
-            },
-            "type": {
-                "type": "string",
-                "description": "File type to search (e.g. 'js', 'py', 'rust')"
-            },
-            "head_limit": {
-                "type": "number",
-                "description": "Limit output to first N lines/entries"
-            },
-            "offset": {
-                "type": "number",
-                "description": "Skip first N lines/entries"
-            },
-            "multiline": {
-                "type": "boolean",
-                "description": "Enable multiline mode where . matches newlines"
-            }
-        },
-        "required": ["pattern"]
-    }
-);
-
 // ============================================================================
 // In-process tools  –  executed by omega-loop directly
 // ============================================================================
@@ -333,8 +252,6 @@ pub const ALL: &[&LazyLock<ToolDef>] = &[
     &read::DEF,
     &write::DEF,
     &edit::DEF,
-    &glob::DEF,
-    &grep::DEF,
     &ask_user_question::DEF,
     &transfer::DEF,
 ];
@@ -426,8 +343,7 @@ mod tests {
     /// Proxy tools are those executed by omega-sh.
     #[test]
     fn test_proxy_tool_kinds() {
-        let proxies: std::collections::HashSet<&str> =
-            ["Bash", "Read", "Write", "Edit", "Glob", "Grep"].into();
+        let proxies: std::collections::HashSet<&str> = ["Bash", "Read", "Write", "Edit"].into();
         for &def in ALL {
             if proxies.contains(def.name) {
                 assert_eq!(
@@ -464,8 +380,6 @@ mod tests {
             "Read",
             "Write",
             "Edit",
-            "Glob",
-            "Grep",
             "AskUserQuestion",
             "Transfer",
         ]
@@ -482,7 +396,7 @@ mod tests {
     /// The ALL list has the expected count.
     #[test]
     fn test_all_count() {
-        assert_eq!(ALL.len(), 8);
+        assert_eq!(ALL.len(), 6);
     }
 
     /// Schema with required fields: every required property must also
@@ -509,19 +423,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Edge cases
     // -----------------------------------------------------------------------
-
-    /// Bash schema: the longest schema still parses correctly.
-    #[test]
-    fn test_grep_schema_parses() {
-        let v: serde_json::Value = serde_json::from_str(grep::DEF.input_schema_json).unwrap();
-        let props = v["properties"].as_object().unwrap();
-        // Grep has many properties — at least 10
-        assert!(
-            props.len() >= 10,
-            "Grep schema has {} properties",
-            props.len()
-        );
-    }
 
     /// AskUserQuestion schema: includes special characters (newlines, quotes).
     #[test]
@@ -558,20 +459,5 @@ mod tests {
         assert_eq!(props.len(), 1, "Transfer has {} properties", props.len());
         assert!(props.contains_key("file_path"));
         assert_eq!(v["required"][0].as_str(), Some("file_path"));
-    }
-
-    /// Proxy tools must have a non-empty description.
-    #[test]
-    fn test_proxy_descriptions_describe_delegation() {
-        for &def in ALL {
-            if def.kind == ToolKind::Proxy {
-                assert!(
-                    def.description.len() > 20,
-                    "Proxy tool '{}' has a very short description ({})",
-                    def.name,
-                    def.description.len()
-                );
-            }
-        }
     }
 }

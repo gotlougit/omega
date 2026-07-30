@@ -3,7 +3,7 @@
 //! This crate provides:
 //! - `Tool` trait — interface for implementing tools
 //! - `ToolRegistry` — registry for managing available tools
-//! - Built-in tool implementations (Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion, Transfer)
+//! - Built-in tool implementations (Bash, Read, Write, Edit, AskUserQuestion, Transfer)
 
 mod registry;
 mod tool;
@@ -15,9 +15,7 @@ pub use registry::ToolRegistry;
 pub use tool::Tool;
 
 // Re-export common tools for convenience
-pub use common::{
-    AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, TransferTool, WriteTool,
-};
+pub use common::{AskUserQuestionTool, BashTool, EditTool, ReadTool, TransferTool, WriteTool};
 
 #[cfg(test)]
 mod tests {

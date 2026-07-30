@@ -100,16 +100,6 @@ fn log_param(tool: &str, args: &Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        "Glob" => args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        "Grep" => args
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
         _ => String::new(),
     }
 }
@@ -407,176 +397,6 @@ mod tools {
         }
     }
 
-    /// Search files by glob pattern (sorted by mtime, newest first).
-    pub async fn glob(args: &Value) -> OmegaToolResult {
-        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-        if pattern.is_empty() {
-            return err("Missing required field: pattern");
-        }
-
-        let search_dir = args.get("path").and_then(|v| v.as_str());
-        let base_dir = std::env::current_dir()
-            .map(|d| d.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let base = search_dir.unwrap_or(&base_dir);
-
-        let full_pattern = if std::path::Path::new(pattern).is_absolute() {
-            pattern.to_string()
-        } else {
-            format!("{base}/{pattern}")
-        };
-
-        let mut entries: Vec<(String, std::time::SystemTime)> = match glob::glob(&full_pattern) {
-            Ok(glob_iter) => glob_iter
-                .filter_map(|entry| entry.ok())
-                .filter_map(|path| {
-                    let mtime = path.metadata().ok()?.modified().ok()?;
-                    let display = path.to_string_lossy().to_string();
-                    Some((display, mtime))
-                })
-                .collect(),
-            Err(e) => return err(format!("Invalid glob pattern: {e}")),
-        };
-
-        // Sort by mtime descending
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1));
-
-        if entries.is_empty() {
-            return ok_text(format!("No files found matching pattern: {pattern}"));
-        }
-
-        let mut result = format!("Found {} files matching '{pattern}':\n", entries.len());
-        for (path, _) in entries.iter().take(100) {
-            result.push_str(&format!("{path}\n"));
-        }
-        if entries.len() > 100 {
-            result.push_str(&format!("... and {} more\n", entries.len() - 100));
-        }
-        ok_text(result)
-    }
-
-    /// Search file contents with ripgrep.
-    pub async fn grep(args: &Value) -> OmegaToolResult {
-        let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-        if pattern.is_empty() {
-            return err("Missing required field: pattern");
-        }
-
-        let search_path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|d| d.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            });
-
-        let output_mode = args
-            .get("output_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("files_with_matches");
-        let glob_filter = args.get("glob").and_then(|v| v.as_str());
-        let before_ctx = args.get("-B").and_then(|v| v.as_u64());
-        let after_ctx = args.get("-A").and_then(|v| v.as_u64());
-        let ctx = args.get("-C").and_then(|v| v.as_u64());
-        let line_numbers = args.get("-n").and_then(|v| v.as_bool()).unwrap_or(true);
-        let case_insensitive = args.get("-i").and_then(|v| v.as_bool()).unwrap_or(false);
-        let file_type = args.get("type").and_then(|v| v.as_str());
-        let multiline = args
-            .get("multiline")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let head_limit = args
-            .get("head_limit")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let offset = args
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-
-        let mut cmd = Command::new("rg");
-        cmd.arg(pattern).arg(&search_path);
-
-        match output_mode {
-            "content" => {
-                if line_numbers {
-                    cmd.arg("-n");
-                }
-                if let Some(b) = before_ctx {
-                    cmd.arg("-B").arg(b.to_string());
-                }
-                if let Some(a) = after_ctx {
-                    cmd.arg("-A").arg(a.to_string());
-                }
-                if let Some(c) = ctx {
-                    cmd.arg("-C").arg(c.to_string());
-                }
-            }
-            "count" => {
-                cmd.arg("-c");
-            }
-            _ => {
-                // files_with_matches (default)
-                cmd.arg("-l");
-            }
-        }
-
-        if case_insensitive {
-            cmd.arg("-i");
-        }
-        if let Some(ft) = file_type {
-            cmd.arg("--type").arg(ft);
-        }
-        if let Some(g) = glob_filter {
-            cmd.arg("--glob").arg(g);
-        }
-        if multiline {
-            cmd.arg("-U").arg("--multiline-dotall");
-        }
-        cmd.arg("--color=never");
-
-        let output = match cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => return err(format!("Failed to run ripgrep: {e}")),
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if !output.status.success() && stdout.is_empty() {
-            if stderr.contains("No such file or directory") {
-                return ok_text(format!("Path not found: {search_path}"));
-            }
-            if output.status.code() == Some(1) {
-                // rg exit 1 = no matches
-                return ok_text(format!("No matches found for pattern: {pattern}"));
-            }
-            return ok_text(format!("Search error: {stderr}"));
-        }
-
-        let mut lines: Vec<&str> = stdout.lines().collect();
-
-        if let Some(off) = offset {
-            if off < lines.len() {
-                lines = lines[off..].to_vec();
-            } else {
-                lines.clear();
-            }
-        }
-        if let Some(lim) = head_limit {
-            lines.truncate(lim);
-        }
-
-        ok_text(lines.join("\n"))
-    }
-
     // -- helpers -----------------------------------------------------------
 
     fn ok_text(t: impl Into<String>) -> OmegaToolResult {
@@ -673,8 +493,6 @@ async fn handle_connection(stream: UnixStream) {
             "Read" => tools::read(&request.args).await,
             "Write" => tools::write(&request.args).await,
             "Edit" => tools::edit(&request.args).await,
-            "Glob" => tools::glob(&request.args).await,
-            "Grep" => tools::grep(&request.args).await,
             other => OmegaToolResult {
                 content: OmegaContent::Text {
                     data: format!("Unknown tool: {other}"),

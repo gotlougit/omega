@@ -128,8 +128,7 @@ async fn execute(
             let content = args.get(1..).map(|s| s.join(" ")).unwrap_or_default();
             json!({ "file_path": path, "content": content })
         }
-        "Glob" => json!({ "pattern": args.first().map(|s| s.as_str()).unwrap_or("") }),
-        "Grep" => json!({ "pattern": args.first().map(|s| s.as_str()).unwrap_or("") }),
+
         _ => json!({ "command": args.join(" ") }), // fallback to bash
     };
     client.execute(tool, input).await

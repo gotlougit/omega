@@ -599,12 +599,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
-
-[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,7 +1140,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
- "glob",
  "serde",
  "serde_json",
  "tokio",
@@ -1185,7 +1178,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "glob",
  "omega-core",
  "omega-llm",
  "omega-tool-defs",

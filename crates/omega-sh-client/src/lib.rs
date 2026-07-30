@@ -294,7 +294,7 @@ mod tests {
         let client = OmegaClient::with_socket("/tmp/nonexistent-test-socket.sock");
         register_proxy_tools(&mut registry, client);
 
-        for proxy_name in &["Bash", "Read", "Write", "Edit", "Glob", "Grep"] {
+        for proxy_name in &["Bash", "Read", "Write", "Edit"] {
             assert!(
                 registry.get(proxy_name).is_some(),
                 "{} should be registered as a proxy tool",
