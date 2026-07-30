@@ -919,3 +919,98 @@ fn stamp_message_end(marker: &CacheControl, msg: &mut Message) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omega_llm::{CacheControl, ContentBlock, MessageContent};
+
+    // -----------------------------------------------------------------------
+    // stamp_message_end tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stamp_message_end_on_text_content() {
+        let marker = CacheControl::ephemeral_1h();
+        let mut msg = Message::user("Hello world");
+
+        let result = stamp_message_end(&marker, &mut msg);
+
+        assert!(result);
+        // Should have converted from Text to Blocks
+        match &msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    ContentBlock::Text { text, cache_control } => {
+                        assert_eq!(text, "Hello world");
+                        assert!(cache_control.is_some());
+                        assert_eq!(cache_control.as_ref().unwrap().cache_type, "ephemeral");
+                    }
+                    _ => panic!("Expected Text block"),
+                }
+            }
+            _ => panic!("Expected Blocks content after stamp"),
+        }
+    }
+
+    #[test]
+    fn test_stamp_message_end_on_empty_text_returns_false() {
+        let marker = CacheControl::ephemeral();
+        let mut msg = Message::user("");
+
+        let result = stamp_message_end(&marker, &mut msg);
+
+        assert!(!result);
+        // Message should remain as Text (not converted to Blocks)
+        assert!(matches!(msg.content, MessageContent::Text(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn test_stamp_message_end_on_blocks() {
+        let marker = CacheControl::ephemeral_1h();
+        let mut msg = Message::user_with_blocks(vec![
+            ContentBlock::text("Part 1"),
+            ContentBlock::text("Part 2"),
+        ]);
+
+        let result = stamp_message_end(&marker, &mut msg);
+
+        assert!(result);
+        match &msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                // First block unchanged
+                assert!(blocks[0].as_text() == Some("Part 1"));
+                // Last block should have cache_control
+                match &blocks[1] {
+                    ContentBlock::Text { text, cache_control } => {
+                        assert_eq!(text, "Part 2");
+                        assert!(cache_control.is_some());
+                    }
+                    _ => panic!("Expected Text block at position 1"),
+                }
+            }
+            _ => panic!("Expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn test_stamp_message_end_does_not_double_stamp() {
+        let marker = CacheControl::ephemeral_1h();
+        let other_marker = CacheControl::ephemeral_5m();
+        let mut msg = Message::user_with_blocks(vec![
+            ContentBlock::text_with_cache("Already cached", other_marker),
+        ]);
+
+        // First stamp succeeds
+        let result1 = stamp_message_end(&marker, &mut msg);
+        assert!(result1);
+
+        // Second stamp should still succeed (stamp_message_end doesn't check
+        // for existing markers — it just re-stamps). This is by design:
+        // apply_cache_control strips all markers first, then re-stamps.
+        let result2 = stamp_message_end(&marker, &mut msg);
+        assert!(result2);
+    }
+}

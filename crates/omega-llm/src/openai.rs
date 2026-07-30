@@ -848,3 +848,381 @@ fn derive_models_url(chat_url: &str) -> String {
     let trimmed = chat_url.trim_end_matches('/');
     format!("{}/models", trimmed)
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::CustomTool;
+    use crate::{CacheControl, SystemBlock, ToolInputSchema};
+
+    // -----------------------------------------------------------------------
+    // Unit tests: OpenAIUsage deserialization (prompt_tokens_details)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_usage_with_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "total_tokens": 1200,
+            "prompt_tokens_details": {
+                "cached_tokens": 800,
+                "audio_tokens": 0
+            }
+        }"#;
+        let usage: OpenAIUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.completion_tokens, 200);
+        assert_eq!(usage.total_tokens, 1200);
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, 800);
+    }
+
+    #[test]
+    fn test_parse_usage_without_cached_tokens() {
+        // First request: no cache hit, cached_tokens is 0 or absent
+        let json = r#"{
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "total_tokens": 1200
+        }"#;
+        let usage: OpenAIUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert!(usage.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn test_parse_usage_with_zero_cached_tokens() {
+        // cached_tokens present but zero (first fill, no hit yet)
+        let json = r#"{
+            "prompt_tokens": 500,
+            "completion_tokens": 100,
+            "total_tokens": 600,
+            "prompt_tokens_details": {
+                "cached_tokens": 0
+            }
+        }"#;
+        let usage: OpenAIUsage = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, 0);
+    }
+
+    #[test]
+    fn test_parse_usage_cached_tokens_missing_field_defaults_to_zero() {
+        // prompt_tokens_details present but cached_tokens field absent
+        let json = r#"{
+            "prompt_tokens": 500,
+            "completion_tokens": 100,
+            "total_tokens": 600,
+            "prompt_tokens_details": {
+                "audio_tokens": 5
+            }
+        }"#;
+        let usage: OpenAIUsage = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        // #[serde(default)] means cached_tokens = 0
+        assert_eq!(details.cached_tokens, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: Streaming chunk parsing with and without usage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_stream_chunk_first_chunk_with_role_no_usage() {
+        // First SSE chunk: has role but NO usage (typical OpenAI streaming)
+        let json = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": null
+            }]
+        }"#;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(json).unwrap();
+        assert!(chunk.usage.is_none(), "first chunk should have no usage");
+        assert_eq!(chunk.choices[0].delta.role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn test_parse_stream_chunk_last_chunk_with_usage_and_finish_reason() {
+        // Last SSE chunk: has usage AND finish_reason but NO role
+        // This is where cached_tokens lives in real OpenAI streaming
+        let json = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion.chunk",
+            "created": 1700000001,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "total_tokens": 1200,
+                "prompt_tokens_details": {
+                    "cached_tokens": 750
+                }
+            }
+        }"#;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.completion_tokens, 200);
+        let details = usage.prompt_tokens_details.as_ref().unwrap();
+        assert_eq!(details.cached_tokens, 750);
+        let finish_reason = chunk.choices[0].finish_reason.as_deref().unwrap();
+        assert_eq!(finish_reason, "stop");
+    }
+
+    #[test]
+    fn test_parse_stream_chunk_with_role_and_usage() {
+        // Some providers send usage in the first chunk alongside role
+        // (e.g. Anthropic-style streaming, some gateways)
+        let json = r#"{
+            "id": "chatcmpl-456",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "claude-opus-4",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": null
+            }],
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 0,
+                "total_tokens": 2000,
+                "prompt_tokens_details": {
+                    "cached_tokens": 1800
+                }
+            }
+        }"#;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 2000);
+        let details = usage.prompt_tokens_details.as_ref().unwrap();
+        assert_eq!(details.cached_tokens, 1800);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: Converting messages to OpenAI format — cache_control handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_convert_messages_to_openai_text_block_strips_cache_control() {
+        // BUG: cache_control on ContentBlock::Text is silently discarded
+        // when converting to OpenAI wire format.
+        // The OpenAIMessage wire types only support string content,
+        // not content blocks with metadata like cache_control.
+        let cc = CacheControl::ephemeral_1h();
+        let msg = Message {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "Hello".to_string(),
+                cache_control: Some(cc),
+            }]),
+        };
+        let messages = vec![msg];
+        let system = Some(SystemPrompt::Text("You are helpful.".to_string()));
+
+        let openai_messages = convert_messages_to_openai(&messages, &system);
+
+        // Two messages: system + user
+        assert_eq!(openai_messages.len(), 2);
+        match &openai_messages[1] {
+            OpenAIMessage::User { content, .. } => {
+                assert_eq!(content, "Hello");
+                // The content is just the text string — cache_control is gone.
+                // This is the core bug: the API never receives cache_control.
+            }
+            _ => panic!("Expected User message"),
+        }
+    }
+
+    #[test]
+    fn test_convert_system_blocks_to_openai_strips_cache_control() {
+        // BUG: SystemPrompt::Blocks with cache_control is flattened to a
+        // plain string, losing cache_control annotations.
+        let cc = CacheControl::ephemeral_1h();
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "You are a caching-aware assistant.".to_string(),
+            cache_control: Some(cc),
+        }]));
+        let messages: Vec<Message> = vec![];
+
+        let openai_messages = convert_messages_to_openai(&messages, &system);
+
+        assert_eq!(openai_messages.len(), 1);
+        match &openai_messages[0] {
+            OpenAIMessage::System { content, .. } => {
+                assert_eq!(content, "You are a caching-aware assistant.");
+                // cache_control on SystemBlock is silently dropped
+            }
+            _ => panic!("Expected System message"),
+        }
+    }
+
+    #[test]
+    fn test_convert_tools_to_openai_strips_cache_control() {
+        // BUG: ToolDefinition::Custom with cache_control loses it during conversion
+        let cc = CacheControl::ephemeral_1h();
+        let tool = ToolDefinition::Custom(CustomTool {
+            name: "read".to_string(),
+            description: Some("Read a file".to_string()),
+            input_schema: ToolInputSchema::new(),
+            tool_type: None,
+            cache_control: Some(cc),
+        });
+        let tools = vec![tool];
+
+        let openai_tools = convert_tools_to_openai(&tools);
+
+        assert_eq!(openai_tools.len(), 1);
+        // OpenAITool has no cache_control field — it's been discarded.
+        // Verify the resulting JSON also doesn't contain cache_control:
+        let json = serde_json::to_value(&openai_tools[0]).unwrap();
+        assert!(
+            !json.to_string().contains("cache_control"),
+            "BUG: OpenAITool serialization should not contain cache_control"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: OpenAIRequest serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_serializes_prompt_cache_fields() {
+        let request = OpenAIRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAIMessage::User {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: Some(4096),
+            stream: None,
+            prompt_cache_key: Some("session-abc".to_string()),
+            prompt_cache_retention: Some("24h".to_string()),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["prompt_cache_key"], "session-abc");
+        assert_eq!(json["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn test_request_omits_prompt_cache_fields_when_none() {
+        let request = OpenAIRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAIMessage::User {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("prompt_cache_key").is_none());
+        assert!(json.get("prompt_cache_retention").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: Usage construction from OpenAIUsage (regression test)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_usage_from_openai_with_cached_tokens() {
+        let openai_usage = OpenAIUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            total_tokens: 1200,
+            prompt_tokens_details: Some(OpenAIPromptTokensDetails {
+                cached_tokens: 800,
+            }),
+        };
+
+        // Mimic the Usage construction in send_streaming_request
+        let usage = Usage {
+            input_tokens: openai_usage.prompt_tokens,
+            output_tokens: openai_usage.completion_tokens,
+            cache_creation_input_tokens: None, // BUG: always None for OpenAI
+            cache_read_input_tokens: openai_usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            thoughts_token_count: None,
+        };
+
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, Some(800));
+        // BUG: cache_creation_input_tokens is always None for OpenAI provider
+        assert!(usage.cache_creation_input_tokens.is_none());
+    }
+
+    #[test]
+    fn test_usage_from_openai_without_cached_tokens() {
+        let openai_usage = OpenAIUsage {
+            prompt_tokens: 500,
+            completion_tokens: 100,
+            total_tokens: 600,
+            prompt_tokens_details: None,
+        };
+
+        let usage = Usage {
+            input_tokens: openai_usage.prompt_tokens,
+            output_tokens: openai_usage.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: openai_usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            thoughts_token_count: None,
+        };
+
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.cache_read_input_tokens, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: derive_models_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_models_url_standard() {
+        let url = derive_models_url("https://api.openai.com/v1/chat/completions");
+        assert_eq!(url, "https://api.openai.com/v1/models");
+    }
+
+    #[test]
+    fn test_derive_models_url_custom_proxy() {
+        let url = derive_models_url("https://my-proxy.com/v1/chat/completions");
+        assert_eq!(url, "https://my-proxy.com/v1/models");
+    }
+
+    #[test]
+    fn test_derive_models_url_no_trailing_path() {
+        let url = derive_models_url("https://api.openai.com/v1");
+        assert_eq!(url, "https://api.openai.com/v1/models");
+    }
+}

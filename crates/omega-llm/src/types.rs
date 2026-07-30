@@ -929,6 +929,205 @@ impl RawStreamEvent {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // CacheControl tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cache_control_ephemeral_serialization() {
+        let cc = CacheControl::ephemeral();
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json["type"], "ephemeral");
+        // No ttl → should NOT be serialized
+        assert!(json.get("ttl").is_none());
+    }
+
+    #[test]
+    fn test_cache_control_ephemeral_5m() {
+        let cc = CacheControl::ephemeral_5m();
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json["type"], "ephemeral");
+        assert_eq!(json["ttl"], "5m");
+    }
+
+    #[test]
+    fn test_cache_control_ephemeral_1h() {
+        let cc = CacheControl::ephemeral_1h();
+        let json = serde_json::to_value(&cc).unwrap();
+        assert_eq!(json["type"], "ephemeral");
+        assert_eq!(json["ttl"], "1h");
+    }
+
+    #[test]
+    fn test_cache_control_deserialization() {
+        let json = r#"{"type": "ephemeral", "ttl": "1h"}"#;
+        let cc: CacheControl = serde_json::from_str(json).unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+        assert_eq!(cc.ttl, Some("1h".to_string()));
+    }
+
+    #[test]
+    fn test_cache_control_deserialization_without_ttl() {
+        let json = r#"{"type": "ephemeral"}"#;
+        let cc: CacheControl = serde_json::from_str(json).unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+        assert!(cc.ttl.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemBlock with cache_control
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_block_with_cache_control_serialization() {
+        let block = SystemBlock::new("You are helpful.")
+            .with_cache_control(CacheControl::ephemeral_1h());
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "You are helpful.");
+        let cc = &json["cache_control"];
+        assert_eq!(cc["type"], "ephemeral");
+        assert_eq!(cc["ttl"], "1h");
+    }
+
+    #[test]
+    fn test_system_block_without_cache_control_omits_field() {
+        let block = SystemBlock::new("You are helpful.");
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(json.get("cache_control").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ContentBlock with cache_control
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_text_block_with_cache_control_serialization() {
+        let block = ContentBlock::text_with_cache("Hello", CacheControl::ephemeral_1h());
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "Hello");
+        let cc = &json["cache_control"];
+        assert_eq!(cc["type"], "ephemeral");
+        assert_eq!(cc["ttl"], "1h");
+    }
+
+    #[test]
+    fn test_tool_result_with_cache_control_serialization() {
+        let block = ContentBlock::tool_result_with_cache(
+            "toolu_123",
+            "output text",
+            false,
+            CacheControl::ephemeral(),
+        );
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "tool_result");
+        assert_eq!(json["tool_use_id"], "toolu_123");
+        assert_eq!(json["content"], "output text");
+        let cc = &json["cache_control"];
+        assert_eq!(cc["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_text_block_without_cache_control_omits_field() {
+        let block = ContentBlock::text("Hello");
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(json.get("cache_control").is_none());
+    }
+
+    #[test]
+    fn test_with_cache_control_on_text_block() {
+        let block = ContentBlock::text("Hello")
+            .with_cache_control(CacheControl::ephemeral_1h());
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(json.get("cache_control").is_some());
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_with_cache_control_on_tool_result_block() {
+        let block = ContentBlock::tool_result("id1", "result", false)
+            .with_cache_control(CacheControl::ephemeral());
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(json.get("cache_control").is_some());
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_with_cache_control_is_noop_on_tool_use() {
+        // ToolUse blocks don't support cache_control
+        let block = ContentBlock::tool_use("id1", "read", serde_json::json!({"path": "/tmp"}))
+            .with_cache_control(CacheControl::ephemeral_1h());
+        let json = serde_json::to_value(&block).unwrap();
+        assert!(
+            json.get("cache_control").is_none(),
+            "ToolUse should not have cache_control"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ToolDefinition with cache_control
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tool_definition_with_cache_control_serialization() {
+        let tool = ToolDefinition::Custom(CustomTool {
+            name: "read".to_string(),
+            description: Some("Read a file".to_string()),
+            input_schema: ToolInputSchema::new(),
+            tool_type: None,
+            cache_control: Some(CacheControl::ephemeral_1h()),
+        });
+        let json = serde_json::to_value(&tool).unwrap();
+        // ToolDefinition is externally tagged: {"Custom": {...}}
+        let custom = &json["Custom"];
+        let cc = &custom["cache_control"];
+        assert_eq!(cc["type"], "ephemeral");
+        assert_eq!(cc["ttl"], "1h");
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage struct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_usage_serialization_with_cache() {
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(800),
+            thoughts_token_count: None,
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["input_tokens"], 1000);
+        assert_eq!(json["output_tokens"], 200);
+        assert_eq!(json["cache_creation_input_tokens"], 0);
+        assert_eq!(json["cache_read_input_tokens"], 800);
+        assert!(json.get("thoughts_token_count").is_none());
+    }
+
+    #[test]
+    fn test_usage_serialization_without_cache() {
+        let usage = Usage {
+            input_tokens: 500,
+            output_tokens: 100,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            thoughts_token_count: None,
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        // These fields have #[serde(default)] so None serializes as null, not omitted
+        assert_eq!(json["cache_creation_input_tokens"], serde_json::Value::Null);
+        assert_eq!(json["cache_read_input_tokens"], serde_json::Value::Null);
+        // thoughts_token_count has skip_serializing_if, so it IS omitted
+        assert!(json.get("thoughts_token_count").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Original tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_message_serialization() {
         let msg = Message::user("Hello");
