@@ -112,22 +112,6 @@ impl Debugger {
         })
     }
 
-    #[allow(dead_code)]
-    /// Create a disabled debugger (no-op for all operations)
-    pub fn disabled() -> Self {
-        Self {
-            dir: PathBuf::new(),
-            sequence: AtomicU64::new(0),
-            enabled: false,
-        }
-    }
-
-    #[allow(dead_code)]
-    /// Check if debugging is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// Get the debug directory path
     pub fn dir(&self) -> &Path {
         &self.dir

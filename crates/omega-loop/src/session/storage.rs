@@ -1,11 +1,10 @@
 //! Session storage helpers
-#![allow(dead_code)]
 //!
 //! Handles reading and writing session data to disk.
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use omega_core::core::error::FrameworkError;
 use omega_core::core::FrameworkResult;
@@ -260,11 +259,6 @@ impl SessionStorage {
             fs::remove_dir_all(&dir)?;
         }
         Ok(())
-    }
-
-    /// Get the base directory
-    pub fn base_dir(&self) -> &Path {
-        &self.base_dir
     }
 }
 

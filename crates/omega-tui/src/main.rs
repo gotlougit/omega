@@ -914,7 +914,7 @@ fn run_loop(
                     handle.set_buffer(String::new(), 0);
                 }
             }
-            AppEvent::Term(Event::Resize { width, height }) => {
+            AppEvent::Term(Event::Resize { width, height: _ }) => {
                 // Refresh the status line (e.g. cache bar) at the new width.
                 // Use the resize event's width directly since the Term's internal
                 // SharedState may not have been updated yet (this event arrives

@@ -1,5 +1,4 @@
 //! Session metadata types
-#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -123,18 +122,6 @@ impl SessionMetadata {
     /// Update the updated_at timestamp
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
-    }
-
-    /// Set the model
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = model.into();
-        self
-    }
-
-    /// Set the provider
-    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
-        self.provider = provider.into();
-        self
     }
 
     /// Add a child session ID

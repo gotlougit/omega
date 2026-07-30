@@ -108,6 +108,7 @@ struct SimChunk {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct SimChoice {
     delta: SimDelta,
     #[serde(default)]
@@ -115,6 +116,7 @@ struct SimChoice {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 struct SimDelta {
     #[serde(default)]
     role: Option<String>,

@@ -63,9 +63,6 @@ struct ClientRequest {
 
 #[derive(Deserialize, Default)]
 struct SessionConfig {
-    #[allow(dead_code)]
-    #[serde(default)]
-    stream: bool,
     #[serde(default)]
     think: bool,
     #[serde(default)]
