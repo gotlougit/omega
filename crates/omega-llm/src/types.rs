@@ -837,11 +837,26 @@ pub struct MessageDeltaData {
     pub stop_sequence: Option<String>,
 }
 
-/// Usage in delta events (may only have output_tokens)
+/// Usage in delta events
+///
+/// In standard streaming (e.g. Anthropic) only `output_tokens` is sent in
+/// `message_delta` while input/cache stats arrive in `message_start`.
+/// For providers that send full usage in a late chunk (OpenAI), the
+/// optional fields carry the complete picture so the consumer can prefer
+/// them over the `message_start` values.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeltaUsage {
     /// Output tokens (cumulative)
     pub output_tokens: u32,
+    /// Input tokens (optional – set by providers that send full usage late)
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    /// Cache creation tokens (optional)
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Cache read tokens (optional)
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Error in stream
@@ -1172,5 +1187,32 @@ mod tests {
             }
             _ => panic!("Expected ContentBlockDelta"),
         }
+    }
+
+    #[test]
+    fn test_delta_usage_with_full_usage_fields() {
+        // DeltaUsage now carries optional full usage fields (Bug B fix)
+        let json = r#"{
+            "output_tokens": 200,
+            "input_tokens": 1000,
+            "cache_read_input_tokens": 750,
+            "cache_creation_input_tokens": null
+        }"#;
+        let usage: DeltaUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.input_tokens, Some(1000));
+        assert_eq!(usage.cache_read_input_tokens, Some(750));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn test_delta_usage_backward_compatible() {
+        // Old format (only output_tokens) still deserializes correctly
+        let json = r#"{"output_tokens": 42}"#;
+        let usage: DeltaUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
     }
 }

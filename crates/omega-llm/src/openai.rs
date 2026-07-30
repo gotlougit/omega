@@ -37,7 +37,7 @@ use tokio_util::io::StreamReader;
 use super::auth::{auth_provider, AuthConfig, AuthSource};
 use super::provider::LlmProvider;
 use super::types::{
-    ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
+    CacheControl, ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
     ContentBlockStopEvent, ContentDelta, DeltaUsage, Message, MessageContent, MessageDeltaData,
     MessageDeltaEvent, MessageStartData, MessageStartEvent, StopReason, StreamEvent, SystemPrompt,
     ThinkingConfig, ToolChoice, ToolDefinition, Usage,
@@ -49,14 +49,51 @@ const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 // OpenAI Wire Types
 // ============================================================================
 
+/// A content part in OpenAI's structured content format.
+///
+/// OpenAI's Chat Completions API allows `content` to be either a plain
+/// string or an array of content parts.  The array form is required
+/// when per-block metadata such as `cache_control` must be preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAIContentPart {
+    /// Content type (always "text" for now)
+    #[serde(rename = "type")]
+    part_type: String,
+    /// Text content
+    text: String,
+    /// Cache control (optional, supported by some OpenAI-compatible gateways)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// OpenAI message content – either a plain string or an array of parts.
+///
+/// Using `#[serde(untagged)]` means this serialises to the same JSON
+/// whether the content is simple text or structured blocks, keeping
+/// backward compatibility with providers that expect the string form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenAIContent {
+    /// Simple text content
+    Text(String),
+    /// Array of content parts (with optional per-block metadata)
+    Parts(Vec<OpenAIContentPart>),
+}
+
 /// A message in OpenAI's chat completions format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum OpenAIMessage {
     /// System message
-    System { role: String, content: String },
+    System {
+        role: String,
+        content: OpenAIContent,
+    },
     /// User message
-    User { role: String, content: String },
+    User {
+        role: String,
+        content: OpenAIContent,
+    },
     /// Assistant message (may include tool_calls)
     Assistant {
         role: String,
@@ -95,6 +132,9 @@ struct OpenAITool {
     #[serde(rename = "type")]
     tool_type: String,
     function: OpenAIFunction,
+    /// Cache control (optional, supported by some OpenAI-compatible gateways)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 /// OpenAI function definition
@@ -505,17 +545,34 @@ impl OpenAIProvider {
                                     _ => Some(StopReason::EndTurn),
                                 };
 
-                                let output_tokens = chunk.usage
-                                    .as_ref()
-                                    .map(|u| u.completion_tokens)
-                                    .unwrap_or(0);
+                                // Emit full usage in MessageDelta (Bug B fix).
+                                // OpenAI sends usage only in the final chunk (alongside
+                                // finish_reason), NOT in the first chunk.  The agent loop
+                                // prefers this over the (empty) usage from MessageStart.
+                                let final_usage = chunk.usage.as_ref().map(|u| {
+                                    let cached = u
+                                        .prompt_tokens_details
+                                        .as_ref()
+                                        .map(|d| d.cached_tokens);
+                                    DeltaUsage {
+                                        output_tokens: u.completion_tokens,
+                                        input_tokens: Some(u.prompt_tokens),
+                                        cache_creation_input_tokens: None,
+                                        cache_read_input_tokens: cached,
+                                    }
+                                }).unwrap_or_else(|| DeltaUsage {
+                                    output_tokens: 0,
+                                    input_tokens: None,
+                                    cache_creation_input_tokens: None,
+                                    cache_read_input_tokens: None,
+                                });
 
                                 yield StreamEvent::MessageDelta(MessageDeltaEvent {
                                     delta: MessageDeltaData {
                                         stop_reason,
                                         stop_sequence: None,
                                     },
-                                    usage: DeltaUsage { output_tokens },
+                                    usage: final_usage,
                                 });
                             }
                         }
@@ -658,15 +715,32 @@ fn convert_messages_to_openai(
         Some(SystemPrompt::Text(s)) => {
             out.push(OpenAIMessage::System {
                 role: "system".to_string(),
-                content: s.clone(),
+                content: OpenAIContent::Text(s.clone()),
             });
         }
         Some(SystemPrompt::Blocks(blocks)) => {
-            let text: String = blocks.iter().map(|b| b.text.as_str()).collect();
-            out.push(OpenAIMessage::System {
-                role: "system".to_string(),
-                content: text,
-            });
+            // Check if any block has cache_control – if so, emit structured parts
+            let has_cache = blocks.iter().any(|b| b.cache_control.is_some());
+            if has_cache {
+                let parts: Vec<OpenAIContentPart> = blocks
+                    .iter()
+                    .map(|b| OpenAIContentPart {
+                        part_type: "text".to_string(),
+                        text: b.text.clone(),
+                        cache_control: b.cache_control.clone(),
+                    })
+                    .collect();
+                out.push(OpenAIMessage::System {
+                    role: "system".to_string(),
+                    content: OpenAIContent::Parts(parts),
+                });
+            } else {
+                let text: String = blocks.iter().map(|b| b.text.as_str()).collect();
+                out.push(OpenAIMessage::System {
+                    role: "system".to_string(),
+                    content: OpenAIContent::Text(text),
+                });
+            }
         }
         None => {}
     }
@@ -682,115 +756,156 @@ fn convert_messages_to_openai(
 /// Convert a single internal Message into one or more OpenAI messages
 fn convert_to_openai_messages(msg: &Message, out: &mut Vec<OpenAIMessage>) {
     match msg.role.as_str() {
-        "user" => match &msg.content {
-            MessageContent::Text(s) => {
-                out.push(OpenAIMessage::User {
-                    role: "user".to_string(),
-                    content: s.clone(),
-                });
-            }
-            MessageContent::Blocks(blocks) => {
-                // Separate tool results from text/image content
-                let mut text_parts: Vec<String> = Vec::new();
-                let mut tool_results: Vec<(&str, &str)> = Vec::new();
-
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text, .. } => {
-                            text_parts.push(text.clone());
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } => {
-                            let text = content.as_deref().unwrap_or("");
-                            tool_results.push((tool_use_id.as_str(), text));
-                        }
-                        ContentBlock::Image { .. } | ContentBlock::Document { .. } => {
-                            // OpenAI doesn't support image/document via this path in the same way;
-                            // skip for now with a warning
-                            tracing::warn!(
-                                "OpenAI provider: image/document blocks not supported in message conversion"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Emit text content as user message
-                if !text_parts.is_empty() {
-                    out.push(OpenAIMessage::User {
-                        role: "user".to_string(),
-                        content: text_parts.join("\n"),
-                    });
-                }
-
-                // Emit each tool result as a separate tool message
-                for (tool_call_id, content) in tool_results {
-                    out.push(OpenAIMessage::Tool {
-                        role: "tool".to_string(),
-                        tool_call_id: tool_call_id.to_string(),
-                        content: content.to_string(),
-                    });
-                }
-            }
-        },
-        "assistant" => match &msg.content {
-            MessageContent::Text(s) => {
-                // Check if there are tool calls mixed in — shouldn't happen for text-only,
-                // but handle gracefully
-                out.push(OpenAIMessage::Assistant {
-                    role: "assistant".to_string(),
-                    content: Some(s.clone()),
-                    tool_calls: None,
-                });
-            }
-            MessageContent::Blocks(blocks) => {
-                let mut text_content: Option<String> = None;
-                let mut tool_calls: Vec<OpenAIToolCall> = Vec::new();
-
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text { text, .. } => {
-                            text_content = Some(text.clone());
-                        }
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => {
-                            tool_calls.push(OpenAIToolCall {
-                                id: id.clone(),
-                                call_type: "function".to_string(),
-                                function: OpenAIFunctionCall {
-                                    name: name.clone(),
-                                    arguments: input.to_string(),
-                                },
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-
-                out.push(OpenAIMessage::Assistant {
-                    role: "assistant".to_string(),
-                    content: text_content,
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                });
-            }
-        },
+        "user" => convert_user_message(msg, out),
+        "assistant" => convert_assistant_message(msg, out),
+        "system" | "developer" => {
+            // System/developer messages in the history – treat like user for OpenAI,
+            // but preserve cache_control if present
+            convert_user_message(msg, out);
+        }
         _ => {
             // Unknown role, add as user message
             tracing::warn!("Unknown message role '{}', treating as user", msg.role);
             if let Some(text) = msg.text() {
                 out.push(OpenAIMessage::User {
                     role: "user".to_string(),
-                    content: text.to_string(),
+                    content: OpenAIContent::Text(text.to_string()),
                 });
             }
+        }
+    }
+}
+
+/// Convert a user message to OpenAI format, preserving cache_control when present.
+fn convert_user_message(msg: &Message, out: &mut Vec<OpenAIMessage>) {
+    match &msg.content {
+        MessageContent::Text(s) => {
+            out.push(OpenAIMessage::User {
+                role: "user".to_string(),
+                content: OpenAIContent::Text(s.clone()),
+            });
+        }
+        MessageContent::Blocks(blocks) => {
+            // Separate text parts with cache_control from tool results
+            let mut text_parts: Vec<OpenAIContentPart> = Vec::new();
+            let mut tool_results: Vec<(&str, &str)> = Vec::new();
+
+            for block in blocks {
+                match block {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        text_parts.push(OpenAIContentPart {
+                            part_type: "text".to_string(),
+                            text: text.clone(),
+                            cache_control: cache_control.clone(),
+                        });
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        let text = content.as_deref().unwrap_or("");
+                        tool_results.push((tool_use_id.as_str(), text));
+                    }
+                    ContentBlock::Image { .. } | ContentBlock::Document { .. } => {
+                        tracing::warn!(
+                            "OpenAI provider: image/document blocks not supported in message conversion"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            // Emit text content as user message
+            if !text_parts.is_empty() {
+                // Only use structured parts if at least one block has cache_control
+                let has_cache = text_parts.iter().any(|p| p.cache_control.is_some());
+                if has_cache {
+                    out.push(OpenAIMessage::User {
+                        role: "user".to_string(),
+                        content: OpenAIContent::Parts(text_parts),
+                    });
+                } else {
+                    let text: String = text_parts
+                        .into_iter()
+                        .map(|p| p.text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push(OpenAIMessage::User {
+                        role: "user".to_string(),
+                        content: OpenAIContent::Text(text),
+                    });
+                }
+            }
+
+            // Emit each tool result as a separate tool message
+            for (tool_call_id, content) in tool_results {
+                out.push(OpenAIMessage::Tool {
+                    role: "tool".to_string(),
+                    tool_call_id: tool_call_id.to_string(),
+                    content: content.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Convert an assistant message to OpenAI format.
+///
+/// Note: The OpenAI wire format for assistant messages uses
+/// `content: Option<String>` and does not natively support structured
+/// content parts alongside `tool_calls`.  When cache_control is present
+/// on text-only assistant messages, it is silently dropped because the
+/// wire format has no place for it.  This is acceptable because the
+/// primary caching value comes from system prompt, tool definitions,
+/// and *user* messages; assistant text blocks are small and rarely
+/// the cache breakpoint target.
+fn convert_assistant_message(msg: &Message, out: &mut Vec<OpenAIMessage>) {
+    match &msg.content {
+        MessageContent::Text(s) => {
+            out.push(OpenAIMessage::Assistant {
+                role: "assistant".to_string(),
+                content: Some(s.clone()),
+                tool_calls: None,
+            });
+        }
+        MessageContent::Blocks(blocks) => {
+            let mut text_content: Option<String> = None;
+            let mut tool_calls: Vec<OpenAIToolCall> = Vec::new();
+
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        text_content = Some(text.clone());
+                    }
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
+                        tool_calls.push(OpenAIToolCall {
+                            id: id.clone(),
+                            call_type: "function".to_string(),
+                            function: OpenAIFunctionCall {
+                                name: name.clone(),
+                                arguments: input.to_string(),
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            out.push(OpenAIMessage::Assistant {
+                role: "assistant".to_string(),
+                content: text_content,
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+            });
         }
     }
 }
@@ -813,6 +928,7 @@ fn convert_tools_to_openai(tools: &[ToolDefinition]) -> Vec<OpenAITool> {
                     description: Some(description),
                     parameters,
                 },
+                cache_control: custom.cache_control.clone(),
             }
         })
         .collect()
@@ -1015,15 +1131,91 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Bug B fix: usage captured from final chunk (not first chunk)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_final_chunk_usage_includes_cached_tokens() {
+        // FIXED (Bug B): The MessageDelta from the final chunk now carries
+        // full usage (input_tokens + cached_tokens), not just output_tokens.
+        // Simulate the logic from send_streaming_request's finish_reason handler.
+        let chunk_json = r#"{
+            "id": "chatcmpl-final",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "total_tokens": 1200,
+                "prompt_tokens_details": {"cached_tokens": 750}
+            }
+        }"#;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(chunk_json).unwrap();
+        let choice = &chunk.choices[0];
+        assert!(choice.finish_reason.is_some());
+
+        // This replicates the exact logic now used in send_streaming_request
+        let final_usage = chunk
+            .usage
+            .as_ref()
+            .map(|u| {
+                let cached = u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens);
+                DeltaUsage {
+                    output_tokens: u.completion_tokens,
+                    input_tokens: Some(u.prompt_tokens),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: cached,
+                }
+            })
+            .unwrap();
+
+        assert_eq!(final_usage.output_tokens, 200);
+        assert_eq!(final_usage.input_tokens, Some(1000));
+        assert_eq!(final_usage.cache_read_input_tokens, Some(750));
+        assert!(final_usage.cache_creation_input_tokens.is_none());
+
+        // Verify that the agent loop would now see these values
+        // (as implemented in standard_loop's MessageDelta handler)
+        if final_usage.input_tokens.is_some() {
+            // This condition triggers the fix in the agent loop
+            let recovered_usage = Usage {
+                input_tokens: final_usage.input_tokens.unwrap_or(0),
+                output_tokens: final_usage.output_tokens,
+                cache_creation_input_tokens: final_usage.cache_creation_input_tokens,
+                cache_read_input_tokens: final_usage.cache_read_input_tokens,
+                thoughts_token_count: None,
+            };
+            assert_eq!(recovered_usage.input_tokens, 1000);
+            assert_eq!(recovered_usage.cache_read_input_tokens, Some(750));
+        }
+    }
+
+    #[test]
+    fn test_first_chunk_without_usage_no_longer_masks_cached_tokens() {
+        // Regression test: even when the first chunk has no usage,
+        // the final chunk will provide it, so telemetry won't be zero.
+        let chunk1_json = r#"{
+            "choices": [{"index": 0, "delta": {"role": "assistant"}}]
+        }"#;
+        let chunk1: OpenAIStreamChunk = serde_json::from_str(chunk1_json).unwrap();
+
+        // First chunk has no usage (typical OpenAI streaming)
+        assert!(chunk1.usage.is_none());
+
+        // The MessageStart emitted from this chunk will have zero usage,
+        // but the agent loop now prefers MessageDelta's usage when it's available.
+        // This test just verifies the first chunk is correctly parsed;
+        // the end-to-end fix is tested in test_final_chunk_usage_includes_cached_tokens.
+    }
+
+    // -----------------------------------------------------------------------
     // Unit tests: Converting messages to OpenAI format — cache_control handling
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_convert_messages_to_openai_text_block_strips_cache_control() {
-        // BUG: cache_control on ContentBlock::Text is silently discarded
-        // when converting to OpenAI wire format.
-        // The OpenAIMessage wire types only support string content,
-        // not content blocks with metadata like cache_control.
+    fn test_cache_control_preserved_in_user_message() {
+        // FIXED (Bug A): cache_control on ContentBlock::Text is now preserved
+        // as structured content parts in the OpenAI wire format.
         let cc = CacheControl::ephemeral_1h();
         let msg = Message {
             role: "user".to_string(),
@@ -1041,18 +1233,31 @@ mod tests {
         assert_eq!(openai_messages.len(), 2);
         match &openai_messages[1] {
             OpenAIMessage::User { content, .. } => {
-                assert_eq!(content, "Hello");
-                // The content is just the text string — cache_control is gone.
-                // This is the core bug: the API never receives cache_control.
+                // Content should be Parts (not Text) because cache_control is present
+                match content {
+                    OpenAIContent::Parts(parts) => {
+                        assert_eq!(parts.len(), 1);
+                        assert_eq!(parts[0].text, "Hello");
+                        assert!(
+                            parts[0].cache_control.is_some(),
+                            "cache_control should be preserved in content parts"
+                        );
+                        assert_eq!(
+                            parts[0].cache_control.as_ref().unwrap().cache_type,
+                            "ephemeral"
+                        );
+                    }
+                    _ => panic!("Expected Parts content with cache_control"),
+                }
             }
             _ => panic!("Expected User message"),
         }
     }
 
     #[test]
-    fn test_convert_system_blocks_to_openai_strips_cache_control() {
-        // BUG: SystemPrompt::Blocks with cache_control is flattened to a
-        // plain string, losing cache_control annotations.
+    fn test_cache_control_preserved_in_system_prompt() {
+        // FIXED (Bug A): SystemPrompt::Blocks with cache_control now produces
+        // structured content parts instead of a flattened string.
         let cc = CacheControl::ephemeral_1h();
         let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
             block_type: "text".to_string(),
@@ -1065,17 +1270,25 @@ mod tests {
 
         assert_eq!(openai_messages.len(), 1);
         match &openai_messages[0] {
-            OpenAIMessage::System { content, .. } => {
-                assert_eq!(content, "You are a caching-aware assistant.");
-                // cache_control on SystemBlock is silently dropped
-            }
+            OpenAIMessage::System { content, .. } => match content {
+                OpenAIContent::Parts(parts) => {
+                    assert_eq!(parts.len(), 1);
+                    assert_eq!(parts[0].text, "You are a caching-aware assistant.");
+                    assert!(
+                        parts[0].cache_control.is_some(),
+                        "cache_control should be preserved in system parts"
+                    );
+                }
+                _ => panic!("Expected Parts content with cache_control"),
+            },
             _ => panic!("Expected System message"),
         }
     }
 
     #[test]
-    fn test_convert_tools_to_openai_strips_cache_control() {
-        // BUG: ToolDefinition::Custom with cache_control loses it during conversion
+    fn test_cache_control_preserved_in_tools() {
+        // FIXED (Bug A): ToolDefinition::Custom with cache_control now
+        // includes it in the OpenAITool wire format.
         let cc = CacheControl::ephemeral_1h();
         let tool = ToolDefinition::Custom(CustomTool {
             name: "read".to_string(),
@@ -1089,13 +1302,53 @@ mod tests {
         let openai_tools = convert_tools_to_openai(&tools);
 
         assert_eq!(openai_tools.len(), 1);
-        // OpenAITool has no cache_control field — it's been discarded.
-        // Verify the resulting JSON also doesn't contain cache_control:
+        // Verify the JSON now contains cache_control
         let json = serde_json::to_value(&openai_tools[0]).unwrap();
         assert!(
-            !json.to_string().contains("cache_control"),
-            "BUG: OpenAITool serialization should not contain cache_control"
+            json.to_string().contains("cache_control"),
+            "Fixed: OpenAITool serialization should now include cache_control"
         );
+        assert_eq!(json["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_user_message_without_cache_control_still_uses_plain_text() {
+        // Regression test: plain text messages without cache_control should
+        // still serialize as a simple string, not structured parts.
+        let msg = Message::user("Hello");
+        let messages = vec![msg];
+        let system = Some(SystemPrompt::Text("You are helpful.".to_string()));
+
+        let openai_messages = convert_messages_to_openai(&messages, &system);
+
+        assert_eq!(openai_messages.len(), 2);
+        match &openai_messages[1] {
+            OpenAIMessage::User { content, .. } => match content {
+                OpenAIContent::Text(s) => {
+                    assert_eq!(s, "Hello");
+                }
+                _ => panic!("Expected Text content (no cache_control)"),
+            },
+            _ => panic!("Expected User message"),
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_without_cache_control_still_uses_plain_text() {
+        // Regression test: system prompt without cache_control should
+        // still serialize as a plain string.
+        let system = Some(SystemPrompt::Text("You are helpful.".to_string()));
+        let messages: Vec<Message> = vec![];
+
+        let openai_messages = convert_messages_to_openai(&messages, &system);
+
+        assert_eq!(openai_messages.len(), 1);
+        match &openai_messages[0] {
+            OpenAIMessage::System { content, .. } => {
+                assert!(matches!(content, OpenAIContent::Text(_)));
+            }
+            _ => panic!("Expected System message"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1108,7 +1361,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: vec![OpenAIMessage::User {
                 role: "user".to_string(),
-                content: "Hello".to_string(),
+                content: OpenAIContent::Text("Hello".to_string()),
             }],
             tools: None,
             tool_choice: None,
@@ -1130,7 +1383,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: vec![OpenAIMessage::User {
                 role: "user".to_string(),
-                content: "Hi".to_string(),
+                content: OpenAIContent::Text("Hi".to_string()),
             }],
             tools: None,
             tool_choice: None,

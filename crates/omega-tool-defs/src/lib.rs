@@ -304,14 +304,8 @@ mod tests {
     /// No tool should be unclassified (every name maps to exactly one kind).
     #[test]
     fn test_all_kinds_covered() {
-        let classified: std::collections::HashSet<&str> = [
-            "Bash",
-            "Read",
-            "Write",
-            "Edit",
-            "Transfer",
-        ]
-        .into();
+        let classified: std::collections::HashSet<&str> =
+            ["Bash", "Read", "Write", "Edit", "Transfer"].into();
         for &def in ALL {
             assert!(
                 classified.contains(def.name),

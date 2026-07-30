@@ -773,6 +773,18 @@ impl StandardAgent {
                             stop_reason = msg_delta.delta.stop_reason;
                             // Capture final output tokens
                             output_tokens = msg_delta.usage.output_tokens;
+                            // Prefer full usage from MessageDelta if available
+                            // (Bug B fix: OpenAI sends input+cache tokens only in the
+                            // final chunk, not in MessageStart.)
+                            if msg_delta.usage.input_tokens.is_some() {
+                                initial_usage = Some(omega_llm::Usage {
+                                    input_tokens: msg_delta.usage.input_tokens.unwrap_or(0),
+                                    output_tokens: msg_delta.usage.output_tokens,
+                                    cache_creation_input_tokens: msg_delta.usage.cache_creation_input_tokens,
+                                    cache_read_input_tokens: msg_delta.usage.cache_read_input_tokens,
+                                    thoughts_token_count: None,
+                                });
+                            }
                         }
 
                         StreamEvent::MessageStop => {
