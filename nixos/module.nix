@@ -10,10 +10,21 @@
 # clone repos, run nix flakes, etc., without ever needing sudo/wheel.
 # ---------------------------------------------------------------------------
 
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
-  inherit (lib) mkIf mkEnableOption mkOption types literalExpression;
+  inherit (lib)
+    mkIf
+    mkEnableOption
+    mkOption
+    types
+    literalExpression
+    ;
 
   cfg = config.services.omega;
 
@@ -24,8 +35,18 @@ let
     version = "0.1.0";
     src = ../.;
     cargoLock.lockFile = .././Cargo.lock;
-    cargoBuildFlags = [ "-p" "omega-loop" "-p" "omega-sh" "-p" "omega-tui" ];
-    nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
+    cargoBuildFlags = [
+      "-p"
+      "omega-loop"
+      "-p"
+      "omega-sh"
+      "-p"
+      "omega-tui"
+    ];
+    nativeBuildInputs = with pkgs; [
+      pkg-config
+      makeWrapper
+    ];
     buildInputs = with pkgs; [ openssl.dev ];
     doCheck = false;
     postInstall = ''
@@ -35,37 +56,65 @@ let
   };
 
   # Derived constants
-  clankerUser  = cfg.user;
+  clankerUser = cfg.user;
   clankerGroup = cfg.group;
-  clankerHome  = "/persist/${clankerUser}";
-  omegaDir     = "${clankerHome}/omega";
+  clankerHome = "/persist/${clankerUser}";
+  omegaDir = "${clankerHome}/omega";
 
-  omegaShSocket   = "/run/omega/omega-sh.sock";
+  omegaShSocket = "/run/omega/omega-sh.sock";
   omegaLoopSocket = "/run/omega/omega-loop.sock";
   systemPromptPath = "/etc/omega/system-prompt.md";
 
-  # Hardcoded system prompt injected into every new session.
-  systemPrompt = ''
-    You are a coding agent with full filesystem and shell access.
+  # Default system prompt used when the user doesn't set cfg.systemPrompt.
+  defaultSystemPrompt = ''
+    You are Omega, a general-purpose agent with full filesystem and shell access.
+
+    You operate in a dedicated workspace and have full permissions to manage your
+    workspace as you see fit. The user will give you tasks to accomplish with
+    the tools at your disposal. Use them wisely and judiciously, and offer to
+    send the user the work you've done (but not do it automatically unless the user
+    says otherwise.)
+
+    ## Communication
+
+    Lead with the outcome rather than the steps you took to get there.
+    Communicate complex concepts clearly, calibrating to the user's background
+    knowledge. Prefer plain language over jargon.
+
+    Avoid over-formatting responses. Use the minimum formatting appropriate.
+    If you use lists, follow CommonMark standard (blank line before list,
+    blank line between headers and content).
+
+    Use visualisations (tables, timelines, trees) only when they make a
+    relationship materially easier to understand than prose.
+
+    ## Working
+
+    You have access to a set of tools for reading, writing, and editing files,
+    running shell commands, searching your workspace, and asking the user
+    questions. Use them as needed — they are provided to you separately.
 
     You can create and clone git repositories.  If a repository you need
     is not already present on disk, clone it using `git clone <url>`.
     You can also initialise new repos with `git init`.
 
     You have nix installed and can run `nix build`, `nix develop`,
-    `nix flake` commands, etc.
+    `nix flake` commands, etc. You operate on NixOS so this should be your
+    first line of action. Prefer creating nix devshell flakes over trying to
+    permanently install programs into your $PATH.
 
     Work is performed under the "${clankerUser}" user.
     Your home directory is ${clankerHome}.
     You can create project directories under ${clankerHome}/projects/
     or clone repos there.
-
-    Available tools:
-    - Read / Write / Edit  – filesystem operations
-    - Bash                 – run arbitrary shell commands
-    - Glob / Grep          – file searching
-    - AskUserQuestion      – ask the user for input
   '';
+
+  # Final system prompt: if the user set systemPrompt, use that as the base;
+  # otherwise use the default.  extraSystemPrompt is always appended.
+  systemPrompt =
+    (if cfg.systemPrompt != null then cfg.systemPrompt else defaultSystemPrompt)
+    + (if cfg.extraSystemPrompt != "" then "\n\n" + cfg.extraSystemPrompt else "");
+
 in
 {
 
@@ -99,7 +148,9 @@ in
     humanUsers = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      example = [ "gotlou" "alice" ];
+      example = [
+        "alice"
+      ];
       description = ''
         Human users that should be added to the omega group so they can
         connect to omega-loop with the omega-tui TUI client.
@@ -109,7 +160,10 @@ in
     extraGroups = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      example = [ "docker" "kvm" ];
+      example = [
+        "docker"
+        "kvm"
+      ];
       description = "Additional groups to add the clanker user to.";
     };
 
@@ -153,9 +207,42 @@ in
     };
 
     logLevel = mkOption {
-      type = types.enum [ "trace" "debug" "info" "warn" "error" ];
+      type = types.enum [
+        "trace"
+        "debug"
+        "info"
+        "warn"
+        "error"
+      ];
       default = "info";
       description = "RUST_LOG level for the omega services.";
+    };
+
+    systemPrompt = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "You are a helpful AI assistant.";
+      description = ''
+        Complete system prompt for the agent.  If null (the default), the
+        module's built-in default prompt is used.  Set this to completely
+        replace the default.
+
+        To just append extra instructions while keeping the default, use
+        `extraSystemPrompt` instead.
+      '';
+    };
+
+    extraSystemPrompt = mkOption {
+      type = types.str;
+      default = "";
+      example = ''
+        You have access to Docker and can run containers.
+      '';
+      description = ''
+        Extra text appended to the system prompt (whether the built-in
+        default or a custom `systemPrompt`).  A blank line is added
+        before the extra content automatically.
+      '';
     };
 
     sessionDir = mkOption {
@@ -200,21 +287,27 @@ in
     # omega-sh — filesystem/shell tool daemon
     systemd.services.omega-sh = {
       description = "Omega-sh daemon (filesystem/shell tools)";
-      after       = [ "network.target" ];
-      wantedBy    = [ "multi-user.target" ];
+      after = [ "network.target" ];
+      wantedBy = [ "multi-user.target" ];
       # Always include bashInteractive and coreutils in the path so the
       # shell tool (Command::new("bash")) and basic utilities are available,
       # regardless of what the user puts in cfg.packages.
-      path        = with pkgs; [ bashInteractive coreutils ] ++ cfg.packages;
+      path =
+        with pkgs;
+        [
+          bashInteractive
+          coreutils
+        ]
+        ++ cfg.packages;
 
       serviceConfig = {
-        User  = clankerUser;
+        User = clankerUser;
         Group = clankerGroup;
 
-        Type        = "simple";
-        ExecStart   = "${cfg.package}/bin/omega-sh";
-        Restart     = "on-failure";
-        RestartSec  = "5s";
+        Type = "simple";
+        ExecStart = "${cfg.package}/bin/omega-sh";
+        Restart = "on-failure";
+        RestartSec = "5s";
 
         Environment = [
           "OMEGA_SOCKET_PATH=${omegaShSocket}"
@@ -226,10 +319,10 @@ in
 
         # Security hardening
         NoNewPrivileges = true;
-        PrivateTmp      = true;
-        ProtectSystem   = "full";
-        ProtectHome     = false;        # needs access for project work
-        ReadWritePaths  = [ clankerHome ];
+        PrivateTmp = true;
+        ProtectSystem = "full";
+        ProtectHome = false; # needs access for project work
+        ReadWritePaths = [ clankerHome ];
         RuntimeDirectory = "omega";
         RuntimeDirectoryMode = "0770";
       };
@@ -238,21 +331,30 @@ in
     # omega-loop — agent runtime daemon (depends on omega-sh)
     systemd.services.omega-loop = {
       description = "Omega-loop daemon (agent runtime)";
-      after       = [ "network.target" "omega-sh.service" ];
-      requires    = [ "omega-sh.service" ];
-      wantedBy    = [ "multi-user.target" ];
+      after = [
+        "network.target"
+        "omega-sh.service"
+      ];
+      requires = [ "omega-sh.service" ];
+      wantedBy = [ "multi-user.target" ];
       # Always include bashInteractive and coreutils in the path so that
       # the agent can execute shell commands via the omega-sh daemon.
-      path        = with pkgs; [ bashInteractive coreutils ] ++ cfg.packages;
+      path =
+        with pkgs;
+        [
+          bashInteractive
+          coreutils
+        ]
+        ++ cfg.packages;
 
       serviceConfig = {
-        User  = clankerUser;
+        User = clankerUser;
         Group = clankerGroup;
 
-        Type  = "simple";
+        Type = "simple";
         ExecStart = "${cfg.package}/bin/omega-loop";
         WorkingDirectory = omegaDir;
-        Restart    = "on-failure";
+        Restart = "on-failure";
         RestartSec = "5s";
 
         # 0007 umask → sockets created with 0770 (srw-rw----)
@@ -269,20 +371,26 @@ in
 
         # Security hardening
         NoNewPrivileges = true;
-        PrivateTmp      = true;
-        ProtectSystem   = "full";
-        ProtectHome     = false;
-        ReadWritePaths  = [ clankerHome ];
+        PrivateTmp = true;
+        ProtectSystem = "full";
+        ProtectHome = false;
+        ReadWritePaths = [ clankerHome ];
 
         RuntimeDirectory = "omega";
         RuntimeDirectoryMode = "0770";
 
-        StateDirectory   = "clanker/omega";
+        StateDirectory = "clanker/omega";
         StateDirectoryMode = "0770";
 
-      } // (if cfg.envFile != null then {
-        EnvironmentFile = cfg.envFile;
-      } else { });
+      }
+      // (
+        if cfg.envFile != null then
+          {
+            EnvironmentFile = cfg.envFile;
+          }
+        else
+          { }
+      );
 
       preStart = ''
         mkdir -p '${cfg.sessionDir}'
@@ -292,7 +400,7 @@ in
 
     # ----- omega binaries on the system ---------------------------------
     environment.systemPackages = [
-      cfg.package  # omega-tui, omega-loop, omega-sh
+      cfg.package # omega-tui, omega-loop, omega-sh
     ];
 
     # ----- allow clanker to use nix build etc. ---------------------------
