@@ -16,13 +16,20 @@
       nixpkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
 
       mkOmegaPkg =
-        { pkgs, pname, cargoBuildFlags }:
+        {
+          pkgs,
+          pname,
+          cargoBuildFlags,
+        }:
         pkgs.rustPlatform.buildRustPackage {
           inherit pname cargoBuildFlags;
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            makeWrapper
+          ];
           buildInputs = with pkgs; [ openssl.dev ];
           doCheck = false;
         };
@@ -42,13 +49,19 @@
           omega-sh = mkOmegaPkg {
             inherit pkgs;
             pname = "omega-sh";
-            cargoBuildFlags = [ "-p" "omega-sh" ];
+            cargoBuildFlags = [
+              "-p"
+              "omega-sh"
+            ];
           };
 
           omega-loop = mkOmegaPkg rec {
             inherit pkgs;
             pname = "omega-loop";
-            cargoBuildFlags = [ "-p" "omega-loop" ];
+            cargoBuildFlags = [
+              "-p"
+              "omega-loop"
+            ];
             postInstall = ''
               wrapProgram $out/bin/omega-tui \
                 --set-default OMEGA_LOOP_SOCKET_PATH /run/omega/omega-loop.sock
@@ -58,7 +71,10 @@
           omega-tui = mkOmegaPkg {
             inherit pkgs;
             pname = "omega-tui";
-            cargoBuildFlags = [ "-p" "omega-tui" ];
+            cargoBuildFlags = [
+              "-p"
+              "omega-tui"
+            ];
           };
         }
       );
