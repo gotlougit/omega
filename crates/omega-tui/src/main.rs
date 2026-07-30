@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 
 use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
 use omega_loop_client::{
-    AgentdClient, DaemonReader, DaemonWriter, OutputChunk, ServerEvent, SessionConfig,
+    connect, DaemonReader, DaemonWriter, OutputChunk, ServerEvent, SessionConfig,
 };
 
 mod markdown;
@@ -91,8 +91,15 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 enum DaemonCmd {
-    Run { session_id: String, content: String },
-    SetModel { session_id: String, model: String },
+    Run {
+        session_id: String,
+        content: String,
+        model: Option<String>,
+    },
+    SetModel {
+        session_id: String,
+        model: String,
+    },
     ListModels,
     ListSessions,
     Resume(String),
@@ -144,9 +151,15 @@ async fn daemon_loop(
                 Ok(DaemonCmd::Run {
                     session_id,
                     content,
+                    model,
                 }) => {
                     if let Err(e) = writer
-                        .send_run(&session_id, &content, &SessionConfig::default())
+                        .send_run(
+                            &session_id,
+                            &content,
+                            &SessionConfig::default(),
+                            model.as_deref(),
+                        )
                         .await
                     {
                         tracing::error!(target: "omega_tui::daemon", %session_id, error = %e, "send_run failed — daemon connection may be dead");
@@ -444,8 +457,12 @@ fn handle_daemon_event(
                 cache_read_tokens,
                 cache_creation_tokens,
             } => {
-                app.cache
-                    .update(input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens);
+                app.cache.update(
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                );
                 refresh_cache_status(handle, app);
             }
             OutputChunk::AskUserQuestion { .. } => {}
@@ -487,7 +504,7 @@ fn handle_daemon_event(
             refresh_cache_status(handle, app);
         }
         ServerEvent::ModelChanged { model } => {
-            app.model = model.clone();
+            app.model = Some(model.clone());
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("Model changed: {model}"),
                 s_system(),
@@ -512,7 +529,7 @@ fn handle_daemon_event(
                 let mut st =
                     StyledText::from(Span::new("Available models:\n".to_string(), s_system()));
                 for m in &models {
-                    let style = if m == &app.model {
+                    let style = if app.model.as_ref() == Some(m) {
                         s_highlight()
                     } else {
                         s_assistant()
@@ -566,10 +583,18 @@ impl CacheStats {
     fn fmt_tokens(n: u64) -> String {
         if n >= 1_000_000 {
             let m = n as f64 / 1_000_000.0;
-            if m < 10.0 { format!("{:.1}m", m) } else { format!("{:.0}m", m) }
+            if m < 10.0 {
+                format!("{:.1}m", m)
+            } else {
+                format!("{:.0}m", m)
+            }
         } else if n >= 1000 {
             let k = n as f64 / 1000.0;
-            if k < 10.0 { format!("{:.1}k", k) } else { format!("{:.0}k", k) }
+            if k < 10.0 {
+                format!("{:.1}k", k)
+            } else {
+                format!("{:.0}k", k)
+            }
         } else {
             n.to_string()
         }
@@ -598,7 +623,9 @@ impl CacheStats {
 
 struct AppState {
     session_id: String,
-    model: String,
+    /// Current model. `None` until we hear it from the daemon
+    /// (via `ModelChanged` on session creation, or from `OPENAI_MODEL` env).
+    model: Option<String>,
     cache: CacheStats,
 }
 
@@ -625,6 +652,7 @@ fn process_line(
         let _ = cmd_tx.send(DaemonCmd::Run {
             session_id: app.session_id.clone(),
             content: line.to_string(),
+            model: app.model.clone(),
         });
         return LineOutcome::Continue;
     }
@@ -656,6 +684,7 @@ fn process_line(
         let _ = cmd_tx.send(DaemonCmd::Run {
             session_id: app.session_id.clone(),
             content: line.to_string(),
+            model: app.model.clone(),
         });
         return LineOutcome::Continue;
     }
@@ -712,7 +741,7 @@ fn process_line(
         "/model" => {
             if let Some(model) = parts.get(1) {
                 let model = model.to_string();
-                app.model = model.clone();
+                app.model = Some(model.clone());
                 let _ = cmd_tx.send(DaemonCmd::SetModel {
                     session_id: app.session_id.clone(),
                     model,
@@ -734,6 +763,7 @@ fn process_line(
             let _ = cmd_tx.send(DaemonCmd::Run {
                 session_id: name.clone(),
                 content: String::new(),
+                model: app.model.clone(),
             });
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("New session: {name}"),
@@ -842,7 +872,7 @@ fn run_loop(
                             format!(
                                 "✓ omega-loop connection OK — session: {} | model: {} | {} model(s) available",
                                 app.session_id,
-                                app.model,
+                                app.model.as_deref().unwrap_or("?"),
                                 models.len(),
                             ),
                             s_highlight(),
@@ -960,7 +990,7 @@ fn main() -> Result<()> {
         std::thread::spawn(move || {
             let rt = Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                let client = match AgentdClient::connect().await {
+                let (reader, writer) = match connect().await {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "failed to connect");
@@ -971,7 +1001,6 @@ fn main() -> Result<()> {
                         return;
                     }
                 };
-                let (reader, writer) = client.split();
                 daemon_loop(reader, writer, cmd_rx, app_tx).await;
             });
         })
@@ -979,37 +1008,33 @@ fn main() -> Result<()> {
 
     // ── Initialise session with defaults (will be updated by daemon) ───
     let session_id = format!("tui-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
-    // Queue the init commands — they'll be processed as soon as the
-    // daemon thread connects and starts its event loop.  Run creates
-    // the session, SetModel sets our default model (from env or fallback).
-    // We skip ListModels to avoid the model list being printed in the TUI
-    // at startup (the user can run `/models` or `/status` later).
+    // Optional model override from the environment.  If set, it's sent
+    // with the Run request so the daemon applies it immediately.
+    // If not set, the daemon uses its own default and tells us via
+    // ModelChanged when the session is created.
+    let env_model = std::env::var("OPENAI_MODEL").ok();
+
     cmd_tx
         .send(DaemonCmd::Run {
             session_id: session_id.clone(),
             content: String::new(),
-        })
-        .ok();
-    cmd_tx
-        .send(DaemonCmd::SetModel {
-            session_id: session_id.clone(),
-            model: model.clone(),
+            model: env_model.clone(),
         })
         .ok();
 
+    let model_label = env_model.clone().unwrap_or_else(|| "?".to_string());
     let mut app = AppState {
         session_id,
-        model,
+        model: env_model,
         cache: CacheStats::default(),
     };
 
     // ── Welcome (printed immediately — no daemon round-trip) ───────────
     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
         format!(
-            "omega-tui — session: {} | model: {}\nType /help for commands.",
-            app.session_id, app.model
+            "omega-tui — session: {} | model: {model_label}\nType /help for commands.",
+            app.session_id,
         ),
         s_system(),
     ))));
@@ -1077,7 +1102,7 @@ mod tests {
             cmd_rx,
             app: AppState {
                 session_id: "sess-1".to_string(),
-                model: "gpt-a".to_string(),
+                model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
             },
             streaming: Streaming {
@@ -1149,6 +1174,7 @@ mod tests {
             Ok(DaemonCmd::Run {
                 session_id,
                 content,
+                ..
             }) => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(content, "hello agent");
@@ -1173,7 +1199,7 @@ mod tests {
     fn model_command_sets_model() {
         let mut fx = fixture();
         process_line("/model gpt-b", &mut fx.app, &fx.handle, &fx.cmd_tx);
-        assert_eq!(fx.app.model, "gpt-b");
+        assert_eq!(fx.app.model, Some("gpt-b".to_string()));
         match fx.cmd_rx.try_recv() {
             Ok(DaemonCmd::SetModel { session_id, model }) => {
                 assert_eq!(session_id, "sess-1");
@@ -1351,7 +1377,7 @@ mod tests {
             },
         );
         fx.handle.redraw_sync();
-        assert_eq!(fx.app.model, "gpt-b");
+        assert_eq!(fx.app.model, Some("gpt-b".to_string()));
         assert_eq!(count_rows_containing(&fx, "Model changed: gpt-b"), 1);
     }
 
@@ -1522,7 +1548,7 @@ mod tests {
             buf,
             app: AppState {
                 session_id: "sess-1".to_string(),
-                model: "gpt-a".to_string(),
+                model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
             },
             app_tx,
@@ -2749,7 +2775,7 @@ mod tests {
         let mut fx = fixture();
         process_line("/model   gpt-b  ", &mut fx.app, &fx.handle, &fx.cmd_tx);
         // The argument should be trimmed.
-        assert_eq!(fx.app.model, "gpt-b");
+        assert_eq!(fx.app.model, Some("gpt-b".to_string()));
         match fx.cmd_rx.try_recv() {
             Ok(DaemonCmd::SetModel { model, .. }) => assert_eq!(model, "gpt-b"),
             other => panic!("expected SetModel, got {other:?}"),

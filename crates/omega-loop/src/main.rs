@@ -251,6 +251,24 @@ async fn handle_connection(
                 if is_new {
                     let config = req.config.unwrap_or_default();
 
+                    // Apply model from request if provided (on session creation only)
+                    if let Some(ref model) = req.model {
+                        let max_tokens = req.max_tokens.unwrap_or(16384);
+                        let prov = current_provider.read().unwrap().clone();
+                        let new_provider = prov.create_variant(model, max_tokens);
+                        *current_provider.write().unwrap() = new_provider;
+                        tracing::info!(model = %model, "model set from run request");
+                    }
+
+                    // Always broadcast the current model so the client knows
+                    // what the session is using.
+                    {
+                        let prov = current_provider.read().unwrap();
+                        let _ = event_tx.send(ServerEvent::ModelChanged {
+                            model: prov.model().to_string(),
+                        });
+                    }
+
                     // --- create session ----------------------------------
                     let storage = SessionStorage::with_dir("./sessions");
                     // Read system prompt from OMEGA_SYSTEM_PROMPT_PATH file, or empty

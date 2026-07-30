@@ -1,7 +1,8 @@
 //! # omega-loop client — connect to the agent daemon from a UI process
 //!
-//! Provides `AgentdClient` which speaks the newline-delimited JSON protocol
-//! to a running `omega-loop` daemon.
+//! The main entry points are [`connect`] and [`connect_to`], which return a
+//! `(DaemonReader, DaemonWriter)` pair.  Use the writer to send commands and
+//! the reader to receive events.
 
 use std::collections::HashMap;
 
@@ -464,111 +465,34 @@ pub struct DaemonWriter {
     writer: tokio::io::WriteHalf<UnixStream>,
 }
 
-/// A client connected to the omega-loop daemon.
-pub struct AgentdClient {
-    reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
-    writer: tokio::io::WriteHalf<UnixStream>,
+// ---------------------------------------------------------------------------
+// Free functions — connect to the daemon
+// ---------------------------------------------------------------------------
+
+/// Connect to the omega-loop daemon using `OMEGA_LOOP_SOCKET_PATH` env or default.
+pub async fn connect() -> Result<(DaemonReader, DaemonWriter)> {
+    let path = std::env::var("OMEGA_LOOP_SOCKET_PATH")
+        .unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
+    connect_to(&path).await
 }
 
-impl AgentdClient {
-    /// Connect to the omega-loop daemon using `OMEGA_LOOP_SOCKET_PATH` env or default.
-    pub async fn connect() -> Result<Self> {
-        let path = std::env::var("OMEGA_LOOP_SOCKET_PATH")
-            .unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
-        Self::connect_to(&path).await
-    }
-
-    /// Connect to the omega-loop daemon at a specific socket path.
-    pub async fn connect_to(path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(path)
-            .await
-            .with_context(|| format!("Cannot connect to omega-loop at {path}"))?;
-        let (reader, writer) = tokio::io::split(stream);
-        Ok(Self {
+/// Connect to the omega-loop daemon at a specific socket path.
+pub async fn connect_to(path: &str) -> Result<(DaemonReader, DaemonWriter)> {
+    let stream = UnixStream::connect(path)
+        .await
+        .with_context(|| format!("Cannot connect to omega-loop at {path}"))?;
+    let (reader, writer) = tokio::io::split(stream);
+    Ok((
+        DaemonReader {
             reader: BufReader::new(reader),
-            writer,
-        })
-    }
-
-    /// Send a `run` request (creates session if new, then sends the message).
-    pub async fn send_run(
-        &mut self,
-        session_id: &str,
-        content: &str,
-        config: &SessionConfig,
-    ) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "run",
-            "session_id": session_id,
-            "content": content,
-            "config": {
-                "stream": config.stream,
-                "think": config.think,
-                "no_cache": config.no_cache,
-            },
-        });
-        self.write_json(&req).await
-    }
-
-    /// Send an `ask_response` to the daemon.
-    pub async fn send_ask_response(
-        &mut self,
-        session_id: &str,
-        request_id: &str,
-        answers: HashMap<String, String>,
-    ) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "ask_response",
-            "session_id": session_id,
-            "request_id": request_id,
-            "answers": answers,
-        });
-        self.write_json(&req).await
-    }
-
-    /// Read the next event from the daemon. Returns `None` on EOF.
-    pub async fn recv_event(&mut self) -> Result<Option<ServerEvent>> {
-        loop {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            let line = line.trim();
-            if !line.is_empty() {
-                let event = ServerEvent::from_json_line(line)?;
-                return Ok(Some(event));
-            }
-        }
-    }
-
-    /// Try to read an event without blocking. Returns `None` if no data is available.
-    pub fn try_recv_event(&mut self) -> Result<Option<ServerEvent>> {
-        Ok(None)
-    }
-
-    /// Split the client into separate reader and writer halves.
-    ///
-    /// Use this when you need to read events and write commands
-    /// concurrently from different tasks (no Mutex required).
-    pub fn split(self) -> (DaemonReader, DaemonWriter) {
-        (
-            DaemonReader {
-                reader: self.reader,
-            },
-            DaemonWriter {
-                writer: self.writer,
-            },
-        )
-    }
-
-    async fn write_json(&mut self, value: &Value) -> Result<()> {
-        let json = serde_json::to_string(value)?;
-        self.writer.write_all(json.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        Ok(())
-    }
+        },
+        DaemonWriter { writer },
+    ))
 }
+
+// ---------------------------------------------------------------------------
+// DaemonReader — read events from the daemon
+// ---------------------------------------------------------------------------
 
 impl DaemonReader {
     /// Read the next event from the daemon. Returns `None` on EOF.
@@ -588,15 +512,21 @@ impl DaemonReader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DaemonWriter — send commands to the daemon
+// ---------------------------------------------------------------------------
+
 impl DaemonWriter {
     /// Send a `run` request (creates session if new, then sends the message).
+    /// If `model` is `Some`, it will be applied on session creation.
     pub async fn send_run(
         &mut self,
         session_id: &str,
         content: &str,
         config: &SessionConfig,
+        model: Option<&str>,
     ) -> Result<()> {
-        let req = serde_json::json!({
+        let mut req = serde_json::json!({
             "type": "run",
             "session_id": session_id,
             "content": content,
@@ -606,6 +536,9 @@ impl DaemonWriter {
                 "no_cache": config.no_cache,
             },
         });
+        if let Some(m) = model {
+            req["model"] = serde_json::json!(m);
+        }
         self.write_json(&req).await
     }
 
