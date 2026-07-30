@@ -22,7 +22,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, ClearType};
 use crossterm::QueueableCommand;
 
-use crate::style::{Cell, cell_slice_cols, emit_styled_cells};
+use crate::style::{cell_slice_cols, emit_styled_cells, Cell};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -138,16 +138,12 @@ impl Screen {
                 .zip(desired_slice.iter())
                 .take_while(|(a, d)| a == d)
                 .count();
-            let common_prefix = repaint_prefix_for_cluster_boundary(
-                common_prefix,
-                actual_slice,
-                desired_slice,
-            );
+            let common_prefix =
+                repaint_prefix_for_cluster_boundary(common_prefix, actual_slice, desired_slice);
 
             let is_last_desired = row == desired_count - 1;
             let actual_wider = cell_slice_cols(actual_slice) > cell_slice_cols(desired_slice);
-            let has_extra_actual_below =
-                is_last_desired && self.lines.len() > desired_count;
+            let has_extra_actual_below = is_last_desired && self.lines.len() > desired_count;
 
             if common_prefix == actual_slice.len()
                 && common_prefix == desired_slice.len()

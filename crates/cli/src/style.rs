@@ -226,8 +226,6 @@ impl StyledText {
         self.spans.iter().all(|s| s.text.is_empty())
     }
 
-
-
     pub fn to_cells(&self) -> Vec<Cell> {
         let mut cells = Vec::new();
         visit_styled_graphemes(&self.spans, |grapheme, style| {
@@ -266,9 +264,7 @@ impl From<String> for StyledText {
 
 impl From<Span> for StyledText {
     fn from(span: Span) -> Self {
-        Self {
-            spans: vec![span],
-        }
+        Self { spans: vec![span] }
     }
 }
 
@@ -450,7 +446,11 @@ fn apply_style(w: &mut impl Write, style: &Style) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Splits styled content into physical terminal lines based on width.
-pub fn layout_lines(content: &StyledText, width: usize, preserve_last_newline: bool) -> Vec<Vec<Cell>> {
+pub fn layout_lines(
+    content: &StyledText,
+    width: usize,
+    preserve_last_newline: bool,
+) -> Vec<Vec<Cell>> {
     let width = width.max(1);
 
     let mut logical_lines: Vec<Vec<Cell>> = vec![Vec::new()];

@@ -62,8 +62,7 @@ impl AgentState {
     pub fn is_waiting(&self) -> bool {
         matches!(
             self,
-            AgentState::Idle
-                | AgentState::WaitingForUserInput { .. }
+            AgentState::Idle | AgentState::WaitingForUserInput { .. }
         )
     }
 

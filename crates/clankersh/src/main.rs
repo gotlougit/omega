@@ -114,7 +114,11 @@ fn parse_tool_and_args_slice<'a>(args: &'a [&'a str]) -> (&'a str, Vec<&'a str>)
     }
 }
 
-async fn execute(client: &OmegaClient, tool: &str, args: &[impl AsRef<str>]) -> Result<omega_core::core::ToolResult, String> {
+async fn execute(
+    client: &OmegaClient,
+    tool: &str,
+    args: &[impl AsRef<str>],
+) -> Result<omega_core::core::ToolResult, String> {
     let args: Vec<String> = args.iter().map(|a| a.as_ref().to_string()).collect();
     let input = match tool {
         "Bash" => json!({ "command": args.join(" ") }),
@@ -142,7 +146,11 @@ fn print_result(result: &omega_core::core::ToolResult) {
         omega_core::core::ToolResultData::Image { media_type, .. } => {
             println!("[Image: {media_type}]");
         }
-        omega_core::core::ToolResultData::Document { media_type, description, .. } => {
+        omega_core::core::ToolResultData::Document {
+            media_type,
+            description,
+            ..
+        } => {
             println!("[{description} — {media_type}]");
         }
     }

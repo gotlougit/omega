@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use omega_core::core::{QuestionOption, ToolInfo, ToolResult, UserQuestion};
-use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
+use omega_core::core::ToolRuntime;
+use omega_core::core::{QuestionOption, ToolInfo, ToolResult, UserQuestion};
 use omega_llm::ToolDefinition;
 
 /// Input for a single question option
@@ -166,5 +166,4 @@ impl Tool for AskUserQuestionTool {
             ))),
         }
     }
-
 }

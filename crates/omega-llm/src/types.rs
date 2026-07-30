@@ -980,8 +980,8 @@ mod tests {
 
     #[test]
     fn test_system_block_with_cache_control_serialization() {
-        let block = SystemBlock::new("You are helpful.")
-            .with_cache_control(CacheControl::ephemeral_1h());
+        let block =
+            SystemBlock::new("You are helpful.").with_cache_control(CacheControl::ephemeral_1h());
         let json = serde_json::to_value(&block).unwrap();
         assert_eq!(json["type"], "text");
         assert_eq!(json["text"], "You are helpful.");
@@ -1037,8 +1037,7 @@ mod tests {
 
     #[test]
     fn test_with_cache_control_on_text_block() {
-        let block = ContentBlock::text("Hello")
-            .with_cache_control(CacheControl::ephemeral_1h());
+        let block = ContentBlock::text("Hello").with_cache_control(CacheControl::ephemeral_1h());
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("cache_control").is_some());
         assert_eq!(json["cache_control"]["type"], "ephemeral");

@@ -26,13 +26,21 @@ pub struct Capture {
 impl Capture {
     pub fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        (Self { buf: Arc::clone(&buf) }, buf)
+        (
+            Self {
+                buf: Arc::clone(&buf),
+            },
+            buf,
+        )
     }
 }
 
 impl Write for Capture {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.lock().expect("capture poisoned").extend_from_slice(data);
+        self.buf
+            .lock()
+            .expect("capture poisoned")
+            .extend_from_slice(data);
         Ok(data.len())
     }
 
@@ -236,7 +244,8 @@ impl Emulator {
         self.pending_wrap = false;
         if self.row + 1 >= self.rows {
             let top = self.screen.remove(0);
-            self.history.push(Self::row_string(&top).trim_end().to_string());
+            self.history
+                .push(Self::row_string(&top).trim_end().to_string());
             self.screen.push(vec![' '; self.cols]);
         } else {
             self.row += 1;

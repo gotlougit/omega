@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use omega_core::core::{AgentContext, AgentState, FrameworkError, InputMessage, OutputChunk};
 use crate::runtime::{AgentHandle, AgentInternals};
 use crate::session::AgentSession;
+use omega_core::core::{AgentContext, AgentState, FrameworkError, InputMessage, OutputChunk};
 
 /// Runtime for spawning and managing agent tasks.
 ///
@@ -56,13 +56,7 @@ impl AgentRuntime {
             Arc::clone(&state),
         );
 
-        let handle = AgentHandle::new(
-            session_id,
-            session_arc,
-            input_tx,
-            output_tx.clone(),
-            state,
-        );
+        let handle = AgentHandle::new(session_id, session_arc, input_tx, output_tx.clone(), state);
 
         tokio::spawn(async move {
             if let Err(e) = agent_fn(internals).await {

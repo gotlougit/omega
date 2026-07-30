@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::process::Command;
 
-use omega_core::core::{ToolInfo, ToolResult};
-use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
+use omega_core::core::ToolRuntime;
+use omega_core::core::{ToolInfo, ToolResult};
 use omega_llm::{ToolDefinition, ToolInputSchema};
 
 /// Grep tool for content search
@@ -308,7 +308,6 @@ impl Tool for GrepTool {
             Err(e) => Ok(ToolResult::error(format!("Search failed: {}", e))),
         }
     }
-
 }
 
 // Tests temporarily disabled - require ToolRuntime test helper

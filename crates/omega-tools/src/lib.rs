@@ -16,8 +16,7 @@ pub use tool::Tool;
 
 // Re-export common tools for convenience
 pub use common::{
-    AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, TransferTool,
-    WriteTool,
+    AskUserQuestionTool, BashTool, EditTool, GlobTool, GrepTool, ReadTool, TransferTool, WriteTool,
 };
 
 #[cfg(test)]
@@ -52,12 +51,10 @@ mod tests {
         for &def in omega_tool_defs::ALL {
             let td = def_to_tool_definition(def);
             let ToolDefinition::Custom(custom) = &td;
-            let original: serde_json::Value =
-                serde_json::from_str(def.input_schema_json).unwrap();
+            let original: serde_json::Value = serde_json::from_str(def.input_schema_json).unwrap();
             // The CustomTool.input_schema is a ToolInputSchema which
             // serializes as a JSON object. Re-parse to compare.
-            let parsed: serde_json::Value =
-                serde_json::to_value(&custom.input_schema).unwrap();
+            let parsed: serde_json::Value = serde_json::to_value(&custom.input_schema).unwrap();
             assert_eq!(
                 original, parsed,
                 "schema for '{}' changed through conversion",
@@ -101,8 +98,7 @@ mod tests {
     fn test_ask_user_question_definition_matches_canonical() {
         let tool = AskUserQuestionTool::new();
         let tool_def = tool.definition();
-        let canonical =
-            def_to_tool_definition(&omega_tool_defs::ask_user_question::DEF);
+        let canonical = def_to_tool_definition(&omega_tool_defs::ask_user_question::DEF);
         assert_eq!(
             serde_json::to_value(&tool_def).unwrap(),
             serde_json::to_value(&canonical).unwrap(),
@@ -116,8 +112,7 @@ mod tests {
     fn test_transfer_definition_matches_canonical() {
         let tool = TransferTool::new();
         let tool_def = tool.definition();
-        let canonical =
-            def_to_tool_definition(&omega_tool_defs::transfer::DEF);
+        let canonical = def_to_tool_definition(&omega_tool_defs::transfer::DEF);
         assert_eq!(
             serde_json::to_value(&tool_def).unwrap(),
             serde_json::to_value(&canonical).unwrap(),

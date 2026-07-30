@@ -19,11 +19,11 @@
 //! These tests use the same types and conversions that the real code uses.
 //! Run with: `cargo test -p omega-llm --test streaming_cache_regression`
 
-use omega_llm::{
-    CacheControl, ContentBlock, Message, MessageContent,
-    SystemBlock, SystemPrompt, ToolDefinition, ToolInputSchema, Usage,
-};
 use omega_llm::types::CustomTool;
+use omega_llm::{
+    CacheControl, ContentBlock, Message, MessageContent, SystemBlock, SystemPrompt, ToolDefinition,
+    ToolInputSchema, Usage,
+};
 
 // Replicate CacheTelemetry to avoid adding omega-core as a dependency
 #[derive(Debug, Clone)]
@@ -76,9 +76,7 @@ fn simulate_openai_text_extraction(msg: &Message) -> String {
 fn simulate_system_block_extraction(system: &SystemPrompt) -> String {
     match system {
         SystemPrompt::Text(s) => s.clone(),
-        SystemPrompt::Blocks(blocks) => {
-            blocks.iter().map(|b| b.text.as_str()).collect()
-        }
+        SystemPrompt::Blocks(blocks) => blocks.iter().map(|b| b.text.as_str()).collect(),
     }
 }
 
@@ -125,8 +123,7 @@ fn bug_a_cache_control_lost_on_system_prompt() {
     // Setup: SystemPrompt::Blocks with cache_control
     let cc = CacheControl::ephemeral_1h();
     let system = SystemPrompt::Blocks(vec![
-        SystemBlock::new("You are a helpful assistant.")
-            .with_cache_control(cc.clone()),
+        SystemBlock::new("You are a helpful assistant.").with_cache_control(cc.clone())
     ]);
 
     // Internal type has cache_control
@@ -275,10 +272,7 @@ fn bug_b_usage_from_first_chunk_is_empty() {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: u
-                .prompt_tokens_details
-                .as_ref()
-                .map(|d| d.cached_tokens),
+            cache_read_input_tokens: u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens),
             thoughts_token_count: None,
         });
 
@@ -292,10 +286,14 @@ fn bug_b_usage_from_first_chunk_is_empty() {
         });
 
         // BUG: initial_usage has all zeros because chunk1 had no `usage` field!
-        assert_eq!(initial_usage.input_tokens, 0,
-            "BUG: input_tokens is 0 because usage wasn't in the first chunk");
-        assert_eq!(initial_usage.cache_read_input_tokens, None,
-            "BUG: cache_read_input_tokens is None because usage wasn't in the first chunk");
+        assert_eq!(
+            initial_usage.input_tokens, 0,
+            "BUG: input_tokens is 0 because usage wasn't in the first chunk"
+        );
+        assert_eq!(
+            initial_usage.cache_read_input_tokens, None,
+            "BUG: cache_read_input_tokens is None because usage wasn't in the first chunk"
+        );
     }
 
     // --- Simulate what send_streaming_request does on chunk 2 ---
@@ -303,13 +301,16 @@ fn bug_b_usage_from_first_chunk_is_empty() {
     // Finish reason is processed...
     if let Some(ref _reason) = chunk2.choices[0].finish_reason {
         // The real code only extracts output_tokens here:
-        let output_tokens = chunk2.usage
+        let output_tokens = chunk2
+            .usage
             .as_ref()
             .map(|u| u.completion_tokens)
             .unwrap_or(0);
 
-        assert_eq!(output_tokens, 10,
-            "output_tokens is correctly captured from the last chunk");
+        assert_eq!(
+            output_tokens, 10,
+            "output_tokens is correctly captured from the last chunk"
+        );
     }
 
     // --- BUT cached_tokens from chunk2 is NEVER captured! ---
@@ -317,7 +318,11 @@ fn bug_b_usage_from_first_chunk_is_empty() {
     // because it only uses `initial_usage` (from chunk 1) for cache telemetry.
     let chunk2_usage = chunk2.usage.as_ref().unwrap();
     assert_eq!(chunk2_usage.prompt_tokens, 1000);
-    let cached = chunk2_usage.prompt_tokens_details.as_ref().unwrap().cached_tokens;
+    let cached = chunk2_usage
+        .prompt_tokens_details
+        .as_ref()
+        .unwrap()
+        .cached_tokens;
     assert_eq!(cached, 800,
         "Chunk 2 correctly reports 800 cached tokens, but this value is NEVER captured by the agent loop");
 }
@@ -346,10 +351,7 @@ fn usage_in_first_chunk_is_captured_correctly() {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cache_creation_input_tokens: None,
-            cache_read_input_tokens: u
-                .prompt_tokens_details
-                .as_ref()
-                .map(|d| d.cached_tokens),
+            cache_read_input_tokens: u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens),
             thoughts_token_count: None,
         });
 
@@ -361,10 +363,15 @@ fn usage_in_first_chunk_is_captured_correctly() {
             thoughts_token_count: None,
         });
 
-        assert_eq!(initial_usage.input_tokens, 500,
-            "When usage IS in the first chunk, input_tokens is captured correctly");
-        assert_eq!(initial_usage.cache_read_input_tokens, Some(450),
-            "When usage IS in the first chunk, cached_tokens is captured correctly");
+        assert_eq!(
+            initial_usage.input_tokens, 500,
+            "When usage IS in the first chunk, input_tokens is captured correctly"
+        );
+        assert_eq!(
+            initial_usage.cache_read_input_tokens,
+            Some(450),
+            "When usage IS in the first chunk, cached_tokens is captured correctly"
+        );
     }
 }
 
@@ -396,14 +403,15 @@ fn end_to_end_cache_telemetry_always_zero() {
 
     // Verify internal type has cache_control
     match &msg.content {
-        MessageContent::Blocks(blocks) => {
-            match &blocks[0] {
-                ContentBlock::Text { cache_control, .. } => {
-                    assert!(cache_control.is_some(), "Internal type has cache_control after stamping");
-                }
-                _ => panic!("Expected Text block"),
+        MessageContent::Blocks(blocks) => match &blocks[0] {
+            ContentBlock::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "Internal type has cache_control after stamping"
+                );
             }
-        }
+            _ => panic!("Expected Text block"),
+        },
         _ => panic!("Expected Blocks after stamp"),
     }
 
@@ -413,29 +421,39 @@ fn end_to_end_cache_telemetry_always_zero() {
 
     // Step 3: Simulate streaming response with cached_tokens in the last chunk
     // (BUG B — cached_tokens is in the last chunk but we capture from first)
-    let chunk1: SimChunk = serde_json::from_str(r#"{
+    let chunk1: SimChunk = serde_json::from_str(
+        r#"{
         "choices": [{"index": 0, "delta": {"role": "assistant"}}]
-    }"#).unwrap();
-    let _chunk2: SimChunk = serde_json::from_str(r#"{
+    }"#,
+    )
+    .unwrap();
+    let _chunk2: SimChunk = serde_json::from_str(
+        r#"{
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
             "prompt_tokens_details": {"cached_tokens": 80}}
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
 
     // Capture "initial_usage" from chunk1 (first "role" chunk)
-    let initial_usage = chunk1.usage.as_ref().map(|u| Usage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens),
-        thoughts_token_count: None,
-    }).unwrap_or(Usage {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-        thoughts_token_count: None,
-    });
+    let initial_usage = chunk1
+        .usage
+        .as_ref()
+        .map(|u| Usage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: u.prompt_tokens_details.as_ref().map(|d| d.cached_tokens),
+            thoughts_token_count: None,
+        })
+        .unwrap_or(Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            thoughts_token_count: None,
+        });
 
     // Simulate the telemetry emission in standard_loop.rs:
     let telemetry = CacheTelemetry {
@@ -445,12 +463,18 @@ fn end_to_end_cache_telemetry_always_zero() {
     };
 
     // ASSERT: Telemetry is ALL ZEROS even though the API returned cached_tokens=80!
-    assert_eq!(telemetry.input_tokens, 0,
-        "BUG: input_tokens is 0 (was in last chunk, not captured)");
-    assert_eq!(telemetry.cache_read_tokens, 0,
-        "BUG: cache_read_tokens is 0 (cached_tokens=80 was in last chunk, not captured)");
-    assert_eq!(telemetry.cache_creation_tokens, 0,
-        "cache_creation_tokens is 0 (always None for OpenAI)");
+    assert_eq!(
+        telemetry.input_tokens, 0,
+        "BUG: input_tokens is 0 (was in last chunk, not captured)"
+    );
+    assert_eq!(
+        telemetry.cache_read_tokens, 0,
+        "BUG: cache_read_tokens is 0 (cached_tokens=80 was in last chunk, not captured)"
+    );
+    assert_eq!(
+        telemetry.cache_creation_tokens, 0,
+        "cache_creation_tokens is 0 (always None for OpenAI)"
+    );
 
     // When both bugs are fixed, this test should FAIL with these assertions:
     // assert_eq!(telemetry.input_tokens, 100);
@@ -462,11 +486,14 @@ fn end_to_end_cache_telemetry_always_zero() {
 #[test]
 fn correct_behavior_if_usage_were_captured_from_final_chunk() {
     // What SHOULD happen: capture usage from the chunk with finish_reason
-    let chunk: SimChunk = serde_json::from_str(r#"{
+    let chunk: SimChunk = serde_json::from_str(
+        r#"{
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 2000, "completion_tokens": 50, "total_tokens": 2050,
             "prompt_tokens_details": {"cached_tokens": 1500}}
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
 
     // If we captured usage from the final chunk (the fix):
     if chunk.choices[0].finish_reason.is_some() {
@@ -489,8 +516,13 @@ fn correct_behavior_if_usage_were_captured_from_final_chunk() {
         assert_eq!(telemetry.input_tokens, 2000);
         assert_eq!(telemetry.cache_read_tokens, 1500);
         assert_eq!(telemetry.cache_creation_tokens, 0); // still None for OpenAI
-        assert!(telemetry.has_caching(), "With the fix, has_caching() should be true");
-        assert!((telemetry.hit_rate_pct() - 75.0).abs() < 0.01,
-            "Hit rate should be 75% (1500/2000)");
+        assert!(
+            telemetry.has_caching(),
+            "With the fix, has_caching() should be true"
+        );
+        assert!(
+            (telemetry.hit_rate_pct() - 75.0).abs() < 0.01,
+            "Hit rate should be 75% (1500/2000)"
+        );
     }
 }

@@ -22,8 +22,8 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
-use omega_llm::{Message, SystemPrompt};
 use omega_core::core::ToolResult;
+use omega_llm::{Message, SystemPrompt};
 
 /// Debugger for logging API calls and tool executions
 pub struct Debugger {

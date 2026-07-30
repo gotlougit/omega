@@ -14,14 +14,14 @@ use anyhow::Result;
 use futures::StreamExt;
 use serde_json::Value;
 
-use omega_core::core::{FrameworkResult, InputMessage};
 use crate::helpers::{process_attachments, Debugger};
+use crate::runtime::AgentInternals;
+use omega_core::core::{FrameworkResult, InputMessage};
+use omega_core::core::{ToolResult, ToolResultData};
 use omega_llm::{
     CacheControl, ContentBlock, ContentBlockStart, ContentDelta, LlmProvider, Message, StopReason,
     StreamEvent, SystemBlock, SystemPrompt,
 };
-use crate::runtime::AgentInternals;
-use omega_core::core::{ToolResult, ToolResultData};
 
 use super::config::AgentConfig;
 use super::executor::ToolExecutor;
@@ -62,7 +62,6 @@ impl StandardAgent {
             let mut session = internals.session.write().await;
             session.set_model(self.llm.model());
             session.set_provider(self.llm.provider_name());
-
         }
 
         // Initialize debugger if enabled
@@ -103,46 +102,45 @@ impl StandardAgent {
                         match self
                             .process_turn(&mut internals, &text, first_attempt)
                             .await
-                            {
-                                Ok(()) => break,
-                                Err(e) => {
-                                    first_attempt = false;
-                                    attempt += 1;
-                                    let err_msg = e.to_string();
-                                    let is_transient = err_msg
-                                        .contains("error decoding response body")
-                                        || err_msg.contains("connection")
-                                        || err_msg.contains("timeout")
-                                        || err_msg.contains("broken pipe")
-                                        || err_msg.contains("reset by peer")
-                                        || err_msg.contains("stream")
-                                        || err_msg.contains("hyper")
-                                        || err_msg.contains("io error");
+                        {
+                            Ok(()) => break,
+                            Err(e) => {
+                                first_attempt = false;
+                                attempt += 1;
+                                let err_msg = e.to_string();
+                                let is_transient = err_msg.contains("error decoding response body")
+                                    || err_msg.contains("connection")
+                                    || err_msg.contains("timeout")
+                                    || err_msg.contains("broken pipe")
+                                    || err_msg.contains("reset by peer")
+                                    || err_msg.contains("stream")
+                                    || err_msg.contains("hyper")
+                                    || err_msg.contains("io error");
 
-                                    if retry_config.enabled
-                                        && is_transient
-                                        && attempt < retry_config.max_retries
-                                    {
-                                        tracing::warn!(
+                                if retry_config.enabled
+                                    && is_transient
+                                    && attempt < retry_config.max_retries
+                                {
+                                    tracing::warn!(
                                             "[StandardAgent] Transient error on attempt {}/{}: {}. Retrying in {}s...",
                                             attempt, retry_config.max_retries, e, retry_config.retry_delay_secs
                                         );
-                                        internals.send_status(format!(
-                                            "Connection issue, retrying... (attempt {}/{})",
-                                            attempt, retry_config.max_retries
-                                        ));
-                                        tokio::time::sleep(std::time::Duration::from_secs(
-                                            retry_config.retry_delay_secs,
-                                        ))
-                                        .await;
-                                        continue;
-                                    }
-
-                                    tracing::error!("[StandardAgent] Error processing turn: {}", e);
-                                    internals.send_error(format!("Error: {}", e));
-                                    break;
+                                    internals.send_status(format!(
+                                        "Connection issue, retrying... (attempt {}/{})",
+                                        attempt, retry_config.max_retries
+                                    ));
+                                    tokio::time::sleep(std::time::Duration::from_secs(
+                                        retry_config.retry_delay_secs,
+                                    ))
+                                    .await;
+                                    continue;
                                 }
+
+                                tracing::error!("[StandardAgent] Error processing turn: {}", e);
+                                internals.send_error(format!("Error: {}", e));
+                                break;
                             }
+                        }
                     }
 
                     // Conversation naming removed — it caused a 30-second blocking
@@ -181,8 +179,6 @@ impl StandardAgent {
 
         Ok(())
     }
-
-
 
     /// Process a single user turn (may involve multiple LLM calls for tool use)
     ///
@@ -313,13 +309,14 @@ impl StandardAgent {
             }
 
             // Call LLM with streaming (always enabled)
-            let (content_blocks, stop_reason) = self.call_llm_streaming_with_cache(
-                internals,
-                messages_with_cache,
-                tools_with_cache,
-                system_with_cache,
-            )
-            .await?;
+            let (content_blocks, stop_reason) = self
+                .call_llm_streaming_with_cache(
+                    internals,
+                    messages_with_cache,
+                    tools_with_cache,
+                    system_with_cache,
+                )
+                .await?;
 
             tracing::info!(
                 "[StandardAgent] LLM response: stop_reason={:?}",
@@ -356,14 +353,7 @@ impl StandardAgent {
 
                     // Execute tool (if tools configured)
                     let result = if let Some(ref tools) = self.config.tools {
-                        ToolExecutor::execute(
-                            internals,
-                            tools,
-                            name,
-                            id,
-                            input,
-                        )
-                        .await
+                        ToolExecutor::execute(internals, tools, name, id, input).await
                     } else {
                         ToolResult::error(format!("No tools configured, cannot execute: {}", name))
                     };
@@ -572,9 +562,7 @@ impl StandardAgent {
 
         // 1. Add cache control to last tool definition (caches all tools)
         if let Some(last_tool) = tool_definitions.last_mut() {
-            *last_tool = last_tool
-                .clone()
-                .with_cache_control(marker.clone());
+            *last_tool = last_tool.clone().with_cache_control(marker.clone());
         }
 
         // 2. Stamp up to 2 system messages from the front
@@ -606,10 +594,10 @@ impl StandardAgent {
         }
 
         // 4. System prompt with cache control (as a single block with marker)
-        let system_prompt = Some(SystemPrompt::Blocks(vec![
-            SystemBlock::new(system_prompt_text.to_string())
-                .with_cache_control(marker.clone()),
-        ]));
+        let system_prompt = Some(SystemPrompt::Blocks(vec![SystemBlock::new(
+            system_prompt_text.to_string(),
+        )
+        .with_cache_control(marker.clone())]));
 
         (tool_definitions, system_prompt, messages)
     }
@@ -942,7 +930,10 @@ mod tests {
             MessageContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 1);
                 match &blocks[0] {
-                    ContentBlock::Text { text, cache_control } => {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
                         assert_eq!(text, "Hello world");
                         assert!(cache_control.is_some());
                         assert_eq!(cache_control.as_ref().unwrap().cache_type, "ephemeral");
@@ -984,7 +975,10 @@ mod tests {
                 assert!(blocks[0].as_text() == Some("Part 1"));
                 // Last block should have cache_control
                 match &blocks[1] {
-                    ContentBlock::Text { text, cache_control } => {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
                         assert_eq!(text, "Part 2");
                         assert!(cache_control.is_some());
                     }
@@ -999,9 +993,10 @@ mod tests {
     fn test_stamp_message_end_does_not_double_stamp() {
         let marker = CacheControl::ephemeral_1h();
         let other_marker = CacheControl::ephemeral_5m();
-        let mut msg = Message::user_with_blocks(vec![
-            ContentBlock::text_with_cache("Already cached", other_marker),
-        ]);
+        let mut msg = Message::user_with_blocks(vec![ContentBlock::text_with_cache(
+            "Already cached",
+            other_marker,
+        )]);
 
         // First stamp succeeds
         let result1 = stamp_message_end(&marker, &mut msg);

@@ -365,8 +365,7 @@ mod tests {
     #[test]
     fn test_all_schemas_are_objects() {
         for &def in ALL {
-            let v: serde_json::Value =
-                serde_json::from_str(def.input_schema_json).unwrap();
+            let v: serde_json::Value = serde_json::from_str(def.input_schema_json).unwrap();
             assert_eq!(
                 v.get("type").and_then(|t| t.as_str()),
                 Some("object"),
@@ -380,8 +379,7 @@ mod tests {
     #[test]
     fn test_all_schemas_have_properties() {
         for &def in ALL {
-            let v: serde_json::Value =
-                serde_json::from_str(def.input_schema_json).unwrap();
+            let v: serde_json::Value = serde_json::from_str(def.input_schema_json).unwrap();
             assert!(
                 v.get("properties").and_then(|p| p.as_object()).is_some(),
                 "schema for '{}' must have a 'properties' object",
@@ -400,10 +398,7 @@ mod tests {
     #[test]
     fn test_all_names_non_empty() {
         for &def in ALL {
-            assert!(
-                !def.name.is_empty(),
-                "all defs must have a non-empty name"
-            );
+            assert!(!def.name.is_empty(), "all defs must have a non-empty name");
         }
     }
 
@@ -424,11 +419,7 @@ mod tests {
     fn test_no_duplicate_names() {
         let mut seen = std::collections::HashSet::new();
         for &def in ALL {
-            assert!(
-                seen.insert(def.name),
-                "duplicate tool name '{}'",
-                def.name
-            );
+            assert!(seen.insert(def.name), "duplicate tool name '{}'", def.name);
         }
     }
 
@@ -452,8 +443,7 @@ mod tests {
     /// Native tools are those executed in-process.
     #[test]
     fn test_native_tool_kinds() {
-        let natives: std::collections::HashSet<&str> =
-            ["AskUserQuestion", "Transfer"].into();
+        let natives: std::collections::HashSet<&str> = ["AskUserQuestion", "Transfer"].into();
         for &def in ALL {
             if natives.contains(def.name) {
                 assert_eq!(
@@ -469,9 +459,17 @@ mod tests {
     /// No tool should be unclassified (every name maps to exactly one kind).
     #[test]
     fn test_all_kinds_covered() {
-        let classified: std::collections::HashSet<&str> =
-            ["Bash", "Read", "Write", "Edit", "Glob", "Grep",
-             "AskUserQuestion", "Transfer"].into();
+        let classified: std::collections::HashSet<&str> = [
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "AskUserQuestion",
+            "Transfer",
+        ]
+        .into();
         for &def in ALL {
             assert!(
                 classified.contains(def.name),
@@ -492,8 +490,7 @@ mod tests {
     #[test]
     fn test_required_properties_exist() {
         for &def in ALL {
-            let v: serde_json::Value =
-                serde_json::from_str(def.input_schema_json).unwrap();
+            let v: serde_json::Value = serde_json::from_str(def.input_schema_json).unwrap();
             if let Some(required) = v.get("required").and_then(|r| r.as_array()) {
                 let props = v["properties"].as_object().unwrap();
                 for field in required {
@@ -516,18 +513,24 @@ mod tests {
     /// Bash schema: the longest schema still parses correctly.
     #[test]
     fn test_grep_schema_parses() {
-        let v: serde_json::Value =
-            serde_json::from_str(grep::DEF.input_schema_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(grep::DEF.input_schema_json).unwrap();
         let props = v["properties"].as_object().unwrap();
         // Grep has many properties — at least 10
-        assert!(props.len() >= 10, "Grep schema has {} properties", props.len());
+        assert!(
+            props.len() >= 10,
+            "Grep schema has {} properties",
+            props.len()
+        );
     }
 
     /// AskUserQuestion schema: includes special characters (newlines, quotes).
     #[test]
     fn test_ask_user_description_has_special_chars() {
         let desc = ask_user_question::DEF.description;
-        assert!(desc.contains("\"Other\""), "description should contain escaped quotes");
+        assert!(
+            desc.contains("\"Other\""),
+            "description should contain escaped quotes"
+        );
         assert!(desc.contains("\n"), "description should contain newlines");
     }
 
@@ -536,11 +539,9 @@ mod tests {
     #[test]
     fn test_schema_round_trip() {
         for &def in ALL {
-            let original: serde_json::Value =
-                serde_json::from_str(def.input_schema_json).unwrap();
+            let original: serde_json::Value = serde_json::from_str(def.input_schema_json).unwrap();
             let serialized = serde_json::to_string(&original).unwrap();
-            let parsed: serde_json::Value =
-                serde_json::from_str(&serialized).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
             assert_eq!(
                 original, parsed,
                 "round-trip for '{}' did not preserve schema",
@@ -552,8 +553,7 @@ mod tests {
     /// A ToolDef with only one property (Transfer) has a valid schema.
     #[test]
     fn test_transfer_single_property() {
-        let v: serde_json::Value =
-            serde_json::from_str(transfer::DEF.input_schema_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(transfer::DEF.input_schema_json).unwrap();
         let props = v["properties"].as_object().unwrap();
         assert_eq!(props.len(), 1, "Transfer has {} properties", props.len());
         assert!(props.contains_key("file_path"));

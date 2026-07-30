@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -38,8 +38,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::screen::Screen;
 use crate::style::{
-    BlockId, Cell, Span, StyledBlock, StyledText, display_width, emit_styled_cells,
-    layout_block, layout_lines,
+    display_width, emit_styled_cells, layout_block, layout_lines, BlockId, Cell, Span, StyledBlock,
+    StyledText,
 };
 
 // ---------------------------------------------------------------------------
@@ -351,7 +351,6 @@ impl TermHandle {
         self.lock().status_line = None;
         self.redraw.notify();
     }
-
 
     pub fn get_buffer(&self) -> String {
         self.lock().buffer.clone()
@@ -811,7 +810,9 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                     } else if cur >= 1 {
                         // Transpose chars before cursor
                         let chars: Vec<(usize, char)> = st.buffer.char_indices().collect();
-                        let pos = chars.iter().position(|&(i, _)| i == cur)
+                        let pos = chars
+                            .iter()
+                            .position(|&(i, _)| i == cur)
                             .unwrap_or(chars.len());
                         if pos >= 2 {
                             let a = pos - 2;
@@ -841,12 +842,13 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                     // Skip trailing whitespace.
                     let trimmed_end = before.trim_end_matches(|c: char| c.is_ascii_whitespace());
                     // Find the last whitespace before that (word boundary).
-                    let delete_start =
-                        if let Some(last_space) = trimmed_end.rfind(|c: char| c.is_ascii_whitespace()) {
-                            last_space + 1
-                        } else {
-                            0
-                        };
+                    let delete_start = if let Some(last_space) =
+                        trimmed_end.rfind(|c: char| c.is_ascii_whitespace())
+                    {
+                        last_space + 1
+                    } else {
+                        0
+                    };
                     let killed = st.buffer[delete_start..cur].to_string();
                     st.buffer.drain(delete_start..cur);
                     st.cursor = delete_start;
@@ -938,7 +940,7 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
                 let _ = tx.send(InputMessage::Event(Event::BufferChanged));
             }
             _ => {}
-        }
+        },
         KeyCode::Char(c) => {
             let pos = st.cursor;
             st.buffer.insert(pos, c);
@@ -1052,11 +1054,12 @@ fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<Inpu
             if cur > 0 {
                 let before = &st.buffer[..cur];
                 let trimmed = before.trim_end_matches(|c: char| c.is_ascii_whitespace());
-                let delete_start = if let Some(prev_space) = trimmed.rfind(|c: char| c.is_ascii_whitespace()) {
-                    prev_space + 1
-                } else {
-                    0
-                };
+                let delete_start =
+                    if let Some(prev_space) = trimmed.rfind(|c: char| c.is_ascii_whitespace()) {
+                        prev_space + 1
+                    } else {
+                        0
+                    };
                 let killed = st.buffer[delete_start..cur].to_string();
                 st.buffer.drain(delete_start..cur);
                 st.cursor = delete_start;
@@ -1176,7 +1179,9 @@ struct Snapshot {
 
 fn take_snapshot(st: &mut SharedState) -> Snapshot {
     let grab = |ids: &[BlockId], blocks: &HashMap<BlockId, StyledBlock>| {
-        ids.iter().filter_map(|id| blocks.get(id).cloned()).collect()
+        ids.iter()
+            .filter_map(|id| blocks.get(id).cloned())
+            .collect()
     };
     Snapshot {
         shutdown: st.shutdown,
@@ -1399,7 +1404,13 @@ fn render_shutdown(
     let layout = layout_frame(snap);
     let height = snap.height;
     let fixed_height = layout.all_lines.len() - layout.log_end;
-    let metrics = plan_metrics(model, layout.log_end, fixed_height, layout.cursor_row, height);
+    let metrics = plan_metrics(
+        model,
+        layout.log_end,
+        fixed_height,
+        layout.cursor_row,
+        height,
+    );
     let mut render_lines = build_render_lines(&layout, metrics.rubber_height);
     render_lines.truncate(metrics.render_len);
 

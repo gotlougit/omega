@@ -14,12 +14,12 @@ use std::sync::{
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use omega_core::core::{
-    output::UserQuestion, AgentContext, AgentState, CacheTelemetry, FrameworkError, FrameworkResult,
-    InputMessage, OutputChunk,
-};
 use crate::runtime::channels::{InputReceiver, OutputSender};
 use crate::session::AgentSession;
+use omega_core::core::{
+    output::UserQuestion, AgentContext, AgentState, CacheTelemetry, FrameworkError,
+    FrameworkResult, InputMessage, OutputChunk,
+};
 use omega_core::core::{ToolResult, ToolRuntime};
 
 /// Internal state passed to agent functions.
@@ -73,8 +73,6 @@ impl AgentInternals {
     pub async fn receive(&mut self) -> Option<InputMessage> {
         self.input_rx.recv().await
     }
-
-
 
     // ------------------------------------------------------------------
     // Output methods

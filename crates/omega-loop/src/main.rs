@@ -232,9 +232,7 @@ async fn handle_connection(
                 }
                 Err(e) => {
                     tracing::warn!("list_models error: {e}");
-                    let _ = event_tx.send(ServerEvent::ModelList {
-                        models: Vec::new(),
-                    });
+                    let _ = event_tx.send(ServerEvent::ModelList { models: Vec::new() });
                 }
             }
             continue;
@@ -288,7 +286,8 @@ async fn handle_connection(
                         agent_cfg = agent_cfg.with_thinking(16000);
                     }
 
-                    let agent = StandardAgent::new(agent_cfg, current_provider.read().unwrap().clone());
+                    let agent =
+                        StandardAgent::new(agent_cfg, current_provider.read().unwrap().clone());
 
                     // --- spawn agent task --------------------------------
                     let handle = runtime
@@ -396,8 +395,7 @@ async fn handle_connection(
                         };
 
                         let prov = current_provider.read().unwrap().clone();
-                        let agent_cfg = AgentConfig::new()
-                            .with_tools(tools.clone());
+                        let agent_cfg = AgentConfig::new().with_tools(tools.clone());
                         let agent = StandardAgent::new(agent_cfg, prov);
 
                         let handle = runtime
@@ -443,15 +441,20 @@ async fn handle_connection(
                                 "user" => {
                                     let content = match &msg.content {
                                         omega_llm::MessageContent::Text(t) => t.clone(),
-                                        omega_llm::MessageContent::Blocks(blocks) => {
-                                            blocks.iter().filter_map(|b| {
-                                                if let omega_llm::ContentBlock::Text { text, .. } = b {
+                                        omega_llm::MessageContent::Blocks(blocks) => blocks
+                                            .iter()
+                                            .filter_map(|b| {
+                                                if let omega_llm::ContentBlock::Text {
+                                                    text, ..
+                                                } = b
+                                                {
                                                     Some(text.clone())
                                                 } else {
                                                     None
                                                 }
-                                            }).collect::<Vec<_>>().join(" ")
-                                        }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" "),
                                     };
                                     let _ = event_tx.send(ServerEvent::SystemMsg {
                                         message: format!("[History] User: {content}"),
@@ -460,15 +463,20 @@ async fn handle_connection(
                                 "assistant" => {
                                     let content = match &msg.content {
                                         omega_llm::MessageContent::Text(t) => t.clone(),
-                                        omega_llm::MessageContent::Blocks(blocks) => {
-                                            blocks.iter().filter_map(|b| {
-                                                if let omega_llm::ContentBlock::Text { text, .. } = b {
+                                        omega_llm::MessageContent::Blocks(blocks) => blocks
+                                            .iter()
+                                            .filter_map(|b| {
+                                                if let omega_llm::ContentBlock::Text {
+                                                    text, ..
+                                                } = b
+                                                {
                                                     Some(text.clone())
                                                 } else {
                                                     None
                                                 }
-                                            }).collect::<Vec<_>>().join(" ")
-                                        }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" "),
                                     };
                                     if !content.is_empty() {
                                         let _ = event_tx.send(ServerEvent::SystemMsg {
@@ -516,8 +524,7 @@ async fn handle_connection(
                 ) {
                     Ok(agent_session) => {
                         let prov = current_provider.read().unwrap().clone();
-                        let agent_cfg = AgentConfig::new()
-                            .with_tools(tools.clone());
+                        let agent_cfg = AgentConfig::new().with_tools(tools.clone());
                         let agent = StandardAgent::new(agent_cfg, prov);
 
                         let handle = runtime

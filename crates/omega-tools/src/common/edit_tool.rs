@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-use omega_core::core::{ToolInfo, ToolResult};
-use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
+use omega_core::core::ToolRuntime;
+use omega_core::core::{ToolInfo, ToolResult};
 use omega_llm::{ToolDefinition, ToolInputSchema};
 
 /// Edit tool for string replacement in files
@@ -202,7 +202,6 @@ impl Tool for EditTool {
             Err(e) => Ok(ToolResult::error(format!("{}", e))),
         }
     }
-
 }
 
 // Tests temporarily disabled - require ToolRuntime test helper

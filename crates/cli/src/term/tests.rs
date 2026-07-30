@@ -27,7 +27,12 @@ struct TestTerm {
 fn test_term() -> TestTerm {
     let (capture, buf) = Capture::new();
     let (term, handle, input) = Term::new_virtual(COLS, ROWS, prompt(), capture);
-    TestTerm { term, handle, input, buf }
+    TestTerm {
+        term,
+        handle,
+        input,
+        buf,
+    }
 }
 
 fn key(c: char) -> RawEvent {
@@ -235,9 +240,18 @@ fn launch_renders_without_clearing() {
     tt.handle.redraw_sync();
 
     let out = raw(&tt);
-    assert!(!out.windows(4).any(|w| w == b"\x1b[2J"), "launch cleared screen");
-    assert!(!out.windows(4).any(|w| w == b"\x1b[3J"), "launch cleared scrollback");
-    assert!(!out.windows(3).any(|w| w == b"\x1b[H"), "launch homed cursor");
+    assert!(
+        !out.windows(4).any(|w| w == b"\x1b[2J"),
+        "launch cleared screen"
+    );
+    assert!(
+        !out.windows(4).any(|w| w == b"\x1b[3J"),
+        "launch cleared scrollback"
+    );
+    assert!(
+        !out.windows(3).any(|w| w == b"\x1b[H"),
+        "launch homed cursor"
+    );
 
     let em = emulator(&tt);
     let lines = em.screen_lines();
@@ -245,7 +259,10 @@ fn launch_renders_without_clearing() {
     assert_eq!(lines[1], "LINE1");
     assert_eq!(lines[2], "LINE2");
     assert_eq!(lines[3], "P>");
-    assert!(lines[4..].iter().all(|l| l.is_empty()), "prompt bottom-pinned: {lines:?}");
+    assert!(
+        lines[4..].iter().all(|l| l.is_empty()),
+        "prompt bottom-pinned: {lines:?}"
+    );
     assert_eq!(em.cursor(), (3, 3));
     assert!(em.history().is_empty(), "scrollback polluted at launch");
 
@@ -343,7 +360,15 @@ fn resize_triggers_full_render() {
     tt.input.send(RawEvent::Resize(12, 5)).expect("input open");
     wait_for(
         &mut tt.term,
-        |e| matches!(e, Event::Resize { width: 12, height: 5 }),
+        |e| {
+            matches!(
+                e,
+                Event::Resize {
+                    width: 12,
+                    height: 5
+                }
+            )
+        },
         "Resize",
     );
     tt.handle.redraw_sync();
@@ -380,7 +405,10 @@ fn clear_output_clears_screen_and_scrollback() {
     tt.handle.redraw_sync();
 
     let out = raw(&tt);
-    assert!(out.windows(4).any(|w| w == b"\x1b[3J"), "no full render on clear");
+    assert!(
+        out.windows(4).any(|w| w == b"\x1b[3J"),
+        "no full render on clear"
+    );
 
     // Full render homes + clears, so one emulator over the whole stream works.
     let em = emulator(&tt);
@@ -441,7 +469,11 @@ fn paste_inserts_text() {
     tt.input
         .send(RawEvent::Paste("hello".to_string()))
         .expect("input open");
-    wait_for(&mut tt.term, |e| matches!(e, Event::BufferChanged), "BufferChanged");
+    wait_for(
+        &mut tt.term,
+        |e| matches!(e, Event::BufferChanged),
+        "BufferChanged",
+    );
     tt.handle.redraw_sync();
 
     assert_eq!(tt.handle.get_buffer(), "hello");

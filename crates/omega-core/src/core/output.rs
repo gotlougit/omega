@@ -332,7 +332,6 @@ impl InputMessage {
     pub fn user_input(text: impl Into<String>) -> Self {
         InputMessage::UserInput(text.into())
     }
-
 }
 
 #[cfg(test)]
@@ -466,7 +465,8 @@ mod tests {
 
     #[test]
     fn test_cache_telemetry_deserialization() {
-        let json = r#"{"input_tokens": 500, "cache_read_tokens": 400, "cache_creation_tokens": 100}"#;
+        let json =
+            r#"{"input_tokens": 500, "cache_read_tokens": 400, "cache_creation_tokens": 100}"#;
         let t: CacheTelemetry = serde_json::from_str(json).unwrap();
         assert_eq!(t.input_tokens, 500);
         assert_eq!(t.cache_read_tokens, 400);

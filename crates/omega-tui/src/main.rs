@@ -12,10 +12,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::runtime::Runtime;
 
+use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
 use omega_loop_client::{
     AgentdClient, DaemonReader, DaemonWriter, OutputChunk, ServerEvent, SessionConfig,
 };
-use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
 
 mod markdown;
 
@@ -54,7 +54,6 @@ fn s_cache_miss() -> Style {
     sty(Color::DarkGrey)
 }
 
-
 /// Render `text` as markdown into a [`StyledBlock`], using the current
 /// terminal width (obtained from the handle) for line wrapping.
 fn render_md_block(handle: &TermHandle, text: &str) -> StyledBlock {
@@ -92,14 +91,8 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 enum DaemonCmd {
-    Run {
-        session_id: String,
-        content: String,
-    },
-    SetModel {
-        session_id: String,
-        model: String,
-    },
+    Run { session_id: String, content: String },
+    SetModel { session_id: String, model: String },
     ListModels,
     ListSessions,
     Resume(String),
@@ -172,10 +165,7 @@ async fn daemon_loop(
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                     }
                 }
-                Ok(DaemonCmd::SetModel {
-                    session_id,
-                    model,
-                }) => {
+                Ok(DaemonCmd::SetModel { session_id, model }) => {
                     if let Err(e) = writer.send_set_model(&session_id, &model, 16384).await {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "send_set_model failed");
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
@@ -219,7 +209,10 @@ async fn daemon_loop(
         // Read one event from daemon (with timeout so commands aren't starved)
         match tokio::time::timeout(Duration::from_millis(50), reader.recv_event()).await {
             Ok(Ok(Some(event))) => {
-                if app_tx.send(AppEvent::Daemon(DaemonEv::Event(event))).is_err() {
+                if app_tx
+                    .send(AppEvent::Daemon(DaemonEv::Event(event)))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -271,7 +264,10 @@ fn tool_call_line(name: &str, input: &serde_json::Value) -> String {
             // Collapse multi-line values (e.g. shell scripts) into one row.
             let one_line = value.trim().lines().collect::<Vec<_>>().join(" ; ");
             if !one_line.is_empty() {
-                return format!("tool call {name}: {}", cli::truncate_to_width(&one_line, 120));
+                return format!(
+                    "tool call {name}: {}",
+                    cli::truncate_to_width(&one_line, 120)
+                );
             }
         }
     }
@@ -312,13 +308,17 @@ fn handle_daemon_event(
                 }
                 streaming.buf.push_str(&s);
                 if let Some(id) = streaming.block_id {
-                    let block =
-                        StyledBlock::new(StyledText::from(Span::new(streaming.buf.clone(), s_assistant())));
+                    let block = StyledBlock::new(StyledText::from(Span::new(
+                        streaming.buf.clone(),
+                        s_assistant(),
+                    )));
                     handle.set_block(id, block);
                     handle.redraw();
                 } else {
-                    let block =
-                        StyledBlock::new(StyledText::from(Span::new(streaming.buf.clone(), s_assistant())));
+                    let block = StyledBlock::new(StyledText::from(Span::new(
+                        streaming.buf.clone(),
+                        s_assistant(),
+                    )));
                     streaming.block_id = Some(handle.print_output(block));
                 }
             }
@@ -336,7 +336,10 @@ fn handle_daemon_event(
                 }
             }
             OutputChunk::ThinkingDelta(s) => {
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(s, s_thinking()))));
+                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                    s,
+                    s_thinking(),
+                ))));
             }
             OutputChunk::ThinkingComplete(s) => {
                 if !s.is_empty() {
@@ -429,7 +432,8 @@ fn handle_daemon_event(
                 cache_read_tokens,
                 cache_creation_tokens,
             } => {
-                app.cache.update(input_tokens, cache_read_tokens, cache_creation_tokens);
+                app.cache
+                    .update(input_tokens, cache_read_tokens, cache_creation_tokens);
                 refresh_cache_status(handle, app);
             }
             OutputChunk::Unknown => {}
@@ -555,11 +559,7 @@ impl CacheStats {
         let bar_width = (terminal_width.saturating_sub(60)).max(10).min(40);
         let fill = ((pct / 100.0) * bar_width as f64).round() as usize;
         let empty = bar_width.saturating_sub(fill);
-        let bar: String = format!(
-            "{}{}",
-            "█".repeat(fill),
-            "░".repeat(empty),
-        );
+        let bar: String = format!("{}{}", "█".repeat(fill), "░".repeat(empty),);
 
         let total_k = self.total_input_tokens as f64 / 1000.0;
         let cached_k = self.total_cache_read_tokens as f64 / 1000.0;
@@ -611,9 +611,18 @@ fn process_line(
 
     // Check if this is a known slash command.
     let known_commands: &[&str] = &[
-        "/quit", "/exit", "/status", "/help", "/clear",
-        "/models", "/sessions", "/interrupt", "/compact",
-        "/model", "/new", "/resume",
+        "/quit",
+        "/exit",
+        "/status",
+        "/help",
+        "/clear",
+        "/models",
+        "/sessions",
+        "/interrupt",
+        "/compact",
+        "/model",
+        "/new",
+        "/resume",
     ];
     if !known_commands.contains(&cmd) {
         // Unknown slash command — treat as user text, not an error.
@@ -640,10 +649,8 @@ fn process_line(
         }
 
         "/help" => {
-            let mut st = StyledText::from(Span::new(
-                "Available commands:\n".to_string(),
-                s_system(),
-            ));
+            let mut st =
+                StyledText::from(Span::new("Available commands:\n".to_string(), s_system()));
             for (name, desc) in SLASH_COMMANDS {
                 st.push(Span::new(format!("  {name:<14} {desc}\n"), s_assistant()));
             }
@@ -941,8 +948,7 @@ fn main() -> Result<()> {
                 break models.into_iter().next().unwrap();
             }
             Ok(AppEvent::Daemon(DaemonEv::Event(_))) => continue,
-            Err(mpsc::RecvTimeoutError::Timeout)
-            | Ok(AppEvent::Daemon(DaemonEv::Disconnected)) => {
+            Err(mpsc::RecvTimeoutError::Timeout) | Ok(AppEvent::Daemon(DaemonEv::Disconnected)) => {
                 break std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break "unknown".to_string(),
@@ -981,14 +987,7 @@ fn main() -> Result<()> {
     // events, so the loop below wakes for either source.
     let forwarder = spawn_event_forwarder(term, app_tx.clone());
 
-    run_loop(
-        &handle,
-        &mut app,
-        &app_tx,
-        &app_rx,
-        &cmd_tx,
-        STATUS_TIMEOUT,
-    );
+    run_loop(&handle, &mut app, &app_tx, &app_rx, &cmd_tx, STATUS_TIMEOUT);
 
     // ── Cleanup ────────────────────────────────────────────────────────
     // Shut down the daemon task (drops writer → closes socket → daemon cleans up session)
@@ -1012,10 +1011,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use omega_loop_client::{OutputChunk, ServerEvent, ToolResultWire};
     use cli::emulator::{Capture, Emulator};
     use cli::{BlockId, RawEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use omega_loop_client::{OutputChunk, ServerEvent, ToolResultWire};
     use std::sync::{Arc, Mutex};
 
     const ROWS: usize = 12;
@@ -1079,7 +1078,10 @@ mod tests {
 
     fn submit(fx: &mut Fixture) -> String {
         fx.input
-            .send(RawEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         match fx.term.next_event() {
             Some(Event::Line(line)) => line,
@@ -1195,12 +1197,27 @@ mod tests {
     #[test]
     fn streaming_deltas_update_single_block() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("Hello, ".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("world".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("Hello, ".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("world".into())),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "Hello, world"), 1);
 
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete("Hello, world!".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("Hello, world!".into())),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "Hello, world!"), 1);
         assert_eq!(count_rows_containing(&fx, "Hello, world"), 1);
@@ -1209,8 +1226,18 @@ mod tests {
     #[test]
     fn streaming_then_done_keeps_text() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("partial".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("partial".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "partial"), 1);
         // Done finalizes and resets the streaming tracker for the next turn.
@@ -1221,21 +1248,34 @@ mod tests {
     #[test]
     fn tool_events_render() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::ToolStart {
-            id: "t1".into(),
-            name: "read_file".into(),
-            input: serde_json::json!({"path": "src/main.rs"}),
-        }));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::ToolEnd {
-            id: "t1".into(),
-            result: ToolResultWire {
-                text: "boom".into(),
-                is_error: true,
-                content: None,
-            },
-        }));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolStart {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "src/main.rs"}),
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                result: ToolResultWire {
+                    text: "boom".into(),
+                    is_error: true,
+                    content: None,
+                },
+            }),
+        );
         fx.handle.redraw_sync();
-        assert_eq!(count_rows_containing(&fx, "tool call read_file: src/main.rs"), 1);
+        assert_eq!(
+            count_rows_containing(&fx, "tool call read_file: src/main.rs"),
+            1
+        );
         assert_eq!(count_rows_containing(&fx, "✗ boom"), 1);
     }
 
@@ -1268,9 +1308,14 @@ mod tests {
     #[test]
     fn model_changed_renders_confirmation() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, ServerEvent::ModelChanged {
-            model: "gpt-b".into(),
-        });
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ModelChanged {
+                model: "gpt-b".into(),
+            },
+        );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.model, "gpt-b");
         assert_eq!(count_rows_containing(&fx, "Model changed: gpt-b"), 1);
@@ -1279,8 +1324,18 @@ mod tests {
     #[test]
     fn status_and_error_render() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Status("working…".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Error("it broke".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Status("working…".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Error("it broke".into())),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "working…"), 1);
         assert_eq!(count_rows_containing(&fx, "it broke"), 1);
@@ -1289,9 +1344,14 @@ mod tests {
     #[test]
     fn model_list_renders_and_marks_current() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, ServerEvent::ModelList {
-            models: vec!["gpt-a".into(), "gpt-b".into()],
-        });
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ModelList {
+                models: vec!["gpt-a".into(), "gpt-b".into()],
+            },
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "Available models"), 1);
         assert_eq!(count_rows_containing(&fx, "gpt-a"), 1);
@@ -1317,8 +1377,18 @@ mod tests {
         }
 
         // Daemon streams a reply; then input must be ready for the next turn.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("Hi there".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("Hi there".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
 
         let em = emulator(&fx);
@@ -1330,10 +1400,16 @@ mod tests {
             .collect();
         let user_row = all.iter().position(|l| l.contains("▸ hello")).unwrap();
         let reply_row = all.iter().position(|l| l.contains("Hi there")).unwrap();
-        assert!(user_row < reply_row, "reply must follow the prompt: {all:?}");
+        assert!(
+            user_row < reply_row,
+            "reply must follow the prompt: {all:?}"
+        );
         // Fresh prompt sits below the reply with the cursor after it.
         let prompt_row = all.iter().rposition(|l| l.trim_end() == "P>").unwrap();
-        assert!(reply_row < prompt_row, "no fresh prompt after reply: {all:?}");
+        assert!(
+            reply_row < prompt_row,
+            "no fresh prompt after reply: {all:?}"
+        );
 
         // The input buffer was cleared by the submission and still works.
         type_str(&mut fx, "again");
@@ -1352,8 +1428,18 @@ mod tests {
             let line = submit(&mut fx);
             process_line(&line, &mut fx.app, &fx.handle, &fx.cmd_tx);
             let _ = fx.cmd_rx.try_recv();
-            handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta(reply.into())));
-            handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete(reply.into())));
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(reply.into())),
+            );
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextComplete(reply.into())),
+            );
             fx.handle.redraw_sync();
             fx.streaming.reset();
         }
@@ -1458,9 +1544,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::TextDelta("streamed".into()),
                 ))));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::Done,
-                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
                 std::thread::sleep(Duration::from_millis(50));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -1488,11 +1572,9 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Term(Event::Line("/status".to_string())));
                 // Channel order guarantees run_loop arms the ping before
                 // it sees this reply.
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(
-                    ServerEvent::ModelList {
-                        models: vec!["gpt-a".into(), "gpt-b".into()],
-                    },
-                )));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(ServerEvent::ModelList {
+                    models: vec!["gpt-a".into(), "gpt-b".into()],
+                })));
                 std::thread::sleep(Duration::from_millis(50));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -1583,9 +1665,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::TextDelta("response one".into()),
                 ))));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::Done,
-                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
                 // --- Turn 2 ---
                 std::thread::sleep(Duration::from_millis(20));
                 let _ = app_tx.send(AppEvent::Term(Event::Line("second".to_string())));
@@ -1593,9 +1673,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::TextDelta("response two".into()),
                 ))));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::Done,
-                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
                 std::thread::sleep(Duration::from_millis(40));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -1622,11 +1700,26 @@ mod tests {
         // The first delta creates a history block; subsequent deltas mutate
         // it in place (the id stays stable and no extra rows appear).
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("a".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("a".into())),
+        );
         let id: BlockId = fx.streaming.block_id.expect("block created");
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("b".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("b".into())),
+        );
         assert_eq!(fx.streaming.block_id, Some(id));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("c".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("c".into())),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "abc"), 1);
     }
@@ -1642,10 +1735,25 @@ mod tests {
     fn textdelta_after_textcomplete_ignored() {
         let mut fx = fixture();
         // Turn 1: TextDelta starts streaming, TextComplete finalizes.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("final".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete("final".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("final".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("final".into())),
+        );
         // streaming.finalized is now true; next TextDelta auto-resets for a new turn.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("late".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("late".into())),
+        );
         fx.handle.redraw_sync();
         // "late" starts a new turn (auto-reset on finalized) — it IS visible.
         assert_eq!(count_rows_containing(&fx, "late"), 1);
@@ -1659,7 +1767,12 @@ mod tests {
     #[test]
     fn done_without_any_textdelta_is_noop() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert!(fx.streaming.block_id.is_none());
         assert!(fx.streaming.buf.is_empty());
@@ -1671,10 +1784,25 @@ mod tests {
     #[test]
     fn two_dones_are_idempotent() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("hi".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("hi".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         assert!(!fx.streaming.finalized); // reset already
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "hi"), 1);
     }
@@ -1684,18 +1812,42 @@ mod tests {
     #[test]
     fn tool_events_render_after_done() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("text".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("text".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         // streaming is reset; tool events should still render.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::ToolStart {
-            id: "t2".into(),
-            name: "Bash".into(),
-            input: serde_json::json!({"command": "ls"}),
-        }));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::ToolEnd {
-            id: "t2".into(),
-            result: ToolResultWire { text: "done".into(), is_error: false, content: None },
-        }));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolStart {
+                id: "t2".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t2".into(),
+                result: ToolResultWire {
+                    text: "done".into(),
+                    is_error: false,
+                    content: None,
+                },
+            }),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "tool call Bash: ls"), 1);
         assert_eq!(count_rows_containing(&fx, "done"), 1);
@@ -1706,8 +1858,18 @@ mod tests {
     #[test]
     fn textcomplete_without_prior_delta_creates_block() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("only".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete("only".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("only".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("only".into())),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "only"), 1);
         // finalized is true after TextComplete.
@@ -1720,10 +1882,25 @@ mod tests {
     #[test]
     fn textdelta_after_done_starts_new_block() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("before".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("before".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         // Done called reset() — streaming is clean.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("after".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("after".into())),
+        );
         fx.handle.redraw_sync();
         // "after" creates a new block.
         assert_eq!(count_rows_containing(&fx, "before"), 1);
@@ -1738,14 +1915,25 @@ mod tests {
         for i in 0..50 {
             let s = format!("chunk{i} ");
             expected.push_str(&s);
-            handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta(s)));
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(s)),
+            );
         }
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         // Every chunk word must be present in the output (join all rendered
         // rows so wrapping doesn't defeat the substring search).
         let all_rendered = emulator(&fx)
-            .history().iter()
+            .history()
+            .iter()
             .chain(emulator(&fx).screen_lines().iter())
             .cloned()
             .collect::<Vec<_>>()
@@ -1763,9 +1951,24 @@ mod tests {
     fn textcomplete_before_done_leaves_streaming_stuck() {
         let mut fx = fixture();
         // Turn 1: TextDelta → TextComplete → Done.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("partial".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete("corrected".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("partial".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("corrected".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
 
         // CORRECT: Done resets streaming so the next turn works.
@@ -1774,7 +1977,12 @@ mod tests {
             "BUG: TextComplete before Done leaves streaming untouched — Done never resets"
         );
         // Turn 2 should render.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("turn2".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("turn2".into())),
+        );
         fx.handle.redraw_sync();
         assert!(
             count_rows_containing(&fx, "turn2") > 0,
@@ -1794,7 +2002,12 @@ mod tests {
     fn clear_during_streaming_orphans_the_block() {
         let mut fx = fixture();
         // Simulate an in-flight streaming block.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("before-clear".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("before-clear".into())),
+        );
         let id_before = fx.streaming.block_id;
         assert!(id_before.is_some());
 
@@ -1803,8 +2016,18 @@ mod tests {
         fx.handle.redraw_sync();
 
         // Agent continues streaming the same turn.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("after-clear".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("after-clear".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
 
         // CORRECT behavior: "after-clear" text should be visible.
@@ -1822,7 +2045,12 @@ mod tests {
     fn new_session_during_streaming_orphans_the_block() {
         let mut fx = fixture();
         // Streaming is live.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("old-session".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("old-session".into())),
+        );
         assert!(fx.streaming.block_id.is_some());
 
         // User creates a new session mid-stream.
@@ -1830,8 +2058,18 @@ mod tests {
         fx.handle.redraw_sync();
 
         // More deltas arrive for the same logical block.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("new-text".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("new-text".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
 
         assert!(
@@ -1846,11 +2084,26 @@ mod tests {
     fn textcomplete_without_done_blocks_next_turn() {
         let mut fx = fixture();
         // Turn 1: TextDelta then TextComplete (no Done).
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("turn1".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete("turn1".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("turn1".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("turn1".into())),
+        );
         assert!(fx.streaming.finalized);
         // Turn 2: the next TextDelta should auto-reset and NOT be dropped.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("turn2".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("turn2".into())),
+        );
         fx.handle.redraw_sync();
         assert!(
             count_rows_containing(&fx, "turn2") > 0,
@@ -1863,12 +2116,27 @@ mod tests {
     #[test]
     fn done_resets_for_next_turn() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("first".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("first".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         assert!(!fx.streaming.finalized);
         assert!(fx.streaming.block_id.is_none());
         // Second turn.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("second".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("second".into())),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "second"), 1);
     }
@@ -1914,14 +2182,27 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "data");
         // Send Ctrl-D ('d' with CTRL modifier).
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         // Ctrl-D on non-empty buffer deletes the character at cursor.
         // Cursor is at end (after 'a'), so it does nothing.
         // Move cursor back and try again.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         let _ = fx.term.next_event(); // BufferChanged
         assert_eq!(fx.handle.get_buffer(), "ata");
@@ -1933,12 +2214,27 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "hello");
         // Move cursor left twice, putting it after "hel".
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
-        // Send Ctrl-U.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))).unwrap();
+                                      // Send Ctrl-U.
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
         assert_eq!(fx.handle.get_buffer(), "lo");
     }
@@ -1949,10 +2245,20 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "abc");
         assert_eq!(fx.handle.get_cursor(), 3);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 3);
     }
@@ -1964,11 +2270,21 @@ mod tests {
         assert_eq!(fx.handle.get_buffer(), "");
         assert_eq!(fx.handle.get_cursor(), 0);
         // Home on empty buffer — stays at 0, no event
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         // No event fires because cursor didn't change (already at 0)
         assert_eq!(fx.handle.get_cursor(), 0);
         // End on empty buffer — stays at 0, no event
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         assert_eq!(fx.handle.get_cursor(), 0);
     }
 
@@ -1979,13 +2295,28 @@ mod tests {
         type_str(&mut fx, "hello");
         // Already at end (cursor=5), End should stay at 5 with no event
         assert_eq!(fx.handle.get_cursor(), 5);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         assert_eq!(fx.handle.get_cursor(), 5);
         // Move to start, Home should stay at 0 with no event
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         assert_eq!(fx.handle.get_cursor(), 0);
     }
 
@@ -1997,11 +2328,21 @@ mod tests {
         assert_eq!(fx.handle.get_cursor(), 6); // 1 + 2 + 3 bytes
         assert_eq!(fx.handle.get_buffer(), "aé漢");
         // Home to start (cursor moves, fires BufferChanged)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // End back to end
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 6);
         // Type more after End appends at cursor (6), then move to end
@@ -2009,11 +2350,21 @@ mod tests {
         assert_eq!(fx.handle.get_cursor(), 11);
         assert_eq!(fx.handle.get_buffer(), "aé漢 more");
         // Home from the end of the longer buffer
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // End back to end
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 11);
     }
@@ -2025,16 +2376,31 @@ mod tests {
         type_str(&mut fx, "hello world");
         // Move cursor to position 5 (between 'hello' and ' world')
         for _ in 0..6 {
-            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            fx.input
+                .send(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
             let _ = fx.term.next_event();
         }
         assert_eq!(fx.handle.get_cursor(), 5);
         // Home from middle — should go to 0
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // End from start — should go to end
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::End,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 11);
     }
@@ -2053,7 +2419,12 @@ mod tests {
         assert_eq!(fx.handle.get_cursor(), 6); // 3 + 3
         assert_eq!(fx.handle.get_buffer(), "aé漢");
         // Backspace once — should delete '漢'.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_buffer(), "aé");
         assert_eq!(fx.handle.get_cursor(), 3);
@@ -2067,11 +2438,19 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "/mo");
         // Press Tab — inserts \t and emits BufferChanged.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         // Drain the BufferChanged event.
         assert_eq!(fx.term.next_event(), Some(Event::BufferChanged));
         // Buffer now ends with \t — the run_loop handler will trim and complete.
-        assert!(fx.handle.get_buffer().ends_with('\t'), "Tab should insert a literal \\t");
+        assert!(
+            fx.handle.get_buffer().ends_with('\t'),
+            "Tab should insert a literal \\t"
+        );
         // Simulate run_loop's BufferChanged handler.
         let buf = fx.handle.get_buffer();
         let trimmed = buf[..buf.len() - 1].to_string();
@@ -2092,7 +2471,12 @@ mod tests {
     fn set_block_after_clear_does_not_render() {
         let fx = fixture();
         // Create a block.
-        let id = fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new("hello", s_assistant()))));
+        let id = fx
+            .handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "hello",
+                s_assistant(),
+            ))));
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "hello"), 1);
         // Clear everything.
@@ -2100,7 +2484,10 @@ mod tests {
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "hello"), 0);
         // set_block with the same id — should either render or re-add to history.
-        fx.handle.set_block(id, StyledBlock::new(StyledText::from(Span::new("ghost", s_assistant()))));
+        fx.handle.set_block(
+            id,
+            StyledBlock::new(StyledText::from(Span::new("ghost", s_assistant()))),
+        );
         fx.handle.redraw_sync();
         assert!(
             count_rows_containing(&fx, "ghost") > 0,
@@ -2115,7 +2502,11 @@ mod tests {
         let fx = fixture();
         fx.handle.clear_output();
         fx.handle.redraw_sync();
-        fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new("fresh", s_assistant()))));
+        fx.handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "fresh",
+                s_assistant(),
+            ))));
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "fresh"), 1);
     }
@@ -2125,12 +2516,20 @@ mod tests {
     #[test]
     fn two_consecutive_clears_noop() {
         let fx = fixture();
-        fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new("x", s_assistant()))));
+        fx.handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "x",
+                s_assistant(),
+            ))));
         fx.handle.clear_output();
         fx.handle.clear_output();
         fx.handle.redraw_sync();
         // Terminal should just show the empty prompt.
-        fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new("ok", s_assistant()))));
+        fx.handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "ok",
+                s_assistant(),
+            ))));
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "ok"), 1);
     }
@@ -2149,7 +2548,10 @@ mod tests {
         // Must show usage guidance.
         assert_eq!(count_rows_containing(&fx, "Usage: /model"), 1);
         // Must NOT send a SetModel command.
-        assert!(!matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::SetModel { .. })));
+        assert!(!matches!(
+            fx.cmd_rx.try_recv(),
+            Ok(DaemonCmd::SetModel { .. })
+        ));
     }
 
     // =========================================================================
@@ -2162,15 +2564,35 @@ mod tests {
     fn two_turns_with_clear_between() {
         let mut fx = fixture();
         // Turn 1.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("turn1".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("turn1".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         // Clear.
         fx.handle.clear_output();
         fx.handle.redraw_sync();
         // Turn 2.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("turn2".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("turn2".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "turn1"), 0);
         assert_eq!(count_rows_containing(&fx, "turn2"), 1);
@@ -2199,8 +2621,18 @@ mod tests {
     fn long_streaming_response_wraps_correctly() {
         let mut fx = fixture();
         let long = "x".repeat(COLS + 10);
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta(long.clone())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta(long.clone())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         // The rendered output must include the full long string.
         assert!(transcript_contains(&fx, &long));
@@ -2215,14 +2647,29 @@ mod tests {
     #[test]
     fn resize_during_streaming_preserves_text() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("before-resize".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("before-resize".into())),
+        );
         // Resize the terminal.
         fx.input.send(RawEvent::Resize(80, 20)).expect("input open");
         // Drain the Resize event.
         assert!(matches!(fx.term.next_event(), Some(Event::Resize { .. })));
         // Continue streaming.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta(" after".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta(" after".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert!(
             transcript_contains(&fx, "before-resize after"),
@@ -2278,13 +2725,28 @@ mod tests {
     #[test]
     fn two_dones_with_no_textdelta_between() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         assert!(!fx.streaming.finalized);
         assert!(fx.streaming.block_id.is_none());
         assert!(fx.streaming.buf.is_empty());
         // Next turn works.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("next".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("next".into())),
+        );
         assert!(fx.streaming.block_id.is_some());
     }
 
@@ -2292,7 +2754,12 @@ mod tests {
     #[test]
     fn empty_textdelta_does_not_create_block() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta(String::new())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta(String::new())),
+        );
         fx.handle.redraw_sync();
         // No new block created: streaming.block_id is still None.
         assert!(
@@ -2307,11 +2774,26 @@ mod tests {
     #[test]
     fn late_textcomplete_after_done_creates_duplicate() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("streaming version".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("streaming version".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         // Done reset; late TextComplete is ignored because there is no
         // active streaming block.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextComplete("corrected version".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("corrected version".into())),
+        );
         fx.handle.redraw_sync();
         // Only the original text is visible; no duplicate.
         assert_eq!(count_rows_containing(&fx, "streaming version"), 1);
@@ -2328,7 +2810,11 @@ mod tests {
         type_str(&mut fx, "stuff");
         assert_eq!(fx.handle.get_buffer(), "stuff");
         // Send Ctrl-C.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         // Drain the BufferChanged event.
         match fx.term.next_event() {
@@ -2345,7 +2831,11 @@ mod tests {
     #[test]
     fn ctrl_c_on_empty_buffer_sends_cancel() {
         let mut fx = fixture();
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         match fx.term.next_event() {
             Some(Event::CancelPrompt) => {}
@@ -2359,10 +2849,25 @@ mod tests {
     #[test]
     fn spurious_extra_done_does_not_create_extra_blocks() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("data".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("data".into())),
+        );
         let block_count_before = count_rows_containing(&fx, "data");
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         // Must not duplicate.
         assert_eq!(
@@ -2407,11 +2912,22 @@ mod tests {
     fn ctrl_l_clears_screen() {
         let fx = fixture();
         // Put some content on screen first.
-        fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new("garbage", s_assistant()))));
+        fx.handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "garbage",
+                s_assistant(),
+            ))));
         fx.handle.redraw_sync();
-        assert!(count_rows_containing(&fx, "garbage") > 0, "sanity: content on screen");
+        assert!(
+            count_rows_containing(&fx, "garbage") > 0,
+            "sanity: content on screen"
+        );
         // Send Ctrl-L.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(std::time::Duration::from_millis(50));
         // After Ctrl-L, the screen should be cleared.
@@ -2430,13 +2946,18 @@ mod tests {
         type_str(&mut fx, "hello world");
         assert_eq!(fx.handle.get_buffer(), "hello world");
         // Send Ctrl-W.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(std::time::Duration::from_millis(50));
         // After Ctrl-W, "world" should be deleted, leaving "hello ".
         // BUG: Ctrl-W is silently ignored — buffer is still "hello world".
         assert_eq!(
-            fx.handle.get_buffer(), "hello ",
+            fx.handle.get_buffer(),
+            "hello ",
             "BUG: Ctrl-W should delete previous word but buffer is unchanged"
         );
     }
@@ -2447,7 +2968,12 @@ mod tests {
     #[test]
     fn interrupt_during_streaming_does_not_orphan() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta("pre-interrupt".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("pre-interrupt".into())),
+        );
         let bid = fx.streaming.block_id;
         assert!(bid.is_some());
         // User interrupts.
@@ -2455,8 +2981,18 @@ mod tests {
         // Daemon should send Done to terminate the streaming block.
         // But the streaming tracker is still live.
         // More deltas after interrupt should still render.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::TextDelta(" post-interrupt".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming, chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta(" post-interrupt".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert!(
             transcript_contains(&fx, "pre-interrupt post-interrupt"),
@@ -2473,7 +3009,11 @@ mod tests {
         type_str(&mut fx, "important message");
         assert!(!fx.handle.get_buffer().is_empty());
         // Press Escape → the Term emits Escape but does NOT change buffer.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         // Drain the Escape event.
         assert_eq!(fx.term.next_event(), Some(Event::Escape));
@@ -2489,17 +3029,30 @@ mod tests {
     #[test]
     fn toolend_ok_empty_text_is_silent() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::ToolStart {
                 id: "t1".into(),
                 name: "run".into(),
                 input: serde_json::json!({"command": "true"}),
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         // Verify ToolStart rendered.
-        assert!(count_rows_containing(&fx, "tool call run") > 0, "ToolStart text not found");
-        assert!(count_rows_containing(&fx, "done") == 0, "'done' should not appear before ToolEnd");
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        assert!(
+            count_rows_containing(&fx, "tool call run") > 0,
+            "ToolStart text not found"
+        );
+        assert!(
+            count_rows_containing(&fx, "done") == 0,
+            "'done' should not appear before ToolEnd"
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::ToolEnd {
                 id: "t1".into(),
                 result: omega_loop_client::ToolResultWire {
@@ -2507,7 +3060,8 @@ mod tests {
                     is_error: false,
                     content: None,
                 },
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         // The tool completed — an acknowledgment must be visible.
         assert!(
@@ -2526,19 +3080,31 @@ mod tests {
         assert_eq!(fx.handle.get_buffer(), "first command");
         // Press Enter to "submit" — the run_loop would push to history
         // and clear the buffer, but we test the Term-level expectation.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         match fx.term.next_event() {
             Some(Event::Line(line)) => assert_eq!(line, "first command"),
             other => panic!("expected Line, got {other:?}"),
         }
         // Buffer is now empty. Press Up to recall history.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         // BUG: Up/Down are ignored — no event emitted.  The buffer
         // should contain the previous line.
         // Since next_event() blocks, we send a follow-up key to flush.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         let ev = fx.term.next_event();
         assert_eq!(ev, Some(Event::BufferChanged));
@@ -2555,10 +3121,18 @@ mod tests {
     #[test]
     fn down_arrow_does_nothing() {
         let mut fx = fixture();
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         // Send 'x' to flush.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         let ev = fx.term.next_event();
         // BUG: Down was ignored — only one event (from 'x').
@@ -2572,14 +3146,26 @@ mod tests {
     fn empty_textcomplete_then_done_stucks_streaming() {
         let mut fx = fixture();
         // Empty TextComplete: no active block, so it's a no-op.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextComplete(String::new())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete(String::new())),
+        );
         // Done: no active block, resets anyway.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         // Next turn should work.
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("should appear".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("should appear".into())),
+        );
         fx.handle.redraw_sync();
         assert!(
             transcript_contains(&fx, "should appear"),
@@ -2594,13 +3180,21 @@ mod tests {
         type_str(&mut fx, "abc");
         assert_eq!(fx.handle.get_cursor(), 3);
         // Press Ctrl-A: cursor moves to 0.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         // Drain the BufferChanged event from Ctrl-A.
         assert_eq!(fx.term.next_event(), Some(Event::BufferChanged));
         assert_eq!(fx.handle.get_cursor(), 0);
         // Type 'x' at position 0 → "xabc".
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         assert_eq!(fx.term.next_event(), Some(Event::BufferChanged));
         assert_eq!(fx.handle.get_buffer(), "xabc");
@@ -2612,17 +3206,29 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "abc");
         // Move cursor to start first.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         let _ = fx.term.next_event(); // BufferChanged from Home
         assert_eq!(fx.handle.get_cursor(), 0);
         // Press Ctrl-E: cursor moves to end.
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         assert_eq!(fx.term.next_event(), Some(Event::BufferChanged));
         assert_eq!(fx.handle.get_cursor(), 3);
         // Type 'x' at the end → "abcx".
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         assert_eq!(fx.term.next_event(), Some(Event::BufferChanged));
         assert_eq!(fx.handle.get_buffer(), "abcx");
@@ -2724,8 +3330,16 @@ mod tests {
     fn cache_bar_shows_no_requests_when_empty() {
         let cs = CacheStats::default();
         let block = cs.to_status_block(80);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains("no requests yet"), "default bar should say no requests");
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            text.contains("no requests yet"),
+            "default bar should say no requests"
+        );
     }
 
     #[test]
@@ -2733,9 +3347,17 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(1000, 500, 100);
         let block = cs.to_status_block(80);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(text.contains("50.0%"), "bar should show 50.0% hit rate");
-        assert!(text.contains("500") || text.contains("0.5"), "bar should reference cached tokens");
+        assert!(
+            text.contains("500") || text.contains("0.5"),
+            "bar should reference cached tokens"
+        );
     }
 
     #[test]
@@ -2743,7 +3365,12 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(1000, 1000, 0);
         let block = cs.to_status_block(80);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(text.contains("100.0%"), "100% hit rate should show 100.0%");
         // Bar should be completely filled
         let fill_count = text.matches('█').count();
@@ -2757,7 +3384,12 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(1000, 0, 1000);
         let block = cs.to_status_block(80);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(text.contains("0.0%"), "0% hit rate should show 0.0%");
         let fill_count = text.matches('█').count();
         let empty_count = text.matches('░').count();
@@ -2771,7 +3403,12 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(100, 200, 0); // more read than input — shouldn't happen
         let block = cs.to_status_block(80);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         // Count bar chars: they should not exceed bar_width (max 40)
         let total_bar_chars = text.matches('█').count() + text.matches('░').count();
         assert!(
@@ -2787,13 +3424,23 @@ mod tests {
 
         // At narrow width (50 cols): bar_width = max(10, 50-60) = 10
         let block_narrow = cs.to_status_block(50);
-        let text_n: String = block_narrow.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text_n: String = block_narrow
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         let bar_n = text_n.matches('█').count() + text_n.matches('░').count();
         assert_eq!(bar_n, 10, "bar at 50 cols should be 10 chars");
 
         // At wide width (120 cols): bar_width = min(40, 120-60) = 40
         let block_wide = cs.to_status_block(120);
-        let text_w: String = block_wide.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text_w: String = block_wide
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         let bar_w = text_w.matches('█').count() + text_w.matches('░').count();
         assert_eq!(bar_w, 40, "bar at 120 cols should be 40 chars");
     }
@@ -2803,11 +3450,21 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(100, 50, 10);
         let block = cs.to_status_block(80);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(text.contains("1 req"), "bar should show 1 request");
         cs.update(50, 25, 5);
         let block2 = cs.to_status_block(80);
-        let text2: String = block2.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text2: String = block2
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         assert!(text2.contains("2 req"), "bar should show 2 requests");
     }
 
@@ -2837,13 +3494,23 @@ mod tests {
 
         // Compute bar at 50 cols
         let block_50 = cs.to_status_block(50);
-        let text_50: String = block_50.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text_50: String = block_50
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         let bar_50 = text_50.matches('█').count() + text_50.matches('░').count();
         assert_eq!(bar_50, 10, "sanity: bar at 50 cols = 10");
 
         // Compute bar at 120 cols — same CacheStats, just a different argument
         let block_120 = cs.to_status_block(120);
-        let text_120: String = block_120.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text_120: String = block_120
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         let bar_120 = text_120.matches('█').count() + text_120.matches('░').count();
         // The method recomputes correctly when called directly.
         // But through the live TUI, the status line was set at the old width
@@ -2860,11 +3527,19 @@ mod tests {
         cs.update(100, 50, 10);
         // terminal_width = 40 should not cause a panic or empty bar
         let block = cs.to_status_block(40);
-        let text: String = block.content.spans().iter().map(|s| s.text.as_str()).collect();
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         // The bar should still render with at least bar_width=10 characters
         let total_bar = text.matches('█').count() + text.matches('░').count();
         assert_eq!(total_bar, 10, "bar at 40 cols terminal should be 10 chars");
-        assert!(text.contains('%'), "bar must show percentage even at min width");
+        assert!(
+            text.contains('%'),
+            "bar must show percentage even at min width"
+        );
     }
 
     #[test]
@@ -2893,12 +3568,16 @@ mod tests {
     #[test]
     fn cache_bar_renders_on_cache_telemetry_event() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "cache:"), 1);
         assert!(transcript_contains(&fx, "50.0%"));
@@ -2908,18 +3587,26 @@ mod tests {
     #[test]
     fn cache_bar_accumulates_across_multiple_telemetry_events() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
                 cache_read_tokens: 80,
                 cache_creation_tokens: 10,
-            }));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 200,
                 cache_read_tokens: 100,
                 cache_creation_tokens: 50,
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.cache.request_count, 2);
         assert_eq!(fx.app.cache.total_input_tokens, 300);
@@ -2929,12 +3616,16 @@ mod tests {
     #[test]
     fn cache_bar_survives_clear_output() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         assert!(transcript_contains(&fx, "cache:"));
 
@@ -2950,12 +3641,16 @@ mod tests {
     #[test]
     fn cache_bar_survives_new_session_command() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         assert!(transcript_contains(&fx, "cache:"));
 
@@ -2973,23 +3668,42 @@ mod tests {
     fn cache_bar_shown_during_streaming() {
         let mut fx = fixture();
         // Streaming text
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("hello ".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("hello ".into())),
+        );
         // Cache telemetry mid-stream
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 200,
                 cache_read_tokens: 100,
                 cache_creation_tokens: 50,
-            }));
+            }),
+        );
         // More streaming text
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("world".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("world".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
 
-        assert!(transcript_contains(&fx, "hello world"), "streaming text must be visible");
+        assert!(
+            transcript_contains(&fx, "hello world"),
+            "streaming text must be visible"
+        );
         assert!(
             transcript_contains(&fx, "cache:"),
             "cache bar must be visible even during streaming"
@@ -3006,7 +3720,8 @@ mod tests {
         // Inject cache telemetry
         fx.app.cache.update(100, 50, 10);
         let (w, _) = fx.handle.size();
-        fx.handle.set_status_line(fx.app.cache.to_status_block(w.max(40)));
+        fx.handle
+            .set_status_line(fx.app.cache.to_status_block(w.max(40)));
         fx.handle.redraw_sync();
         // Simulate disconnect
         let driver = {
@@ -3038,19 +3753,29 @@ mod tests {
     fn cache_bar_compaction_resets_stats_and_refreshes() {
         let mut fx = fixture();
         // First, set some cache stats
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 1000,
                 cache_read_tokens: 800,
                 cache_creation_tokens: 200,
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.cache.request_count, 1);
         assert!(transcript_contains(&fx, "cache:"));
 
         // Session compacted resets cache
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            ServerEvent::SessionCompacted { session_id: "sess-1".to_string() });
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionCompacted {
+                session_id: "sess-1".to_string(),
+            },
+        );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.cache.request_count, 0);
         // After compaction, the bar should show "no requests yet"
@@ -3063,19 +3788,30 @@ mod tests {
     #[test]
     fn cache_bar_with_tool_events_interleaved() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::ToolStart {
                 id: "t1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({"command": "echo hi"}),
-            }));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 50,
                 cache_read_tokens: 10,
                 cache_creation_tokens: 5,
-            }));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::ToolEnd {
                 id: "t1".into(),
                 result: ToolResultWire {
@@ -3083,9 +3819,13 @@ mod tests {
                     is_error: false,
                     content: None,
                 },
-            }));
+            }),
+        );
         fx.handle.redraw_sync();
-        assert!(transcript_contains(&fx, "tool call bash"), "tool must render");
+        assert!(
+            transcript_contains(&fx, "tool call bash"),
+            "tool must render"
+        );
         assert!(transcript_contains(&fx, "done"), "tool end must render");
         assert!(
             transcript_contains(&fx, "cache:"),
@@ -3146,7 +3886,11 @@ mod tests {
     fn ctrl_d_on_empty_buffer_sends_eof() {
         let mut fx = fixture();
         // Ctrl-D on empty buffer should emit Eof
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         match fx.term.next_event() {
             Some(Event::Eof) => {}
@@ -3161,14 +3905,28 @@ mod tests {
         assert_eq!(fx.handle.get_buffer(), "abcd");
         assert_eq!(fx.handle.get_cursor(), 4);
         // Move cursor left twice: between 'b' and 'c'
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
-        // Cursor now at position 2
+                                      // Cursor now at position 2
         assert_eq!(fx.handle.get_cursor(), 2);
         // Ctrl-D should delete the character at cursor (should delete 'c')
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3184,12 +3942,21 @@ mod tests {
         type_str(&mut fx, "hello world");
         // Move cursor to position 5 (after 'hello')
         for _ in 0..6 {
-            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            fx.input
+                .send(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
             let _ = fx.term.next_event(); // BufferChanged
         }
         assert_eq!(fx.handle.get_cursor(), 5);
         // Ctrl-K should delete from cursor to end, leaving "hello"
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3204,7 +3971,11 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "ab");
         // Ctrl-T should transpose last two chars -> "ba"
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3227,7 +3998,11 @@ mod tests {
         assert_eq!(line2, "second cmd");
         // Now buffer is empty. Ctrl-P should recall the previous entry.
         assert_eq!(fx.handle.get_buffer(), "");
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3246,11 +4021,20 @@ mod tests {
         type_str(&mut fx, "second");
         submit(&mut fx);
         // Recall with up arrow
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_buffer(), "second");
         // Ctrl-N should go to next entry (back to "first"? or clear?)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         // Actually Ctrl-N should go forward in history, which would go back to the
@@ -3268,11 +4052,20 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "hello world foo");
         // Cursor at end. Move to start with Ctrl-A
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
         assert_eq!(fx.handle.get_cursor(), 0);
         // Alt-F should move forward one word
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::ALT,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3287,7 +4080,11 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "hello world foo");
         // Alt-B from end should move back one word
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::ALT,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         // Cursor should jump to after "world " i.e., position of 'f'
@@ -3304,13 +4101,18 @@ mod tests {
         type_str(&mut fx, "abc");
         assert_eq!(fx.handle.get_cursor(), 3);
         // Delete at end of buffer — should be a no-op (nothing to delete)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Delete,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         // No change expected — no event should fire because nothing changed
         // Actually a BufferChanged event may or may not fire; the state shouldn't change.
         assert_eq!(
-            fx.handle.get_buffer(), "abc",
+            fx.handle.get_buffer(),
+            "abc",
             "Delete at end of buffer should be a no-op"
         );
     }
@@ -3321,12 +4123,21 @@ mod tests {
         type_str(&mut fx, "abcd");
         // Move cursor to position 1 (between 'a' and 'b')
         for _ in 0..3 {
-            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            fx.input
+                .send(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
             let _ = fx.term.next_event();
         }
         assert_eq!(fx.handle.get_cursor(), 1);
         // Delete should remove 'b'
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Delete,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         match fx.term.next_event() {
             Some(Event::BufferChanged) => {}
@@ -3340,15 +4151,25 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "abc");
         // Move cursor to start
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // BufferChanged
         assert_eq!(fx.handle.get_cursor(), 0);
         // Backspace at start — no-op
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_buffer(), "abc",
+            fx.handle.get_buffer(),
+            "abc",
             "Backspace at start should be a no-op"
         );
     }
@@ -3357,11 +4178,21 @@ mod tests {
     fn cursor_left_at_start_does_not_wrap() {
         let mut fx = fixture();
         type_str(&mut fx, "abc");
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // Left at start — should stay at 0
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(fx.handle.get_cursor(), 0, "Left at start must stay at 0");
     }
@@ -3372,7 +4203,12 @@ mod tests {
         type_str(&mut fx, "abc");
         assert_eq!(fx.handle.get_cursor(), 3);
         // Right at end — should stay at 3
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(fx.handle.get_cursor(), 3, "Right at end must stay at end");
     }
@@ -3402,7 +4238,8 @@ mod tests {
         let long = "a".repeat(500);
         type_str(&mut fx, &long);
         assert_eq!(
-            fx.handle.get_buffer().len(), 500,
+            fx.handle.get_buffer().len(),
+            500,
             "very long input must not be truncated"
         );
     }
@@ -3416,15 +4253,25 @@ mod tests {
     fn ctrl_right_jumps_to_next_word() {
         let mut fx = fixture();
         type_str(&mut fx, "hello world foo");
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // Ctrl+Right — should jump to start of 'world' (position 6)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_cursor(), 6,
+            fx.handle.get_cursor(),
+            6,
             "Ctrl+Right from start should land at 'world' (expected 6, got {})",
             fx.handle.get_cursor()
         );
@@ -3437,16 +4284,26 @@ mod tests {
         type_str(&mut fx, "one two three");
         // Move cursor to position 2 (middle of "one")
         for _ in 0..11 {
-            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            fx.input
+                .send(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
             let _ = fx.term.next_event();
         }
         assert_eq!(fx.handle.get_cursor(), 2);
         // Ctrl+Right — should skip "one " and land at start of 'two' (position 4)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         let _ = fx.term.next_event();
         assert_eq!(
-            fx.handle.get_cursor(), 4,
+            fx.handle.get_cursor(),
+            4,
             "Ctrl+Right from middle of word should land at start of next word (expected 4, got {})",
             fx.handle.get_cursor()
         );
@@ -3461,17 +4318,27 @@ mod tests {
         type_str(&mut fx, "one two three");
         // Move cursor to position 3 (the space between "one" and "two")
         for _ in 0..10 {
-            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            fx.input
+                .send(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
             let _ = fx.term.next_event();
         }
         assert_eq!(fx.handle.get_cursor(), 3);
         // Ctrl+Right from the space — skips whitespace, then "two", then trailing
         // whitespace, landing at start of 'three' (position 8)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         let _ = fx.term.next_event();
         assert_eq!(
-            fx.handle.get_cursor(), 8,
+            fx.handle.get_cursor(),
+            8,
             "Ctrl+Right from whitespace lands after next word + trailing ws (expected 8, got {})",
             fx.handle.get_cursor()
         );
@@ -3483,20 +4350,40 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "hello world foo");
         // Move to start of last word 'foo' (position 12)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // -> world
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event(); // -> foo
-        // Now at position 12
+                                      // Now at position 12
         assert_eq!(fx.handle.get_cursor(), 12);
         // Ctrl+Right on last word — should go to end (15)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_cursor(), 15,
+            fx.handle.get_cursor(),
+            15,
             "Ctrl+Right on last word should go to end of buffer (expected 15, got {})",
             fx.handle.get_cursor()
         );
@@ -3509,7 +4396,11 @@ mod tests {
         type_str(&mut fx, "hello");
         assert_eq!(fx.handle.get_cursor(), 5);
         // Ctrl+Right at end — should stay at end
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         assert_eq!(fx.handle.get_cursor(), 5);
     }
@@ -3519,7 +4410,11 @@ mod tests {
     fn ctrl_right_on_empty_buffer() {
         let mut fx = fixture();
         assert_eq!(fx.handle.get_cursor(), 0);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         assert_eq!(fx.handle.get_cursor(), 0);
     }
@@ -3529,14 +4424,24 @@ mod tests {
     fn ctrl_right_skips_multiple_spaces() {
         let mut fx = fixture();
         type_str(&mut fx, "hello    world");
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         // Ctrl+Right — should skip "hello    " and land on 'world' at position 9
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_cursor(), 9,
+            fx.handle.get_cursor(),
+            9,
             "Ctrl+Right should skip multiple spaces (expected 9, got {})",
             fx.handle.get_cursor()
         );
@@ -3549,11 +4454,16 @@ mod tests {
         type_str(&mut fx, "hello world foo");
         assert_eq!(fx.handle.get_cursor(), 15);
         // Ctrl+Left — should jump to start of 'foo' (position 12)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_cursor(), 12,
+            fx.handle.get_cursor(),
+            12,
             "Ctrl+Left from end should jump to start of last word (expected 12, got {})",
             fx.handle.get_cursor()
         );
@@ -3566,12 +4476,21 @@ mod tests {
         type_str(&mut fx, "hello world foo");
         // Move cursor to position 8 (middle of 'world')
         for _ in 0..7 {
-            fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))).unwrap();
+            fx.input
+                .send(RawEvent::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
             let _ = fx.term.next_event();
         }
         assert_eq!(fx.handle.get_cursor(), 8);
         // Ctrl+Left — should jump to start of 'world' (position 6)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
@@ -3586,11 +4505,20 @@ mod tests {
     fn ctrl_left_at_start_does_nothing() {
         let mut fx = fixture();
         type_str(&mut fx, "hello world");
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // Ctrl+Left at start — should stay at 0
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         assert_eq!(fx.handle.get_cursor(), 0);
     }
@@ -3600,7 +4528,11 @@ mod tests {
     fn ctrl_left_on_empty_buffer() {
         let mut fx = fixture();
         assert_eq!(fx.handle.get_cursor(), 0);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         assert_eq!(fx.handle.get_cursor(), 0);
     }
@@ -3612,20 +4544,30 @@ mod tests {
         type_str(&mut fx, "hello    world");
         // From end, Ctrl+Left should skip "world" and land on the spaces before it
         assert_eq!(fx.handle.get_cursor(), 14);
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_cursor(), 9,
+            fx.handle.get_cursor(),
+            9,
             "Ctrl+Left from end should land at start of 'world' (expected 9, got {})",
             fx.handle.get_cursor()
         );
         // Second Ctrl+Left should skip the spaces and "hello" to land at position 0
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_cursor(), 0,
+            fx.handle.get_cursor(),
+            0,
             "Second Ctrl+Left should land at start of 'hello' (expected 0, got {})",
             fx.handle.get_cursor()
         );
@@ -3638,19 +4580,39 @@ mod tests {
         type_str(&mut fx, "one two three");
         assert_eq!(fx.handle.get_cursor(), 13);
         // Ctrl+Left from end -> start of 'three' (8)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 8);
         // Ctrl+Left again -> start of 'two' (4)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 4);
         // Ctrl+Left again -> start of 'one' (0)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // Ctrl+Left at start -> still 0 (no event since cursor stays same)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         assert_eq!(fx.handle.get_cursor(), 0);
     }
 
@@ -3659,23 +4621,48 @@ mod tests {
     fn ctrl_right_walks_forward_word_by_word() {
         let mut fx = fixture();
         type_str(&mut fx, "one two three");
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 0);
         // Ctrl+Right from start -> start of 'two' (4)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 4);
         // Ctrl+Right again -> start of 'three' (8)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 8);
         // Ctrl+Right again -> end of buffer (13)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
         assert_eq!(fx.handle.get_cursor(), 13);
         // Ctrl+Right at end -> still 13 (no event)
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
         assert_eq!(fx.handle.get_cursor(), 13);
     }
 
@@ -3688,9 +4675,18 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "hello world");
         // Move to start, Alt+D should delete "hello "
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Home,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         let _ = fx.term.next_event();
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::ALT,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3705,7 +4701,11 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "abc");
         // Ctrl+H is the traditional Backspace
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3721,12 +4721,24 @@ mod tests {
         // First, delete some text with Ctrl-W or Ctrl-U to populate a kill ring
         type_str(&mut fx, "deleteme");
         // Ctrl-W deletes previous word
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(fx.handle.get_buffer(), "", "buffer should be empty after Ctrl-W");
+        assert_eq!(
+            fx.handle.get_buffer(),
+            "",
+            "buffer should be empty after Ctrl-W"
+        );
         // Ctrl-Y should yank (paste) "deleteme" back
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3741,7 +4753,11 @@ mod tests {
         let mut fx = fixture();
         type_str(&mut fx, "hello world foo");
         // Cursor at end, Alt+Backspace should delete "foo"
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::ALT,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -3799,7 +4815,13 @@ mod tests {
         assert!(rendered, "cache bar must be visible");
         // Grab the rendered status line text
         let em = Emulator::from_capture(120, 30, &fx.buf);
-        let joined: String = em.history().iter().chain(em.screen_lines().iter()).cloned().collect::<Vec<_>>().join("");
+        let joined: String = em
+            .history()
+            .iter()
+            .chain(em.screen_lines().iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("");
         let bar_chars = joined.matches('█').count() + joined.matches('░').count();
         assert!(
             bar_chars > 10,
@@ -3882,9 +4904,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::TextDelta("continues after resize".into()),
                 ))));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::Done,
-                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
                 std::thread::sleep(Duration::from_millis(30));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -3929,9 +4949,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::TextDelta("after resizes".into()),
                 ))));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::Done,
-                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
                 std::thread::sleep(Duration::from_millis(30));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -4004,9 +5022,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::TextDelta("after ".into()),
                 ))));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::Done,
-                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
                 std::thread::sleep(Duration::from_millis(30));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -4054,7 +5070,10 @@ mod tests {
         assert!(has_status, "status line must be visible on screen");
         // The prompt text (P> hello) must be visible
         let has_prompt = screen.iter().any(|l| l.contains("P> hello"));
-        assert!(has_prompt, "prompt with typed text must be visible on screen");
+        assert!(
+            has_prompt,
+            "prompt with typed text must be visible on screen"
+        );
         // The status line must NOT be on the same row as the prompt
         let status_row = screen.iter().position(|l| l.contains("cache:"));
         let prompt_row = screen.iter().position(|l| l.contains("P> hello"));
@@ -4070,9 +5089,12 @@ mod tests {
         // not on the status line row.
         let (cursor_row, cursor_col) = em.cursor();
         assert_eq!(
-            cursor_row, prompt_row.unwrap(),
+            cursor_row,
+            prompt_row.unwrap(),
             "cursor should be on the prompt row (row {}), not on status line row {} — got row {}",
-            prompt_row.unwrap(), status_row.unwrap(), cursor_row
+            prompt_row.unwrap(),
+            status_row.unwrap(),
+            cursor_row
         );
     }
 
@@ -4082,7 +5104,8 @@ mod tests {
         fx.app.cache.update(500, 250, 50);
         {
             let (w, _) = fx.handle.size();
-            fx.handle.set_status_line(fx.app.cache.to_status_block(w.max(40)));
+            fx.handle
+                .set_status_line(fx.app.cache.to_status_block(w.max(40)));
         }
         fx.handle.redraw_sync();
 
@@ -4123,7 +5146,9 @@ mod tests {
     fn resize_huge_dimensions_do_not_overflow() {
         let mut fx = fixture();
         // Resize to extremely large dimensions
-        fx.input.send(RawEvent::Resize(9999, 9999)).expect("input open");
+        fx.input
+            .send(RawEvent::Resize(9999, 9999))
+            .expect("input open");
         match fx.term.next_event() {
             Some(Event::Resize { width, height }) => {
                 assert_eq!(width, 9999);
@@ -4148,10 +5173,16 @@ mod tests {
         fx.input.send(RawEvent::Resize(60, 20)).expect("input open");
         let _ = fx.term.next_event();
         // History should still work after resize
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))).unwrap();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            fx.handle.get_buffer(), "second",
+            fx.handle.get_buffer(),
+            "second",
             "History recall must work after resize"
         );
     }
@@ -4159,17 +5190,29 @@ mod tests {
     #[test]
     fn consecutive_resizes_while_streaming_do_not_corrupt_block() {
         let mut fx = fixture();
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("start ".into())));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("start ".into())),
+        );
         // Multiple resize events (simulate user dragging window edge)
         for (w, h) in &[(50, 10), (45, 12), (55, 11), (60, 12), (50, 10)] {
             fx.input.send(RawEvent::Resize(*w, *h)).expect("input open");
             assert!(matches!(fx.term.next_event(), Some(Event::Resize { .. })));
         }
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("end".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::Done));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("end".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert!(
             transcript_contains(&fx, "start end"),
@@ -4185,14 +5228,16 @@ mod tests {
     fn paste_long_text_handled_correctly() {
         let mut fx = fixture();
         // Simulate paste (newlines in paste are silently dropped)
-        fx.input.send(RawEvent::Paste("line1\nline2\nline3".to_string()))
+        fx.input
+            .send(RawEvent::Paste("line1\nline2\nline3".to_string()))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         // Newlines should be dropped, content concatenated
         // Note: paste handling depends on how the virtual input loop treats Paste events
         // Looking at dispatch_input_event: Paste inserts chars but skips \n and \r.
         assert_eq!(
-            fx.handle.get_buffer(), "line1line2line3",
+            fx.handle.get_buffer(),
+            "line1line2line3",
             "Paste should drop newlines and concatenate content"
         );
     }
@@ -4201,22 +5246,38 @@ mod tests {
     fn ctrl_l_clears_screen_and_cache_bar_persists() {
         let mut fx = fixture();
         // Show some output
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("visible".into())));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("visible".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }));
-        handle_daemon_event(&fx.handle, &mut fx.app, &mut fx.streaming,
-            chunk(OutputChunk::Done));
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
         fx.handle.redraw_sync();
         assert!(transcript_contains(&fx, "visible"));
         assert!(transcript_contains(&fx, "cache:"));
 
         // Ctrl-L should clear the screen
-        fx.input.send(RawEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)))
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL,
+            )))
             .expect("input open");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -4263,7 +5324,12 @@ mod tests {
     #[test]
     fn resume_with_spaces_in_id() {
         let mut fx = fixture();
-        process_line("/resume session-id extra", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        process_line(
+            "/resume session-id extra",
+            &mut fx.app,
+            &fx.handle,
+            &fx.cmd_tx,
+        );
         assert_eq!(fx.app.session_id, "session-id");
         match fx.cmd_rx.try_recv() {
             Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "session-id"),
@@ -4290,7 +5356,8 @@ mod tests {
         fx.app.cache.update(1000, 500, 100);
         {
             let (w, _) = fx.handle.size();
-            fx.handle.set_status_line(fx.app.cache.to_status_block(w.max(40)));
+            fx.handle
+                .set_status_line(fx.app.cache.to_status_block(w.max(40)));
         }
         // Status ping should include cache info
         let driver = {
@@ -4298,11 +5365,9 @@ mod tests {
             std::thread::spawn(move || {
                 let _ = app_tx.send(AppEvent::Term(Event::Line("/status".to_string())));
                 std::thread::sleep(Duration::from_millis(20));
-                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(
-                    ServerEvent::ModelList {
-                        models: vec!["gpt-a".into()],
-                    },
-                )));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(ServerEvent::ModelList {
+                    models: vec!["gpt-a".into()],
+                })));
                 std::thread::sleep(Duration::from_millis(30));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
             })
@@ -4364,8 +5429,14 @@ mod tests {
         driver.join().unwrap();
         fx.handle.redraw_sync();
         // All text chunks should be present (not lost/corrupted)
-        assert!(fx.transcript_contains("chunk0"), "first chunk must be present");
-        assert!(fx.transcript_contains("chunk19"), "last chunk must be present");
+        assert!(
+            fx.transcript_contains("chunk0"),
+            "first chunk must be present"
+        );
+        assert!(
+            fx.transcript_contains("chunk19"),
+            "last chunk must be present"
+        );
         // Cache stats should have accumulated 20 requests
         assert_eq!(fx.app.cache.request_count, 20);
         assert!(fx.app.cache.total_input_tokens > 0);

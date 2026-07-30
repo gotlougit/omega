@@ -415,7 +415,10 @@ mod tests {
         let tool = proxy::ProxyTool::new(client, &omega_tool_defs::bash::DEF);
         let input = serde_json::json!({ "command": "echo hi" });
         let result = tool.execute(&input, &mut DummyRuntime).await.unwrap();
-        assert!(result.is_error, "execute with no daemon should return error");
+        assert!(
+            result.is_error,
+            "execute with no daemon should return error"
+        );
     }
 
     /// Executing with no arguments still fails gracefully (not a panic).
@@ -423,7 +426,10 @@ mod tests {
     async fn test_proxy_tool_execute_empty_args() {
         let client = OmegaClient::with_socket("/tmp/omega-sh-test-empty-291837.sock");
         let tool = proxy::ProxyTool::new(client, &omega_tool_defs::bash::DEF);
-        let result = tool.execute(&serde_json::json!({}), &mut DummyRuntime).await.unwrap();
+        let result = tool
+            .execute(&serde_json::json!({}), &mut DummyRuntime)
+            .await
+            .unwrap();
         assert!(result.is_error, "should error, not panic");
     }
 }

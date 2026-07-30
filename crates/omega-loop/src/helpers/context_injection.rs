@@ -3,8 +3,8 @@
 //! Allows programmers to modify messages before each LLM call without
 //! writing the entire agent loop themselves.
 
-use omega_llm::Message;
 use crate::runtime::AgentInternals;
+use omega_llm::Message;
 
 /// Trait for context injection implementations
 pub trait ContextInjection: Send + Sync {

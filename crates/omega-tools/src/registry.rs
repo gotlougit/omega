@@ -6,8 +6,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use omega_core::core::{ToolInfo, ToolResult, ToolRuntime};
 use super::tool::Tool;
+use omega_core::core::{ToolInfo, ToolResult, ToolRuntime};
 use omega_llm::ToolDefinition;
 
 /// Registry that holds all available tools

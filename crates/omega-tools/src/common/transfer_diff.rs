@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use omega_core::core::{ToolInfo, ToolResult};
-use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
+use omega_core::core::ToolRuntime;
+use omega_core::core::{ToolInfo, ToolResult};
 use omega_llm::ToolDefinition;
 
 /// Input for the Transfer tool
@@ -90,10 +90,7 @@ impl Tool for TransferTool {
         };
 
         if content.is_empty() {
-            return Ok(ToolResult::error(format!(
-                "File '{}' is empty",
-                file_path
-            )));
+            return Ok(ToolResult::error(format!("File '{}' is empty", file_path)));
         }
 
         let line_count = content.lines().count();
@@ -108,5 +105,4 @@ impl Tool for TransferTool {
 
         Ok(ToolResult::success(content))
     }
-
 }

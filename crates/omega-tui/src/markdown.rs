@@ -5,12 +5,11 @@
 //! so the existing rendering pipeline (diff-based, scrollback-preserving)
 //! handles all display and scrolling.
 
-use termimad::{
-    self,
-    crossterm::style::Attribute,
-    CompositeKind, CompoundStyle, FmtComposite, FmtLine, FmtText, MadSkin,
-};
 use cli::{Span, Style, StyledText};
+use termimad::{
+    self, crossterm::style::Attribute, CompositeKind, CompoundStyle, FmtComposite, FmtLine,
+    FmtText, MadSkin,
+};
 
 // ---------------------------------------------------------------------------
 // Style conversion: termimad → cli
@@ -49,7 +48,10 @@ fn render_list_item_prefix(skin: &MadSkin, depth: u8, line_buf: &mut StyledText)
     let bullet_style = convert_style(skin.bullet.compound_style());
     let indent = "  ".repeat(depth as usize);
     line_buf.push(Span::new(indent, indent_style));
-    line_buf.push(Span::new(format!("{} ", skin.bullet.get_char()), bullet_style));
+    line_buf.push(Span::new(
+        format!("{} ", skin.bullet.get_char()),
+        bullet_style,
+    ));
 }
 
 fn render_ordered_list_prefix(skin: &MadSkin, level: u8, index: u32, line_buf: &mut StyledText) {
@@ -68,7 +70,12 @@ fn render_list_followup_prefix(skin: &MadSkin, depth: u8, line_buf: &mut StyledT
     line_buf.push(Span::new(indent, indent_style));
 }
 
-fn render_ordered_followup_prefix(skin: &MadSkin, level: u8, index: u32, line_buf: &mut StyledText) {
+fn render_ordered_followup_prefix(
+    skin: &MadSkin,
+    level: u8,
+    index: u32,
+    line_buf: &mut StyledText,
+) {
     let indent_len = termimad::ordered_item_indent(level, index);
     let indent_style = convert_style(&skin.paragraph.compound_style);
     let indent = " ".repeat(indent_len);
@@ -180,9 +187,7 @@ pub fn fmt_text_to_styled_text(fmt_text: &FmtText<'_, '_>, skin: &MadSkin) -> St
                     if i > 0 {
                         result.push(Span::new(tbc.cross.to_string(), rule_style));
                     }
-                    let hbar: String = std::iter::repeat(tbc.horizontal)
-                        .take(*w)
-                        .collect();
+                    let hbar: String = std::iter::repeat(tbc.horizontal).take(*w).collect();
                     result.push(Span::new(hbar, rule_style));
                 }
             }
@@ -248,20 +253,14 @@ mod tests {
         let st = render_markdown("Use `foo()` here", 80);
         let spans = st.spans();
         let code_span = spans.iter().find(|s| s.text == "foo()");
-        assert!(
-            code_span.is_some(),
-            "inline code should be a separate span"
-        );
+        assert!(code_span.is_some(), "inline code should be a separate span");
     }
 
     #[test]
     fn code_block() {
         let st = render_markdown("```\nlet x = 1;\n```", 80);
         let combined = spans_to_string(st.spans());
-        assert!(
-            combined.contains("let"),
-            "code block content should appear"
-        );
+        assert!(combined.contains("let"), "code block content should appear");
     }
 
     #[test]
@@ -308,7 +307,9 @@ mod tests {
         // Italic
         assert!(spans.iter().any(|s| s.text == "italic" && s.style.italic));
         // Bold+italic
-        assert!(spans.iter().any(|s| s.text == "both" && s.style.bold && s.style.italic));
+        assert!(spans
+            .iter()
+            .any(|s| s.text == "both" && s.style.bold && s.style.italic));
         // Inline code
         assert!(spans.iter().any(|s| s.text == "code"));
     }

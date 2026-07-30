@@ -28,26 +28,18 @@ pub enum ServerEvent {
         chunk: OutputChunk,
     },
     /// List of available sessions (response to list_sessions).
-    SessionList {
-        sessions: Vec<String>,
-    },
+    SessionList { sessions: Vec<String> },
     /// A session was resumed.
     SessionResumed {
         session_id: String,
         session_name: String,
     },
     /// Model was changed.
-    ModelChanged {
-        model: String,
-    },
+    ModelChanged { model: String },
     /// Session was compacted.
-    SessionCompacted {
-        session_id: String,
-    },
+    SessionCompacted { session_id: String },
     /// A list of available models from the daemon.
-    ModelList {
-        models: Vec<String>,
-    },
+    ModelList { models: Vec<String> },
     /// A system message from the daemon.
     SystemMsg(String),
     /// An unrecognised variant (forward-compatibility).
@@ -257,7 +249,8 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                         let cache_creation_tokens = inner
                             .get("cache_creation_tokens")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
+                            .unwrap_or(0)
+                            as u32;
                         OutputChunk::CacheTelemetry {
                             input_tokens,
                             cache_read_tokens,
@@ -693,7 +686,10 @@ mod tests {
         let json = r#"{"type":"Created","session_id":"test-123","session_name":"Test Session"}"#;
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
-            ServerEvent::Created { session_id, session_name } => {
+            ServerEvent::Created {
+                session_id,
+                session_name,
+            } => {
                 assert_eq!(session_id, "test-123");
                 assert_eq!(session_name, "Test Session");
             }
@@ -743,7 +739,10 @@ mod tests {
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
             ServerEvent::Unknown(val) => {
-                assert_eq!(val.get("type").and_then(|v| v.as_str()), Some("UnknownType"));
+                assert_eq!(
+                    val.get("type").and_then(|v| v.as_str()),
+                    Some("UnknownType")
+                );
             }
             _ => panic!("Expected Unknown event"),
         }
@@ -765,7 +764,7 @@ mod tests {
         let val = serde_json::Value::String("Done".to_string());
         let chunk = parse_chunk(&val);
         match chunk {
-            OutputChunk::Done => {},
+            OutputChunk::Done => {}
             _ => panic!("Expected Done"),
         }
     }

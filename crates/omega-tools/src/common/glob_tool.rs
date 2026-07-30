@@ -9,9 +9,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use omega_core::core::{ToolInfo, ToolResult};
-use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
+use omega_core::core::ToolRuntime;
+use omega_core::core::{ToolInfo, ToolResult};
 use omega_llm::{ToolDefinition, ToolInputSchema};
 
 /// Glob tool for file pattern matching
@@ -160,7 +160,6 @@ impl Tool for GlobTool {
             Err(e) => Ok(ToolResult::error(format!("Glob search failed: {}", e))),
         }
     }
-
 }
 
 // Tests temporarily disabled - require ToolRuntime test helper

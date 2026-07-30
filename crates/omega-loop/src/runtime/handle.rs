@@ -10,9 +10,8 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use omega_core::core::{AgentState, FrameworkError, FrameworkResult, InputMessage};
 use crate::session::AgentSession;
-
+use omega_core::core::{AgentState, FrameworkError, FrameworkResult, InputMessage};
 
 use super::channels::{InputSender, OutputReceiver, OutputSender};
 
@@ -75,8 +74,6 @@ impl AgentHandle {
         self.send(InputMessage::UserInput(input.into())).await
     }
 
-
-
     /// Request graceful interrupt
     ///
     /// The agent should stop at the next safe point.
@@ -99,8 +96,6 @@ impl AgentHandle {
             .map_err(|_| FrameworkError::ChannelClosed)
     }
 
-
-
     // =========================================================================
     // Output Methods
     // =========================================================================
@@ -112,8 +107,6 @@ impl AgentHandle {
     pub fn subscribe(&self) -> OutputReceiver {
         self.output_tx.subscribe()
     }
-
-
 
     // =========================================================================
     // State Methods
@@ -165,9 +158,9 @@ impl std::fmt::Debug for AgentHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omega_core::core::OutputChunk;
     use crate::runtime::channels::create_agent_channels;
     use crate::session::{AgentSession, SessionStorage};
+    use omega_core::core::OutputChunk;
     use tempfile::TempDir;
 
     fn create_test_handle() -> (AgentHandle, super::super::channels::InputReceiver, TempDir) {

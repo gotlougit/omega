@@ -11,9 +11,9 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use omega_core::core::{ToolInfo, ToolResult};
-use omega_core::core::ToolRuntime;
 use super::super::tool::Tool;
+use omega_core::core::ToolRuntime;
+use omega_core::core::{ToolInfo, ToolResult};
 use omega_llm::{ToolDefinition, ToolInputSchema};
 
 /// Default timeout in milliseconds (2 minutes)
@@ -211,7 +211,6 @@ impl Tool for BashTool {
             ))),
         }
     }
-
 }
 
 // Tests temporarily disabled - require ToolRuntime test helper

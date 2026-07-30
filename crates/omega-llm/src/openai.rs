@@ -39,8 +39,8 @@ use super::provider::LlmProvider;
 use super::types::{
     ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
     ContentBlockStopEvent, ContentDelta, DeltaUsage, Message, MessageContent, MessageDeltaData,
-    MessageDeltaEvent, MessageStartData, MessageStartEvent, StopReason,
-    StreamEvent, SystemPrompt, ThinkingConfig, ToolChoice, ToolDefinition, Usage,
+    MessageDeltaEvent, MessageStartData, MessageStartEvent, StopReason, StreamEvent, SystemPrompt,
+    ThinkingConfig, ToolChoice, ToolDefinition, Usage,
 };
 
 const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
@@ -622,8 +622,8 @@ impl LlmProvider for OpenAIProvider {
             anyhow::bail!("Models API error ({}): {}", status, body);
         }
 
-        let models_response: serde_json::Value = serde_json::from_str(&body)
-            .context("Failed to parse models response")?;
+        let models_response: serde_json::Value =
+            serde_json::from_str(&body).context("Failed to parse models response")?;
 
         let model_ids = models_response["data"]
             .as_array()
@@ -1156,9 +1156,7 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 200,
             total_tokens: 1200,
-            prompt_tokens_details: Some(OpenAIPromptTokensDetails {
-                cached_tokens: 800,
-            }),
+            prompt_tokens_details: Some(OpenAIPromptTokensDetails { cached_tokens: 800 }),
         };
 
         // Mimic the Usage construction in send_streaming_request
