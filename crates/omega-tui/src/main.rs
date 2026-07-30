@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::runtime::Runtime;
 
 use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
@@ -129,18 +129,6 @@ enum LineOutcome {
 // ---------------------------------------------------------------------------
 // Daemon task — runs on a dedicated tokio runtime, bridges async ↔ sync
 // ---------------------------------------------------------------------------
-
-fn spawn_daemon(
-    reader: DaemonReader,
-    writer: DaemonWriter,
-    cmd_rx: Receiver<DaemonCmd>,
-    app_tx: Sender<AppEvent>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let rt = Runtime::new().expect("tokio runtime");
-        rt.block_on(async { daemon_loop(reader, writer, cmd_rx, app_tx).await });
-    })
-}
 
 async fn daemon_loop(
     mut reader: DaemonReader,
@@ -949,48 +937,61 @@ fn main() -> Result<()> {
         )
         .try_init();
 
-    // ── Connect to omega-loop ──────────────────────────────────────────
-    let rt = Runtime::new()?;
-    let client = rt.block_on(AgentdClient::connect()).with_context(|| {
-        "Cannot connect to omega-loop daemon.\n\
-         Make sure omega-loop is running.\n\
-         Set OMEGA_LOOP_SOCKET_PATH if using a custom socket path."
-    })?;
-    let (reader, writer) = client.split();
+    // ── Create terminal FIRST — no daemon dependency ────────────────────
+    // The terminal appears instantly so the user sees something immediately.
+    // Daemon connection and model negotiation happen in the background.
+    let prompt = StyledText::from(Span::new("▸ ", Style::default().fg(Color::DarkYellow)));
+    let (term, handle) = Term::new(prompt)?;
+
+    // Show immediate feedback while we connect in the background.
+    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+        "Connecting to omega-loop…",
+        s_system(),
+    ))));
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DaemonCmd>();
     let (app_tx, app_rx) = mpsc::channel::<AppEvent>();
 
-    let daemon_thread = spawn_daemon(reader, writer, cmd_rx, app_tx.clone());
+    // ── Spawn daemon connection + IO on a background thread ────────────
+    // If the daemon is not reachable we show an error in the TUI instead
+    // of blocking startup.
+    let daemon_thread = {
+        let app_tx = app_tx.clone();
+        std::thread::spawn(move || {
+            let rt = Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                let client = match AgentdClient::connect().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(target: "omega_tui::daemon", error = %e, "failed to connect");
+                        let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(
+                            ServerEvent::SystemMsg(format!("Failed to connect to omega-loop: {e}")),
+                        )));
+                        let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                        return;
+                    }
+                };
+                let (reader, writer) = client.split();
+                daemon_loop(reader, writer, cmd_rx, app_tx).await;
+            });
+        })
+    };
 
-    // ── Create initial session ─────────────────────────────────────────
+    // ── Initialise session with defaults (will be updated by daemon) ───
     let session_id = format!("tui-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    // Send an empty run to create the session on the daemon
+    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+
+    // Queue the init commands — they'll be processed as soon as the
+    // daemon thread connects and starts its event loop.  Run creates
+    // the session, SetModel sets our default model (from env or fallback).
+    // We skip ListModels to avoid the model list being printed in the TUI
+    // at startup (the user can run `/models` or `/status` later).
     cmd_tx
         .send(DaemonCmd::Run {
             session_id: session_id.clone(),
             content: String::new(),
         })
         .ok();
-
-    // ── Query models, pick first ───────────────────────────────────────
-    cmd_tx.send(DaemonCmd::ListModels).ok();
-    let model = loop {
-        match app_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(AppEvent::Daemon(DaemonEv::Event(ServerEvent::ModelList { models })))
-                if !models.is_empty() =>
-            {
-                break models.into_iter().next().unwrap();
-            }
-            Ok(AppEvent::Daemon(DaemonEv::Event(_))) => continue,
-            Err(mpsc::RecvTimeoutError::Timeout) | Ok(AppEvent::Daemon(DaemonEv::Disconnected)) => {
-                break std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break "unknown".to_string(),
-            Ok(_) => continue,
-        }
-    };
-    // Set the model on the daemon
     cmd_tx
         .send(DaemonCmd::SetModel {
             session_id: session_id.clone(),
@@ -1004,11 +1005,7 @@ fn main() -> Result<()> {
         cache: CacheStats::default(),
     };
 
-    // ── Create terminal ────────────────────────────────────────────────
-    let prompt = StyledText::from(Span::new("▸ ", Style::default().fg(Color::DarkYellow)));
-    let (term, handle) = Term::new(prompt)?;
-
-    // Welcome message
+    // ── Welcome (printed immediately — no daemon round-trip) ───────────
     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
         format!(
             "omega-tui — session: {} | model: {}\nType /help for commands.",
