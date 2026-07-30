@@ -85,6 +85,7 @@ pub enum OutputChunk {
     /// Prompt caching telemetry from the last LLM call
     CacheTelemetry {
         input_tokens: u32,
+        output_tokens: u32,
         cache_read_tokens: u32,
         cache_creation_tokens: u32,
     },
@@ -255,6 +256,10 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                             .get("input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as u32;
+                        let output_tokens = inner
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
                         let cache_read_tokens = inner
                             .get("cache_read_tokens")
                             .and_then(|v| v.as_u64())
@@ -266,6 +271,7 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                             as u32;
                         OutputChunk::CacheTelemetry {
                             input_tokens,
+                            output_tokens,
                             cache_read_tokens,
                             cache_creation_tokens,
                         }

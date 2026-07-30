@@ -880,6 +880,7 @@ impl StandardAgent {
         if let Some(ref usage) = initial_usage {
             let telemetry = omega_core::core::CacheTelemetry {
                 input_tokens: usage.input_tokens,
+                output_tokens,
                 cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
                 cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
             };

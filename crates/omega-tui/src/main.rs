@@ -452,11 +452,12 @@ fn handle_daemon_event(
             }
             OutputChunk::CacheTelemetry {
                 input_tokens,
+                output_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
             } => {
                 app.cache
-                    .update(input_tokens, cache_read_tokens, cache_creation_tokens);
+                    .update(input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens);
                 refresh_cache_status(handle, app);
             }
             OutputChunk::AskUserQuestion { .. } => {}
@@ -551,14 +552,16 @@ fn handle_daemon_event(
 #[derive(Debug, Default, Clone, Copy)]
 struct CacheStats {
     total_input_tokens: u64,
+    total_output_tokens: u64,
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
     request_count: u64,
 }
 
 impl CacheStats {
-    fn update(&mut self, input: u32, read: u32, created: u32) {
+    fn update(&mut self, input: u32, output: u32, read: u32, created: u32) {
         self.total_input_tokens += input as u64;
+        self.total_output_tokens += output as u64;
         self.total_cache_read_tokens += read as u64;
         self.total_cache_creation_tokens += created as u64;
         self.request_count += 1;
@@ -571,27 +574,35 @@ impl CacheStats {
         (self.total_cache_read_tokens as f64 / self.total_input_tokens as f64) * 100.0
     }
 
-    /// Render a compact one-line status summary.
-    fn to_status_block(&self, terminal_width: usize) -> StyledBlock {
+    /// Format a token count with k/m suffix.
+    fn fmt_tokens(n: u64) -> String {
+        if n >= 1_000_000 {
+            let m = n as f64 / 1_000_000.0;
+            if m < 10.0 { format!("{:.1}m", m) } else { format!("{:.0}m", m) }
+        } else if n >= 1000 {
+            let k = n as f64 / 1000.0;
+            if k < 10.0 { format!("{:.1}k", k) } else { format!("{:.0}k", k) }
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// Render a compact one-line status summary matching pi-agent's format.
+    fn to_status_block(&self, _terminal_width: usize) -> StyledBlock {
         if self.request_count == 0 {
             return StyledBlock::new(StyledText::from(Span::new(
-                " cache: — (no requests yet)",
+                " cache: \u{2014}",
                 s_cache_miss(),
             )));
         }
         let pct = self.hit_rate_pct();
-        let bar_width = (terminal_width.saturating_sub(60)).max(10).min(40);
-        let fill = ((pct / 100.0) * bar_width as f64).round() as usize;
-        let empty = bar_width.saturating_sub(fill);
-        let bar: String = format!("{}{}", "█".repeat(fill), "░".repeat(empty),);
-
-        let total_k = self.total_input_tokens as f64 / 1000.0;
-        let cached_k = self.total_cache_read_tokens as f64 / 1000.0;
-        let created_k = self.total_cache_creation_tokens as f64 / 1000.0;
-        let reqs = self.request_count;
 
         let text = format!(
-            " cache: {pct:>5.1}% {bar}  hit {cached_k:.1}K / total {total_k:.1}K input  (created {created_k:.1}K · {reqs} req)"
+            " cache: ↑{} ↓{} R{} CH{:5.1}%",
+            Self::fmt_tokens(self.total_input_tokens),
+            Self::fmt_tokens(self.total_output_tokens),
+            Self::fmt_tokens(self.total_cache_read_tokens),
+            pct,
         );
         StyledBlock::new(StyledText::from(Span::new(text, s_cache_hit())))
     }
@@ -3293,7 +3304,7 @@ mod tests {
     #[test]
     fn cache_stats_update_accumulates() {
         let mut cs = CacheStats::default();
-        cs.update(100, 40, 10);
+        cs.update(100, 50, 40, 10);
         assert_eq!(cs.request_count, 1);
         assert_eq!(cs.total_input_tokens, 100);
         assert_eq!(cs.total_cache_read_tokens, 40);
@@ -3303,8 +3314,8 @@ mod tests {
     #[test]
     fn cache_stats_multiple_updates_cumulative() {
         let mut cs = CacheStats::default();
-        cs.update(100, 40, 10);
-        cs.update(200, 160, 30);
+        cs.update(100, 50, 40, 10);
+        cs.update(200, 100, 160, 30);
         assert_eq!(cs.request_count, 2);
         assert_eq!(cs.total_input_tokens, 300);
         assert_eq!(cs.total_cache_read_tokens, 200);
@@ -3314,21 +3325,21 @@ mod tests {
     #[test]
     fn cache_stats_hit_rate_100_percent() {
         let mut cs = CacheStats::default();
-        cs.update(100, 100, 0);
+        cs.update(100, 50, 100, 0);
         assert!((cs.hit_rate_pct() - 100.0).abs() < 0.001);
     }
 
     #[test]
     fn cache_stats_hit_rate_0_percent() {
         let mut cs = CacheStats::default();
-        cs.update(100, 0, 100);
+        cs.update(100, 50, 0, 100);
         assert!((cs.hit_rate_pct() - 0.0).abs() < 0.001);
     }
 
     #[test]
     fn cache_stats_hit_rate_fractional() {
         let mut cs = CacheStats::default();
-        cs.update(3, 1, 2);
+        cs.update(3, 1, 1, 2);
         // 1/3 = 33.333...%
         assert!((cs.hit_rate_pct() - 100.0 / 3.0).abs() < 0.001);
     }
@@ -3345,7 +3356,7 @@ mod tests {
         let mut cs = CacheStats::default();
         // Push values up near u32::MAX repeatedly
         for _ in 0..10 {
-            cs.update(u32::MAX, u32::MAX, u32::MAX);
+            cs.update(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
         }
         // Each u32::MAX ≈ 4.29e9, so 10× fits in u64 easily
         assert!(cs.total_input_tokens as u128 > 0);
@@ -3367,15 +3378,15 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            text.contains("no requests yet"),
-            "default bar should say no requests"
+            text.contains("cache:"),
+            "default bar should show cache prefix"
         );
     }
 
     #[test]
     fn cache_bar_shows_percentage_after_update() {
         let mut cs = CacheStats::default();
-        cs.update(1000, 500, 100);
+        cs.update(1000, 500, 500, 100);
         let block = cs.to_status_block(80);
         let text: String = block
             .content
@@ -3393,7 +3404,7 @@ mod tests {
     #[test]
     fn cache_bar_displays_perfect_hit_rate() {
         let mut cs = CacheStats::default();
-        cs.update(1000, 1000, 0);
+        cs.update(1000, 500, 1000, 0);
         let block = cs.to_status_block(80);
         let text: String = block
             .content
@@ -3402,17 +3413,13 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert!(text.contains("100.0%"), "100% hit rate should show 100.0%");
-        // Bar should be completely filled
-        let fill_count = text.matches('█').count();
-        let empty_count = text.matches('░').count();
-        assert!(fill_count > 0, "100% bar should have filled blocks");
-        assert!(empty_count == 0, "100% bar should have zero empty blocks");
+        assert!(text.contains("CH100.0%") || text.contains("CH 100.0%"));
     }
 
     #[test]
     fn cache_bar_displays_zero_hit_rate() {
         let mut cs = CacheStats::default();
-        cs.update(1000, 0, 1000);
+        cs.update(1000, 500, 0, 1000);
         let block = cs.to_status_block(80);
         let text: String = block
             .content
@@ -3421,17 +3428,14 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert!(text.contains("0.0%"), "0% hit rate should show 0.0%");
-        let fill_count = text.matches('█').count();
-        let empty_count = text.matches('░').count();
-        assert!(fill_count == 0, "0% bar should have zero filled blocks");
-        assert!(empty_count > 0, "0% bar should have empty blocks");
+        assert!(text.contains("CH"));
     }
 
     #[test]
     fn cache_bar_fill_never_exceeds_bar_width() {
-        // Even with >100% "hit rate" (shouldn't happen, but guard against it)
+        // With the new format there is no bar, so just ensure no panic.
         let mut cs = CacheStats::default();
-        cs.update(100, 200, 0); // more read than input — shouldn't happen
+        cs.update(100, 50, 200, 0); // more read than input \u{2014} shouldn't happen
         let block = cs.to_status_block(80);
         let text: String = block
             .content
@@ -3439,20 +3443,15 @@ mod tests {
             .iter()
             .map(|s| s.text.as_str())
             .collect();
-        // Count bar chars: they should not exceed bar_width (max 40)
-        let total_bar_chars = text.matches('█').count() + text.matches('░').count();
-        assert!(
-            total_bar_chars <= 40,
-            "BUG: fill exceeds bar_width: {total_bar_chars} > 40"
-        );
+        assert!(!text.is_empty());
     }
 
     #[test]
     fn cache_bar_width_scales_with_terminal_width() {
+        // The new format is width-independent (no bar), so same output at any width.
         let mut cs = CacheStats::default();
-        cs.update(1000, 500, 100);
+        cs.update(1000, 500, 500, 100);
 
-        // At narrow width (50 cols): bar_width = max(10, 50-60) = 10
         let block_narrow = cs.to_status_block(50);
         let text_n: String = block_narrow
             .content
@@ -3460,10 +3459,7 @@ mod tests {
             .iter()
             .map(|s| s.text.as_str())
             .collect();
-        let bar_n = text_n.matches('█').count() + text_n.matches('░').count();
-        assert_eq!(bar_n, 10, "bar at 50 cols should be 10 chars");
 
-        // At wide width (120 cols): bar_width = min(40, 120-60) = 40
         let block_wide = cs.to_status_block(120);
         let text_w: String = block_wide
             .content
@@ -3471,14 +3467,14 @@ mod tests {
             .iter()
             .map(|s| s.text.as_str())
             .collect();
-        let bar_w = text_w.matches('█').count() + text_w.matches('░').count();
-        assert_eq!(bar_w, 40, "bar at 120 cols should be 40 chars");
+
+        assert_eq!(text_n, text_w, "format should be width-independent");
     }
 
     #[test]
-    fn cache_bar_shows_request_count() {
+    fn cache_bar_shows_arrows_and_labels() {
         let mut cs = CacheStats::default();
-        cs.update(100, 50, 10);
+        cs.update(100, 50, 30, 10);
         let block = cs.to_status_block(80);
         let text: String = block
             .content
@@ -3486,23 +3482,19 @@ mod tests {
             .iter()
             .map(|s| s.text.as_str())
             .collect();
-        assert!(text.contains("1 req"), "bar should show 1 request");
-        cs.update(50, 25, 5);
-        let block2 = cs.to_status_block(80);
-        let text2: String = block2
-            .content
-            .spans()
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(text2.contains("2 req"), "bar should show 2 requests");
+        assert!(text.contains('↑'), "should show up arrow for input");
+        assert!(text.contains('↓'), "should show down arrow for output");
+        assert!(text.contains('R'), "should show R for cache read");
+        assert!(text.contains("CH"), "should show CH for cache hit rate");
+        assert!(text.contains("100"), "should show input count");
+        assert!(text.contains("50"), "should show output count");
     }
 
     #[test]
     fn cache_bar_always_uses_hit_color_regardless_of_rate() {
         // The status block always uses s_cache_hit() (green) even at 0% hit rate.
         let mut cs = CacheStats::default();
-        cs.update(100, 0, 100);
+        cs.update(100, 50, 0, 100);
         let block = cs.to_status_block(80);
         // The top-level style of the block comes from the Span's style.
         let span = &block.content.spans()[0];
@@ -3516,13 +3508,10 @@ mod tests {
 
     #[test]
     fn cache_bar_text_is_stale_after_resize_without_telemetry() {
-        // The block's text content is computed at one terminal width.
-        // If the terminal resizes without a new CacheTelemetry, the bar
-        // characters are NOT recomputed — the stale text just re-flows.
+        // With the width-independent format, resize doesn't change the text.
         let mut cs = CacheStats::default();
-        cs.update(1000, 500, 100);
+        cs.update(1000, 500, 500, 100);
 
-        // Compute bar at 50 cols
         let block_50 = cs.to_status_block(50);
         let text_50: String = block_50
             .content
@@ -3530,10 +3519,7 @@ mod tests {
             .iter()
             .map(|s| s.text.as_str())
             .collect();
-        let bar_50 = text_50.matches('█').count() + text_50.matches('░').count();
-        assert_eq!(bar_50, 10, "sanity: bar at 50 cols = 10");
 
-        // Compute bar at 120 cols — same CacheStats, just a different argument
         let block_120 = cs.to_status_block(120);
         let text_120: String = block_120
             .content
@@ -3541,20 +3527,14 @@ mod tests {
             .iter()
             .map(|s| s.text.as_str())
             .collect();
-        let bar_120 = text_120.matches('█').count() + text_120.matches('░').count();
-        // The method recomputes correctly when called directly.
-        // But through the live TUI, the status line was set at the old width
-        // and only updates on the NEXT CacheTelemetry event.
-        assert!(
-            bar_120 > bar_50,
-            "BUG: bar should be wider at 120 cols than at 50 cols"
-        );
+
+        assert_eq!(text_50, text_120, "format is width-independent");
     }
 
     #[test]
     fn cache_bar_text_truncates_at_min_terminal_width() {
         let mut cs = CacheStats::default();
-        cs.update(100, 50, 10);
+        cs.update(100, 50, 50, 10);
         // terminal_width = 40 should not cause a panic or empty bar
         let block = cs.to_status_block(40);
         let text: String = block
@@ -3564,8 +3544,8 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         // The bar should still render with at least bar_width=10 characters
-        let total_bar = text.matches('█').count() + text.matches('░').count();
-        assert_eq!(total_bar, 10, "bar at 40 cols terminal should be 10 chars");
+        // New format has no bar chars
+        assert!(text.contains('↑'), "should show up arrow at min width");
         assert!(
             text.contains('%'),
             "bar must show percentage even at min width"
@@ -3604,6 +3584,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
+                output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
             }),
@@ -3623,6 +3604,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
+                output_tokens: 50,
                 cache_read_tokens: 80,
                 cache_creation_tokens: 10,
             }),
@@ -3633,6 +3615,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 200,
+                output_tokens: 100,
                 cache_read_tokens: 100,
                 cache_creation_tokens: 50,
             }),
@@ -3652,6 +3635,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
+                output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
             }),
@@ -3677,6 +3661,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
+                output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
             }),
@@ -3711,6 +3696,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 200,
+                output_tokens: 100,
                 cache_read_tokens: 100,
                 cache_creation_tokens: 50,
             }),
@@ -3748,7 +3734,7 @@ mod tests {
     fn cache_bar_disconnected_preserves_last_known() {
         let mut fx = loop_fixture();
         // Inject cache telemetry
-        fx.app.cache.update(100, 50, 10);
+        fx.app.cache.update(100, 50, 50, 10);
         let (w, _) = fx.handle.size();
         fx.handle
             .set_status_line(fx.app.cache.to_status_block(w.max(40)));
@@ -3789,6 +3775,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 1000,
+                output_tokens: 500,
                 cache_read_tokens: 800,
                 cache_creation_tokens: 200,
             }),
@@ -3808,10 +3795,10 @@ mod tests {
         );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.cache.request_count, 0);
-        // After compaction, the bar should show "no requests yet"
+        // After compaction, the bar should show "cache:"
         assert!(
-            transcript_contains(&fx, "no requests yet"),
-            "after compaction cache bar should reset to 'no requests yet'"
+            transcript_contains(&fx, "cache:"),
+            "after compaction cache bar should reset to empty state"
         );
     }
 
@@ -3834,6 +3821,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 50,
+                output_tokens: 25,
                 cache_read_tokens: 10,
                 cache_creation_tokens: 5,
             }),
@@ -3875,6 +3863,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::CacheTelemetry {
                         input_tokens: 100,
+                        output_tokens: 50,
                         cache_read_tokens: 50,
                         cache_creation_tokens: 10,
                     },
@@ -3883,6 +3872,7 @@ mod tests {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::CacheTelemetry {
                         input_tokens: 200,
+                        output_tokens: 100,
                         cache_read_tokens: 100,
                         cache_creation_tokens: 20,
                     },
@@ -4801,27 +4791,20 @@ mod tests {
 
     #[test]
     fn cache_bar_stale_width_on_resize_through_real_rendering() {
-        // This test exercises the actual pipeline: the status line text
-        // is computed at one terminal width, then the terminal is resized.
-        // The bar character count should adapt but doesn't because the
-        // text string was baked in at the old width.
+        // With the new width-independent format, resize does not affect the text.
         let mut fx = loop_fixture();
-        // Start with a 40-wide terminal (default in tests is COLS=40)
-        // At 40 cols: bar_width = max(10, 40-60) = 10
-        // Send a cache telemetry to create the status line
         let driver = {
             let app_tx = fx.app_tx.clone();
             std::thread::spawn(move || {
-                // First, inject cache telemetry
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                     OutputChunk::CacheTelemetry {
                         input_tokens: 1000,
+                        output_tokens: 500,
                         cache_read_tokens: 500,
                         cache_creation_tokens: 100,
                     },
                 ))));
                 std::thread::sleep(Duration::from_millis(30));
-                // Now resize to a wider terminal (120 cols)
                 let _ = app_tx.send(AppEvent::Term(Event::Resize {
                     width: 120,
                     height: 30,
@@ -4840,12 +4823,8 @@ mod tests {
         );
         driver.join().unwrap();
         fx.handle.redraw_sync();
-        // The status line text was computed at 40 cols with bar_width=10.
-        // After resize to 120 cols, the same text is laid out but the
-        // bar characters are stuck at 10 (should be 40).
         let rendered = fx.transcript_contains("cache:");
         assert!(rendered, "cache bar must be visible");
-        // Grab the rendered status line text
         let em = Emulator::from_capture(120, 30, &fx.buf);
         let joined: String = em
             .history()
@@ -4854,11 +4833,10 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>()
             .join("");
-        let bar_chars = joined.matches('█').count() + joined.matches('░').count();
-        assert!(
-            bar_chars > 10,
-            "BUG: cache bar should have more than 10 chars after resize to 120 cols (got {bar_chars})"
-        );
+        assert!(joined.contains('\u{2191}'), "should show up arrow");
+        assert!(joined.contains('\u{2193}'), "should show down arrow");
+        assert!(joined.contains('R'), "should show R for cache reads");
+        assert!(joined.contains("CH"), "should show CH for hit rate");
         fx.shutdown();
     }
 
@@ -5133,7 +5111,7 @@ mod tests {
     fn resize_with_cache_bar_does_not_duplicate_status_line() {
         let mut fx = loop_fixture();
         // Pre-populate cache stats
-        fx.app.cache.update(500, 250, 50);
+        fx.app.cache.update(500, 250, 250, 50);
         {
             let (w, _) = fx.handle.size();
             fx.handle
@@ -5290,6 +5268,7 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::CacheTelemetry {
                 input_tokens: 100,
+                output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
             }),
@@ -5385,7 +5364,7 @@ mod tests {
     fn status_response_contains_cache_info_when_available() {
         let mut fx = loop_fixture();
         // Pre-populate cache
-        fx.app.cache.update(1000, 500, 100);
+        fx.app.cache.update(1000, 500, 500, 100);
         {
             let (w, _) = fx.handle.size();
             fx.handle
@@ -5440,6 +5419,7 @@ mod tests {
                     let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
                         OutputChunk::CacheTelemetry {
                             input_tokens: 100 + i,
+                            output_tokens: 100 + i,
                             cache_read_tokens: 50 + i / 2,
                             cache_creation_tokens: 10,
                         },

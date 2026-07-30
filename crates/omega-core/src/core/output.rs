@@ -165,6 +165,9 @@ pub enum OutputChunk {
 pub struct CacheTelemetry {
     /// Total input tokens sent in this request
     pub input_tokens: u32,
+    /// Output tokens generated in this request
+    #[serde(default)]
+    pub output_tokens: u32,
     /// Tokens read from cache in this request (cache hit)
     pub cache_read_tokens: u32,
     /// Tokens written to cache in this request (cache creation)
@@ -377,6 +380,7 @@ mod tests {
     fn test_cache_telemetry_all_zero() {
         let t = CacheTelemetry {
             input_tokens: 0,
+            output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
@@ -388,6 +392,7 @@ mod tests {
     fn test_cache_telemetry_full_hit() {
         let t = CacheTelemetry {
             input_tokens: 1000,
+            output_tokens: 500,
             cache_read_tokens: 800,
             cache_creation_tokens: 200,
         };
@@ -400,6 +405,7 @@ mod tests {
         // First request: all tokens are new (cache creation only)
         let t = CacheTelemetry {
             input_tokens: 1000,
+            output_tokens: 500,
             cache_read_tokens: 0,
             cache_creation_tokens: 1000,
         };
@@ -412,6 +418,7 @@ mod tests {
         // Edge case: division by zero handled
         let t = CacheTelemetry {
             input_tokens: 0,
+            output_tokens: 0,
             cache_read_tokens: 50,
             cache_creation_tokens: 10,
         };
@@ -423,6 +430,7 @@ mod tests {
     fn test_cache_telemetry_has_caching_true_when_only_read() {
         let t = CacheTelemetry {
             input_tokens: 100,
+            output_tokens: 50,
             cache_read_tokens: 5,
             cache_creation_tokens: 0,
         };
@@ -433,6 +441,7 @@ mod tests {
     fn test_cache_telemetry_has_caching_true_when_only_creation() {
         let t = CacheTelemetry {
             input_tokens: 100,
+            output_tokens: 50,
             cache_read_tokens: 0,
             cache_creation_tokens: 5,
         };
@@ -443,6 +452,7 @@ mod tests {
     fn test_cache_telemetry_hit_rate_hundred_percent() {
         let t = CacheTelemetry {
             input_tokens: 500,
+            output_tokens: 250,
             cache_read_tokens: 500,
             cache_creation_tokens: 0,
         };
@@ -454,6 +464,7 @@ mod tests {
         // Typical first request: tokens written to cache, none read
         let t = CacheTelemetry {
             input_tokens: 2000,
+            output_tokens: 1000,
             cache_read_tokens: 0,
             cache_creation_tokens: 2000,
         };
@@ -465,11 +476,13 @@ mod tests {
     fn test_cache_telemetry_serialization() {
         let t = CacheTelemetry {
             input_tokens: 1000,
+            output_tokens: 500,
             cache_read_tokens: 800,
             cache_creation_tokens: 200,
         };
         let json = serde_json::to_value(&t).unwrap();
         assert_eq!(json["input_tokens"], 1000);
+        assert_eq!(json["output_tokens"], 500);
         assert_eq!(json["cache_read_tokens"], 800);
         assert_eq!(json["cache_creation_tokens"], 200);
     }
@@ -480,6 +493,7 @@ mod tests {
             r#"{"input_tokens": 500, "cache_read_tokens": 400, "cache_creation_tokens": 100}"#;
         let t: CacheTelemetry = serde_json::from_str(json).unwrap();
         assert_eq!(t.input_tokens, 500);
+        assert_eq!(t.output_tokens, 0);
         assert_eq!(t.cache_read_tokens, 400);
         assert_eq!(t.cache_creation_tokens, 100);
     }
