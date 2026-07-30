@@ -48,7 +48,7 @@ impl ToolExecutor {
         }
 
         // Send tool end notification
-        internals.send_tool_end(tool_id, result.clone());
+        internals.send_tool_end(tool_id, tool_name, input, result.clone());
         internals.context.current_tool_use_id = None;
 
         result

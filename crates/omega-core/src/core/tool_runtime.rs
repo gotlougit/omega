@@ -59,9 +59,11 @@ pub trait ToolRuntime: Send + Sync {
     }
 
     /// Notify that a tool has ended
-    fn send_tool_end(&self, id: &str, result: ToolResult) {
+    fn send_tool_end(&self, id: &str, name: &str, input: &serde_json::Value, result: ToolResult) {
         self.send_output(OutputChunk::ToolEnd {
             id: id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
             result,
         });
     }

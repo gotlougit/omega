@@ -65,6 +65,8 @@ pub enum OutputChunk {
     },
     ToolEnd {
         id: String,
+        name: String,
+        input: Value,
         result: ToolResultWire,
     },
     AskUserQuestion {
@@ -177,6 +179,12 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        let name = inner
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = inner.get("input").cloned().unwrap_or(Value::Null);
                         let result = parse_tool_result(inner.get("result")).unwrap_or_else(|| {
                             ToolResultWire {
                                 text: String::new(),
@@ -184,7 +192,12 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                                 content: None,
                             }
                         });
-                        OutputChunk::ToolEnd { id, result }
+                        OutputChunk::ToolEnd {
+                            id,
+                            name,
+                            input,
+                            result,
+                        }
                     }
                     "AskUserQuestion" => {
                         let request_id = inner

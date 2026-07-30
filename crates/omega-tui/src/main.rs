@@ -363,8 +363,45 @@ fn handle_daemon_event(
                     ))));
                 }
             }
-            OutputChunk::ToolEnd { result, .. } => {
-                if result.is_error {
+            OutputChunk::ToolEnd {
+                name,
+                input,
+                result,
+                ..
+            } => {
+                // For Transfer tool, save the file content to the user's PWD
+                if name == "Transfer" && !result.is_error && !result.text.is_empty() {
+                    let file_path = input
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("transferred-file");
+                    let basename = std::path::Path::new(file_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "transferred-file".to_string());
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let out_name = format!("{}-{}", basename, timestamp);
+
+                    match std::fs::write(&out_name, &result.text) {
+                        Ok(()) => {
+                            let cwd = std::env::current_dir().unwrap_or_default();
+                            let full_path = cwd.join(&out_name);
+                            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                                format!("  ✓ Transferred to: {}", full_path.display()),
+                                s_highlight(),
+                            ))));
+                        }
+                        Err(e) => {
+                            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                                format!("  ✗ Failed to save transferred file: {}", e),
+                                s_error(),
+                            ))));
+                        }
+                    }
+                } else if result.is_error {
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                         format!("  ✗ {}", result.text),
                         s_error(),
@@ -1251,6 +1288,8 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::ToolEnd {
                 id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "src/main.rs"}),
                 result: ToolResultWire {
                     text: "boom".into(),
                     is_error: true,
@@ -1828,6 +1867,8 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::ToolEnd {
                 id: "t2".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
                 result: ToolResultWire {
                     text: "done".into(),
                     is_error: false,
@@ -3042,6 +3083,8 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::ToolEnd {
                 id: "t1".into(),
+                name: "run".into(),
+                input: serde_json::json!({"command": "true"}),
                 result: omega_loop_client::ToolResultWire {
                     text: String::new(),
                     is_error: false,
@@ -3801,6 +3844,8 @@ mod tests {
             &mut fx.streaming,
             chunk(OutputChunk::ToolEnd {
                 id: "t1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "echo hello"}),
                 result: ToolResultWire {
                     text: "done".into(),
                     is_error: false,

@@ -99,6 +99,10 @@ pub enum OutputChunk {
     ToolEnd {
         /// Tool use ID
         id: String,
+        /// Tool name
+        name: String,
+        /// Tool input
+        input: Value,
         /// Tool result
         result: ToolResult,
     },
@@ -283,9 +287,16 @@ impl OutputChunk {
     }
 
     /// Create a tool end chunk
-    pub fn tool_end(id: impl Into<String>, result: ToolResult) -> Self {
+    pub fn tool_end(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: Value,
+        result: ToolResult,
+    ) -> Self {
         OutputChunk::ToolEnd {
             id: id.into(),
+            name: name.into(),
+            input,
             result,
         }
     }

@@ -123,9 +123,17 @@ impl AgentInternals {
     }
 
     /// Notify that a tool has ended
-    pub fn send_tool_end(&self, id: &str, result: ToolResult) {
+    pub fn send_tool_end(
+        &self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        result: ToolResult,
+    ) {
         self.send(OutputChunk::ToolEnd {
             id: id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
             result,
         });
     }

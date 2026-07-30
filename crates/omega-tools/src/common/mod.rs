@@ -9,11 +9,11 @@
 pub mod bash;
 pub mod edit_tool;
 pub mod read_tool;
-pub mod transfer_diff;
+pub mod transfer;
 pub mod write_tool;
 
 pub use bash::BashTool;
 pub use edit_tool::EditTool;
 pub use read_tool::ReadTool;
-pub use transfer_diff::TransferTool;
+pub use transfer::TransferTool;
 pub use write_tool::WriteTool;
