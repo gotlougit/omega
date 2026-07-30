@@ -28,7 +28,7 @@ An agent runtime and tool execution framework in Rust.
 | Crate | Description |
 |---|---|
 | **omega-core** | Pure types + `ToolRuntime` trait — no logic, 4 deps (serde, serde_json, thiserror, async-trait) |
-| **omega-tools** | `Tool` trait, `ToolRegistry`, built-in tool implementations (Bash, Read, Write, Edit, Glob, Grep, AskUser, Transfer) |
+| **omega-tools** | `Tool` trait, `ToolRegistry`, built-in tool implementations (Bash, Read, Write, Edit, Glob, Grep, Transfer) |
 | **omega-llm** | LLM provider abstraction (`LlmProvider` trait, types, OpenAI backend) |
 | **omega-loop** | Agent daemon — `StandardAgent`, `AgentRuntime`, `AgentSession`, helpers, everything else |
 | **omega-loop-client** | Client library for the `omega-loop` daemon protocol |

@@ -18,4 +18,4 @@ tools or fix existing ones without touching `omega-core` or `omega-loop`.
 |---|---|
 | **`tool`** | `Tool` trait — implement to add new tools |
 | **`registry`** | `ToolRegistry` — register tools and execute them by name |
-| **`common`** | BashTool, ReadTool, WriteTool, EditTool, GlobTool, GrepTool, AskUserQuestionTool, TransferTool |
+| **`common`** | BashTool, ReadTool, WriteTool, EditTool, GlobTool, GrepTool, TransferTool |

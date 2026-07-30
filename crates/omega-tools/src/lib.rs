@@ -3,7 +3,7 @@
 //! This crate provides:
 //! - `Tool` trait — interface for implementing tools
 //! - `ToolRegistry` — registry for managing available tools
-//! - Built-in tool implementations (Bash, Read, Write, Edit, AskUserQuestion, Transfer)
+//! - Built-in tool implementations (Bash, Read, Write, Edit, Transfer)
 
 mod registry;
 mod tool;
@@ -15,7 +15,7 @@ pub use registry::ToolRegistry;
 pub use tool::Tool;
 
 // Re-export common tools for convenience
-pub use common::{AskUserQuestionTool, BashTool, EditTool, ReadTool, TransferTool, WriteTool};
+pub use common::{BashTool, EditTool, ReadTool, TransferTool, WriteTool};
 
 #[cfg(test)]
 mod tests {
@@ -90,20 +90,6 @@ mod tests {
     // Native tool definitions match canonical defs
     // -----------------------------------------------------------------------
 
-    /// AskUserQuestionTool.definition() must produce the same result as
-    /// def_to_tool_definition(&omega_tool_defs::ask_user_question::DEF).
-    #[test]
-    fn test_ask_user_question_definition_matches_canonical() {
-        let tool = AskUserQuestionTool::new();
-        let tool_def = tool.definition();
-        let canonical = def_to_tool_definition(&omega_tool_defs::ask_user_question::DEF);
-        assert_eq!(
-            serde_json::to_value(&tool_def).unwrap(),
-            serde_json::to_value(&canonical).unwrap(),
-            "AskUserQuestionTool.definition() differs from canonical def"
-        );
-    }
-
     /// TransferTool.definition() must produce the same result as
     /// def_to_tool_definition(&omega_tool_defs::transfer::DEF).
     #[test]
@@ -122,16 +108,12 @@ mod tests {
     // register_default_tools
     // -----------------------------------------------------------------------
 
-    /// register_default_tools must register AskUserQuestion and Transfer.
+    /// register_default_tools must register Transfer.
     #[test]
     fn test_register_default_tools_registers_native_tools() {
         let mut registry = ToolRegistry::new();
         register_default_tools(&mut registry);
 
-        assert!(
-            registry.get("AskUserQuestion").is_some(),
-            "AskUserQuestion should be registered"
-        );
         assert!(
             registry.get("Transfer").is_some(),
             "Transfer should be registered"
@@ -173,10 +155,6 @@ mod tests {
         );
         // Native tools now present too
         assert!(
-            registry.get("AskUserQuestion").is_some(),
-            "AskUserQuestion should have been added"
-        );
-        assert!(
             registry.get("Transfer").is_some(),
             "Transfer should have been added"
         );
@@ -206,12 +184,11 @@ pub fn def_to_tool_definition(def: &omega_tool_defs::ToolDef) -> ToolDefinition 
 /// an external executor like omega-sh.
 pub fn register_default_tools(registry: &mut ToolRegistry) {
     // In-process tools that don't need omega-sh
-    registry.register(AskUserQuestionTool::new());
     registry.register(TransferTool::new());
 
     // Auto-register any future native tools from the canonical defs.
-    // Native tools that need special runtime access (like AskUserQuestion
-    // and Transfer) are registered above; the loop catches any that
+    // Native tools that need special runtime access (like Transfer)
+    // are registered above; the loop catches any that
     // don't need special setup but are marked Native in omega-tool-defs.
     for &def in omega_tool_defs::ALL {
         if def.kind == omega_tool_defs::ToolKind::Native {

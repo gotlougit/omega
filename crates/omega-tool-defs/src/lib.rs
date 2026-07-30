@@ -153,76 +153,6 @@ tool!(edit, Proxy, "Edit",
 // In-process tools  –  executed by omega-loop directly
 // ============================================================================
 
-tool!(ask_user_question, Native, "AskUserQuestion",
-    "Use this tool to ask the user questions during execution. This allows you to:\n\
-     1. Gather user preferences or requirements\n\
-     2. Clarify ambiguous instructions\n\
-     3. Get decisions on implementation choices as you work\n\
-     4. Offer choices to the user about what direction to take.\n\n\
-     Usage notes:\n\
-     - Users will always be able to select \"Other\" to provide custom text input\n\
-     - Use multiSelect: true to allow multiple answers to be selected for a question\n\
-     - If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
-    {
-        "type": "object",
-        "properties": {
-            "questions": {
-                "type": "array",
-                "description": "Questions to ask the user (1-4 questions)",
-                "minItems": 1,
-                "maxItems": 4,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark."
-                        },
-                        "header": {
-                            "type": "string",
-                            "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\"."
-                        },
-                        "options": {
-                            "type": "array",
-                            "description": "The available choices for this question. Must have 2-4 options.",
-                            "minItems": 2,
-                            "maxItems": 4,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {
-                                        "type": "string",
-                                        "description": "The display text for this option (1-5 words)."
-                                    },
-                                    "description": {
-                                        "type": "string",
-                                        "description": "Explanation of what this option means or what will happen if chosen."
-                                    }
-                                },
-                                "required": ["label", "description"]
-                            }
-                        },
-                        "multiSelect": {
-                            "type": "boolean",
-                            "default": false,
-                            "description": "Set to true to allow the user to select multiple options."
-                        }
-                    },
-                    "required": ["question", "header", "options", "multiSelect"]
-                }
-            },
-            "answers": {
-                "type": "object",
-                "description": "Optional pre-filled answers (header -> selected label)",
-                "additionalProperties": {
-                    "type": "string"
-                }
-            }
-        },
-        "required": ["questions"]
-    }
-);
-
 tool!(transfer, Native, "Transfer",
     "Use this tool to transfer a file from the agent's environment to the user.\n\
      The file content will be saved as a file on the user's local machine.\n\n\
@@ -252,7 +182,6 @@ pub const ALL: &[&LazyLock<ToolDef>] = &[
     &read::DEF,
     &write::DEF,
     &edit::DEF,
-    &ask_user_question::DEF,
     &transfer::DEF,
 ];
 
@@ -359,7 +288,7 @@ mod tests {
     /// Native tools are those executed in-process.
     #[test]
     fn test_native_tool_kinds() {
-        let natives: std::collections::HashSet<&str> = ["AskUserQuestion", "Transfer"].into();
+        let natives: std::collections::HashSet<&str> = ["Transfer"].into();
         for &def in ALL {
             if natives.contains(def.name) {
                 assert_eq!(
@@ -380,7 +309,6 @@ mod tests {
             "Read",
             "Write",
             "Edit",
-            "AskUserQuestion",
             "Transfer",
         ]
         .into();
@@ -396,7 +324,7 @@ mod tests {
     /// The ALL list has the expected count.
     #[test]
     fn test_all_count() {
-        assert_eq!(ALL.len(), 6);
+        assert_eq!(ALL.len(), 5);
     }
 
     /// Schema with required fields: every required property must also
@@ -423,17 +351,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Edge cases
     // -----------------------------------------------------------------------
-
-    /// AskUserQuestion schema: includes special characters (newlines, quotes).
-    #[test]
-    fn test_ask_user_description_has_special_chars() {
-        let desc = ask_user_question::DEF.description;
-        assert!(
-            desc.contains("\"Other\""),
-            "description should contain escaped quotes"
-        );
-        assert!(desc.contains("\n"), "description should contain newlines");
-    }
 
     /// Schemas round-trip through JSON: parse → serialize produces valid JSON
     /// with the same structure.

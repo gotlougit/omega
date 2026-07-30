@@ -301,7 +301,7 @@ mod tests {
                 proxy_name
             );
         }
-        assert_eq!(registry.len(), 6);
+        assert_eq!(registry.len(), 4);
     }
 
     /// register_proxy_tools does NOT register native tools.
@@ -311,10 +311,6 @@ mod tests {
         let client = OmegaClient::with_socket("/tmp/nonexistent-test-socket.sock");
         register_proxy_tools(&mut registry, client);
 
-        assert!(
-            registry.get("AskUserQuestion").is_none(),
-            "AskUserQuestion is native and should not be in proxy registry"
-        );
         assert!(
             registry.get("Transfer").is_none(),
             "Transfer is native and should not be in proxy registry"
@@ -349,19 +345,6 @@ mod tests {
         let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
         let tool = proxy::ProxyTool::new(client, &omega_tool_defs::read::DEF);
         assert_eq!(tool.description(), omega_tool_defs::read::DEF.description);
-    }
-
-    /// ProxyTool::definition() matches def_to_tool_definition of the canonical def.
-    #[test]
-    fn test_proxy_tool_definition_matches_canonical() {
-        let client = OmegaClient::with_socket("/tmp/irrelevant.sock");
-        let tool = proxy::ProxyTool::new(client, &omega_tool_defs::grep::DEF);
-        let expected = omega_tools::def_to_tool_definition(&omega_tool_defs::grep::DEF);
-        let actual = tool.definition();
-        assert_eq!(
-            serde_json::to_value(&actual).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
     }
 
     /// ProxyTool::get_info returns a stub with the tool name.

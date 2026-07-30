@@ -383,20 +383,6 @@ fn handle_daemon_event(
                     ))));
                 }
             }
-            OutputChunk::AskUserQuestion { questions, .. } => {
-                for q in &questions {
-                    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        format!("❓ {}: {}", q.header, q.question),
-                        s_highlight(),
-                    ))));
-                    for opt in &q.options {
-                        handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                            format!("  [{}] {}", opt.label, opt.description),
-                            s_assistant(),
-                        ))));
-                    }
-                }
-            }
             OutputChunk::PermissionRequest {
                 tool_name,
                 action,
@@ -436,6 +422,7 @@ fn handle_daemon_event(
                     .update(input_tokens, cache_read_tokens, cache_creation_tokens);
                 refresh_cache_status(handle, app);
             }
+            OutputChunk::AskUserQuestion { .. } => {}
             OutputChunk::Unknown => {}
         },
         ServerEvent::Created {
