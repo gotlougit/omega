@@ -99,6 +99,11 @@ enum OpenAIMessage {
         role: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Reasoning tokens from a previous turn (DeepSeek-style). Sent back
+        /// so the model can continue its chain of thought across turns, exactly
+        /// like opencode does for OpenAI-compatible reasoning models.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<OpenAIToolCall>>,
     },
@@ -216,6 +221,11 @@ struct OpenAIStreamDelta {
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// Reasoning/thinking tokens (DeepSeek-style reasoning models and OpenAI-
+    /// compatible gateways). Streamed BEFORE `content`, and is distinct from
+    /// the final response text — clients render it as a thinking trace.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIStreamToolCall>>,
 }
@@ -396,6 +406,12 @@ impl OpenAIProvider {
             let mut lines = buf_reader.lines();
             let mut full_content = String::new();
             let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
+            // Reasoning (thinking) accumulation. OpenAI-compatible reasoning
+            // models stream `delta.reasoning_content` before any content;
+            // we surface it as a thinking content block (index 0) so the
+            // agent loop forwards it to clients as ThinkingDelta/Complete.
+            let mut thinking_active = false;
+            let mut thinking_accum = String::new();
 
             while let Some(line) = lines.next_line().await? {
                 if !line.starts_with("data: ") {
@@ -452,15 +468,58 @@ impl OpenAIProvider {
                                 });
                             }
 
-                            // Handle content delta
+                            // Handle reasoning content (thinking) deltas.
+                            // Reasoning only ever precedes text output, so once
+                            // text has started any stray reasoning is ignored.
+                            if let Some(reasoning) = &delta.reasoning_content {
+                                if !reasoning.is_empty() && full_content.is_empty() {
+                                    if !thinking_active {
+                                        thinking_active = true;
+                                        // Start of a thinking block
+                                        yield StreamEvent::ContentBlockStart(
+                                            ContentBlockStartEvent {
+                                                index: 0,
+                                                content_block: ContentBlockStart::Thinking {
+                                                    thinking: reasoning.clone(),
+                                                },
+                                            },
+                                        );
+                                    }
+                                    thinking_accum.push_str(reasoning);
+                                    yield StreamEvent::ContentBlockDelta(
+                                        ContentBlockDeltaEvent {
+                                            index: 0,
+                                            delta: ContentDelta::ThinkingDelta {
+                                                thinking: reasoning.clone(),
+                                            },
+                                        },
+                                    );
+                                }
+                            }
+
+                            // Handle content delta. The text block occupies
+                            // index 1 when a thinking block preceded it,
+                            // index 0 otherwise.
                             if let Some(content) = &delta.content {
                                 if !content.is_empty() {
+                                    // Close the thinking block before text starts.
+                                    if thinking_active {
+                                        thinking_active = false;
+                                        yield StreamEvent::ContentBlockStop(
+                                            ContentBlockStopEvent { index: 0 },
+                                        );
+                                    }
+                                    let text_index: usize = if thinking_accum.is_empty() {
+                                        0
+                                    } else {
+                                        1
+                                    };
                                     let is_new_text = full_content.is_empty();
                                     if is_new_text {
                                         // Start of a text block
                                         yield StreamEvent::ContentBlockStart(
                                             ContentBlockStartEvent {
-                                                index: 0,
+                                                index: text_index,
                                                 content_block: ContentBlockStart::Text {
                                                     text: content.clone(),
                                                 },
@@ -469,7 +528,7 @@ impl OpenAIProvider {
                                     }
                                     yield StreamEvent::ContentBlockDelta(
                                         ContentBlockDeltaEvent {
-                                            index: 0,
+                                            index: text_index,
                                             delta: ContentDelta::TextDelta {
                                                 text: content.clone(),
                                             },
@@ -504,23 +563,44 @@ impl OpenAIProvider {
 
                             // Handle finish reason
                             if let Some(ref reason) = choice.finish_reason {
-                                // Close the text block if we accumulated text
-                                if !full_content.is_empty() {
+                                // Close the thinking block if it's still open
+                                // (a reasoning-only turn ends without content).
+                                if thinking_active {
+                                    thinking_active = false;
                                     yield StreamEvent::ContentBlockStop(
                                         ContentBlockStopEvent { index: 0 },
                                     );
                                 }
 
-                                // Emit tool call blocks if we have any
+                                // Close the text block if we accumulated text
+                                if !full_content.is_empty() {
+                                    let text_index: usize = if thinking_accum.is_empty() {
+                                        0
+                                    } else {
+                                        1
+                                    };
+                                    yield StreamEvent::ContentBlockStop(
+                                        ContentBlockStopEvent { index: text_index },
+                                    );
+                                }
+
+                                // Emit tool call blocks if we have any. They
+                                // come after thinking (0) and/or text (1).
                                 if !tool_calls.is_empty() {
-                                    for acc in &tool_calls {
+                                    let tool_index_base: usize = if thinking_accum.is_empty() {
+                                        if full_content.is_empty() { 0 } else { 1 }
+                                    } else {
+                                        if full_content.is_empty() { 1 } else { 2 }
+                                    };
+                                    for (i, acc) in tool_calls.iter().enumerate() {
                                         if !acc.id.is_empty() && !acc.name.is_empty() {
                                             let input: Value = serde_json::from_str(&acc.arguments)
                                                 .unwrap_or(json!({}));
+                                            let idx = tool_index_base + i;
                                             // Emit as content block start+delta+stop sequence
                                             yield StreamEvent::ContentBlockStart(
                                                 ContentBlockStartEvent {
-                                                    index: if full_content.is_empty() { 0 } else { 1 },
+                                                    index: idx,
                                                     content_block: ContentBlockStart::ToolUse {
                                                         id: acc.id.clone(),
                                                         name: acc.name.clone(),
@@ -530,7 +610,7 @@ impl OpenAIProvider {
                                                 },
                                             );
                                             yield StreamEvent::ContentBlockStop(
-                                                ContentBlockStopEvent { index: if full_content.is_empty() { 0 } else { 1 } },
+                                                ContentBlockStopEvent { index: idx },
                                             );
                                         }
                                     }
@@ -612,7 +692,10 @@ impl LlmProvider for OpenAIProvider {
         _session_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         if thinking.is_some() {
-            tracing::warn!("OpenAI Chat Completions does not support extended thinking; ignoring");
+            tracing::debug!(
+                "OpenAI Chat Completions has no extended-thinking request field; \
+                 reasoning traces are surfaced from delta.reasoning_content when the model emits them"
+            );
         }
 
         let openai_messages = convert_messages_to_openai(&messages, &system);
@@ -869,17 +952,25 @@ fn convert_assistant_message(msg: &Message, out: &mut Vec<OpenAIMessage>) {
             out.push(OpenAIMessage::Assistant {
                 role: "assistant".to_string(),
                 content: Some(s.clone()),
+                reasoning_content: None,
                 tool_calls: None,
             });
         }
         MessageContent::Blocks(blocks) => {
             let mut text_content: Option<String> = None;
             let mut tool_calls: Vec<OpenAIToolCall> = Vec::new();
+            // Reasoning traces from earlier turns are sent back as
+            // `reasoning_content` (DeepSeek-style) so the model keeps its
+            // chain of thought across turns — matching opencode's wire format.
+            let mut reasoning_parts: Vec<String> = Vec::new();
 
             for block in blocks {
                 match block {
                     ContentBlock::Text { text, .. } => {
                         text_content = Some(text.clone());
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        reasoning_parts.push(thinking.clone());
                     }
                     ContentBlock::ToolUse {
                         id, name, input, ..
@@ -900,6 +991,11 @@ fn convert_assistant_message(msg: &Message, out: &mut Vec<OpenAIMessage>) {
             out.push(OpenAIMessage::Assistant {
                 role: "assistant".to_string(),
                 content: text_content,
+                reasoning_content: if reasoning_parts.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_parts.join(""))
+                },
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -1128,6 +1224,100 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 2000);
         let details = usage.prompt_tokens_details.as_ref().unwrap();
         assert_eq!(details.cached_tokens, 1800);
+    }
+
+    #[test]
+    fn test_parse_stream_chunk_with_reasoning_content() {
+        // DeepSeek-style reasoning model: thinking tokens arrive in
+        // `delta.reasoning_content` BEFORE any `content`.
+        let json = r#"{
+            "id": "chatcmpl-r1",
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_content": "let me think about this" },
+                "finish_reason": null
+            }]
+        }"#;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("let me think about this")
+        );
+        assert!(delta.content.is_none(), "reasoning must not land in content");
+    }
+
+    #[test]
+    fn test_parse_stream_chunk_without_reasoning_content() {
+        // Plain models: reasoning_content is absent and must default to None.
+        let json = r#"{
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "hello" },
+                "finish_reason": null
+            }]
+        }"#;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.reasoning_content, None);
+        assert_eq!(delta.content.as_deref(), Some("hello"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: reasoning traces round-trip through assistant messages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assistant_message_preserves_reasoning_content() {
+        // A stored thinking block must be sent back as `reasoning_content` so
+        // DeepSeek-style models keep their chain of thought across turns.
+        let msg = Message::assistant_with_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "hmm, step one...".into(),
+                signature: String::new(),
+            },
+            ContentBlock::Text {
+                text: "final answer".into(),
+                cache_control: None,
+            },
+        ]);
+        let mut out = Vec::new();
+        convert_assistant_message(&msg, &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OpenAIMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } => {
+                assert_eq!(content.as_deref(), Some("final answer"));
+                assert_eq!(
+                    reasoning_content.as_deref(),
+                    Some("hmm, step one...")
+                );
+                assert!(tool_calls.is_none());
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn test_assistant_message_without_thinking_omits_reasoning_content() {
+        let msg = Message::assistant("plain reply");
+        let mut out = Vec::new();
+        convert_assistant_message(&msg, &mut out);
+        match &out[0] {
+            OpenAIMessage::Assistant {
+                reasoning_content, ..
+            } => {
+                assert!(reasoning_content.is_none());
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+        // Serialized JSON must not contain a reasoning_content key.
+        let json = serde_json::to_value(&out[0]).unwrap();
+        assert!(json.get("reasoning_content").is_none());
     }
 
     // -----------------------------------------------------------------------

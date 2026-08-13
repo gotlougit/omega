@@ -621,8 +621,12 @@ fn handle_daemon_event(
                 // Accumulate reasoning into ONE block so the trace is readable
                 // instead of one noisy block per delta.
                 streaming.thinking_buf.push_str(&s);
+                // The ✨ spark marks the model as STILL thinking — it stays on
+                // the live block and is replaced by "… " once the trace is
+                // finalized (ThinkingComplete / TextComplete / Done), so the
+                // spark's presence means the model hasn't finished yet.
                 let block = StyledBlock::new(StyledText::from(Span::new(
-                    format!("… {}", streaming.thinking_buf),
+                    format!("✨ {}", streaming.thinking_buf),
                     s_thinking(),
                 )));
                 if let Some(id) = streaming.thinking_block_id {
@@ -6029,7 +6033,7 @@ mod tests {
         );
         fx.handle.redraw_sync();
         assert_eq!(
-            count_rows_containing(&fx, "… let me think about this problem"),
+            count_rows_containing(&fx, "✨ let me think about this problem"),
             1,
             "thinking text must be visible and in ONE block"
         );
@@ -7007,7 +7011,7 @@ mod tests {
             "BUG: turn-2 thinking merged into turn-1 thinking block"
         );
         assert_eq!(count_rows_containing(&fx, "… first thought"), 1);
-        assert_eq!(count_rows_containing(&fx, "… second thought"), 1);
+        assert_eq!(count_rows_containing(&fx, "✨ second thought"), 1);
     }
 
     /// A second ThinkingComplete for the same turn must not create a duplicate
