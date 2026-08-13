@@ -63,14 +63,6 @@ Set behavior hooks.
 
 Stop hook execution on first Deny.
 
-### with_max_tool_iterations
-
-```rust
-.with_max_tool_iterations(usize)
-```
-
-Limit consecutive tool call loops.
-
 ### with_auto_save
 
 ```rust
@@ -128,7 +120,6 @@ let config = AgentConfig::new("You are a coding assistant")
     .with_debug(false)
     .with_thinking(16000)
     .with_hooks(hooks)
-    .with_max_tool_iterations(10)
     .with_auto_save(true)
     .with_auto_name(true)
     .with_prompt_caching(true);

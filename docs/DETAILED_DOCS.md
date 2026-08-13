@@ -2594,7 +2594,6 @@ cargo run --example session_browser
 | `with_thinking(budget)` | Enable extended thinking |
 | `with_hooks(Arc<HookRegistry>)` | Set behavior hooks |
 | `with_hook_short_circuit(bool)` | Enable hook short-circuit on Deny (default: false) |
-| `with_max_tool_iterations(n)` | Limit tool call loops |
 | `with_auto_save(bool)` | Auto-save session |
 | `with_injection_chain(chain)` | Set context injections |
 | `with_auto_name(bool)` | Auto-name conversations (default: true) |

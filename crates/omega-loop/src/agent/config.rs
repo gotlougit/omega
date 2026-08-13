@@ -14,9 +14,6 @@ pub struct AgentConfig {
     /// Context injection chain (applied before each LLM call)
     pub injections: InjectionChain,
 
-    /// Maximum number of tool iterations per turn
-    pub max_tool_iterations: usize,
-
     /// Whether to enable debug logging (API calls, tool calls)
     pub debug_enabled: bool,
 
@@ -49,7 +46,6 @@ impl AgentConfig {
         Self {
             tools: None,
             injections: InjectionChain::new(),
-            max_tool_iterations: 100,
             auto_save_session: true,
             debug_enabled: false,
             enable_prompt_caching: true,
@@ -99,7 +95,6 @@ impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
             .field("tools", &self.tools.as_ref().map(|t| t.tool_names()))
-            .field("max_tool_iterations", &self.max_tool_iterations)
             .field("debug_enabled", &self.debug_enabled)
             .field("enable_prompt_caching", &self.enable_prompt_caching)
             .field("turn_retry", &self.turn_retry)

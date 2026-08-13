@@ -227,20 +227,8 @@ impl StandardAgent {
         // Get tool definitions
         let tool_definitions = self.config.tool_definitions();
 
-        let mut iterations = 0;
-
         // LLM loop - continues until no more tool calls
         loop {
-            iterations += 1;
-            if iterations > self.config.max_tool_iterations {
-                tracing::warn!(
-                    "[StandardAgent] Max tool iterations ({}) reached",
-                    self.config.max_tool_iterations
-                );
-                internals.send_status("Max tool iterations reached");
-                break;
-            }
-
             // Get messages and system prompt from session
             let (messages, system_prompt_text) = {
                 let session = internals.session.read().await;
@@ -268,9 +256,8 @@ impl StandardAgent {
             }
 
             tracing::info!(
-                "[StandardAgent] Calling LLM with {} messages (iteration {})",
-                messages_with_cache.len(),
-                iterations
+                "[StandardAgent] Calling LLM with {} messages",
+                messages_with_cache.len()
             );
 
             // Log API request if debugger is enabled (with cache_control included)
