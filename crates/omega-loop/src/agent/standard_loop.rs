@@ -1168,8 +1168,8 @@ async fn idle_interrupt_does_not_kill_agent() {
     let storage = crate::session::SessionStorage::with_dir(temp.path());
     let session = crate::session::AgentSession::new_with_storage(
         "steer-test",
-        "picrust",
-        "Picrust",
+        "omega",
+        "omega-tui",
         "test",
         "You are helpful.",
         storage,

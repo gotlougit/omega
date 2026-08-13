@@ -4,8 +4,6 @@
 //! `(DaemonReader, DaemonWriter)` pair.  Use the writer to send commands and
 //! the reader to receive events.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use omega_core::core::SessionInfo;
 use serde_json::Value;
@@ -79,10 +77,6 @@ pub enum OutputChunk {
         input: Value,
         result: ToolResultWire,
     },
-    AskUserQuestion {
-        request_id: String,
-        questions: Vec<UserQuestionWire>,
-    },
     PermissionRequest {
         tool_name: String,
         action: String,
@@ -113,20 +107,6 @@ pub struct ToolResultWire {
 pub struct ContentBlockWire {
     pub block_type: String,
     pub text: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UserQuestionWire {
-    pub question: String,
-    pub header: String,
-    pub options: Vec<QuestionOptionWire>,
-    pub multi_select: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct QuestionOptionWire {
-    pub label: String,
-    pub description: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,22 +188,6 @@ fn parse_chunk(val: &Value) -> OutputChunk {
                             name,
                             input,
                             result,
-                        }
-                    }
-                    "AskUserQuestion" => {
-                        let request_id = inner
-                            .get("request_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let questions = inner
-                            .get("questions")
-                            .and_then(|a| a.as_array())
-                            .map(|arr| arr.iter().filter_map(parse_user_question).collect())
-                            .unwrap_or_default();
-                        OutputChunk::AskUserQuestion {
-                            request_id,
-                            questions,
                         }
                     }
                     "PermissionRequest" => {
@@ -326,28 +290,6 @@ fn parse_tool_result(val: Option<&Value>) -> Option<ToolResultWire> {
         text,
         is_error,
         content: None,
-    })
-}
-
-fn parse_user_question(val: &Value) -> Option<UserQuestionWire> {
-    Some(UserQuestionWire {
-        question: val.get("question")?.as_str()?.to_string(),
-        header: val.get("header")?.as_str()?.to_string(),
-        options: val
-            .get("options")?
-            .as_array()?
-            .iter()
-            .filter_map(|o| {
-                Some(QuestionOptionWire {
-                    label: o.get("label")?.as_str()?.to_string(),
-                    description: o.get("description")?.as_str()?.to_string(),
-                })
-            })
-            .collect(),
-        multi_select: val
-            .get("multi_select")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
     })
 }
 
@@ -568,22 +510,6 @@ impl DaemonWriter {
         self.write_json(&req).await
     }
 
-    /// Send an `ask_response` to the daemon.
-    pub async fn send_ask_response(
-        &mut self,
-        session_id: &str,
-        request_id: &str,
-        answers: HashMap<String, String>,
-    ) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "ask_response",
-            "session_id": session_id,
-            "request_id": request_id,
-            "answers": answers,
-        });
-        self.write_json(&req).await
-    }
-
     /// Request the list of available sessions from the daemon.
     ///
     /// `query` is an optional case-insensitive substring filter applied by
@@ -700,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_parse_session_list_with_full_info() {
-        let json = r#"{"type":"SessionList","sessions":[{"session_id":"sess1","name":"Picrust Agent","conversation_name":"Fix build","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-02T00:00:00Z","message_count":5,"last_message":"hello"}]}"#;
+        let json = r#"{"type":"SessionList","sessions":[{"session_id":"sess1","name":"omega-tui","conversation_name":"Fix build","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-02T00:00:00Z","message_count":5,"last_message":"hello"}]}"#;
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
             ServerEvent::SessionList { sessions } => {

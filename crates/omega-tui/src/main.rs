@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::runtime::Runtime;
 
-use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
+use cli::{BlockId, Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
+use crossterm::event::KeyCode;
 use omega_core::core::SessionInfo;
 use omega_loop_client::{
     connect, DaemonReader, DaemonWriter, OutputChunk, ServerEvent, SessionConfig,
@@ -28,13 +29,23 @@ fn sty(fg: Color) -> Style {
     Style::default().fg(fg)
 }
 fn s_user() -> Style {
-    sty(Color::Cyan).bold()
+    // User messages: white — the terminal's default text colour — kept bold
+    // so turn boundaries stay scannable next to white assistant output.
+    // Uses the ANSI "white" slot, which Nord and other themes map to their
+    // own bright foreground; nothing Nord-specific is hardcoded.
+    sty(Color::White).bold()
 }
 fn s_assistant() -> Style {
-    Style::default()
+    // Non-thinking LLM output: white (terminal default foreground).
+    sty(Color::White)
 }
 fn s_tool() -> Style {
+    // Tool call in flight / streaming progress: yellow.
     sty(Color::Yellow)
+}
+fn s_tool_ok() -> Style {
+    // Tool call finished successfully: green.
+    sty(Color::Green)
 }
 fn s_error() -> Style {
     sty(Color::Red)
@@ -64,59 +75,209 @@ fn render_md_block(handle: &TermHandle, text: &str) -> StyledBlock {
     StyledBlock::new(styled)
 }
 
-/// Human-friendly age for an RFC3339 timestamp ("just now", "5m ago", …).
-/// Returns an empty string when the timestamp can't be parsed.
-fn relative_time(rfc3339: &str) -> String {
-    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
-        return String::new();
+/// The normal editable prompt shown at the bottom of the TUI.
+fn default_prompt() -> StyledText {
+    StyledText::from(Span::new("▸ ", Style::default().fg(Color::DarkYellow)))
+}
+
+/// Prompt replacement shown while the `/sessions` picker is active: a hint
+/// line instead of an editable input. j/k and the arrow keys move the
+/// selection, Enter resumes, Esc cancels.
+fn picker_prompt() -> StyledText {
+    StyledText::from(Span::new(
+        "  j/k or ↑/↓ move · PgUp/PgDn page · Enter resume · Esc cancel",
+        Style::default().fg(Color::DarkGrey),
+    ))
+}
+
+/// How many sessions the `/sessions` picker shows at once. Each entry is a
+/// single line (the first user prompt, truncated), so the window is small by
+/// design — you scan a handful of recent chats and jump in with Enter.
+const PICKER_WINDOW: usize = 5;
+
+/// Render the interactive `/sessions` window: at most [`PICKER_WINDOW`]
+/// sessions, one line each, scrolling as the selection moves. The line shows
+/// the session's first user prompt (truncated to fit); the raw session id is
+/// deliberately hidden — the number is only meaningful within this list.
+/// Replaces the previous picker block in place so navigation never appends
+/// new blocks.
+fn render_session_picker(app: &mut AppState, handle: &TermHandle) {
+    let Some(picker) = app.picker.as_mut() else {
+        return;
     };
-    let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
-    let secs = age.num_seconds();
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else if secs < 86400 * 30 {
-        format!("{}d ago", secs / 86400)
+    let (term_w, _) = handle.size();
+    let n = picker.sessions.len();
+    // "▸ 12. " = marker (1) + right-aligned index (2) + ". " (2) columns
+    // before the prompt text begins.
+    let text_w = term_w.saturating_sub(5).max(8);
+
+    let mut st = StyledText::new();
+    if !picker.loaded && n == 0 {
+        st.push(Span::new("Fetching sessions…", s_system()));
+    } else if n == 0 {
+        st.push(Span::new("(no saved sessions)", s_system()));
+        st.push(Span::new("\n", Style::default()));
+        st.push(Span::new("  Esc to return", s_system()));
     } else {
-        format!("{}mo ago", secs / (86400 * 30))
+        picker.selected = picker.selected.min(n - 1);
+        let win = PICKER_WINDOW.min(n);
+        // Keep the selection inside the window, scrolling one session at a
+        // time when it would leave.
+        if picker.first > n.saturating_sub(win) {
+            picker.first = n.saturating_sub(win);
+        }
+        if picker.selected < picker.first {
+            picker.first = picker.selected;
+        }
+        if picker.selected >= picker.first + win {
+            picker.first = picker.selected + 1 - win;
+        }
+        let first = picker.first;
+        let sel = picker.selected;
+        let end = (first + win).min(n);
+
+        st.push(Span::new(
+            format!("Sessions ({n}, newest first):\n"),
+            s_system(),
+        ));
+        for i in first..end {
+            let s = &picker.sessions[i];
+            let idx = i + 1;
+            let is_sel = i == sel;
+            let marker = if is_sel { "▸" } else { " " };
+            let style = if is_sel { s_highlight() } else { s_assistant() };
+            // First user prompt, truncated to a single line; fall back to
+            // the conversation name, then a generic label — never the raw
+            // session id.
+            let text = s
+                .first_user_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    s.conversation_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                })
+                .unwrap_or("(no messages)");
+            let line = cli::truncate_to_width(text, text_w);
+            st.push(Span::new(format!("{marker}{idx:>2}. {line}\n"), style));
+        }
+        // Footer: scroll indicators + key hints.
+        let mut footer = String::new();
+        if first > 0 {
+            footer.push_str(&format!("↑ {first} more · "));
+        }
+        if end < n {
+            footer.push_str(&format!("↓ {} more · ", n - end));
+        }
+        footer.push_str("j/k or ↑/↓ move · PgUp/PgDn page · Enter resume · Esc cancel");
+        st.push(Span::new(footer, s_system()));
+    }
+
+    let block = StyledBlock::new(st);
+    match picker.block_id {
+        Some(id) => handle.set_block(id, block),
+        None => picker.block_id = Some(handle.print_output(block)),
     }
 }
 
-/// Render the stored session list (newest first, as returned by the daemon)
-/// as a numbered, scannable picker. The numbers are what `/resume <index>`
-/// accepts, so finding a chat is: `/sessions <search>` then `/resume <n>`.
-fn render_session_list(app: &AppState, handle: &TermHandle) {
-    let sessions = &app.last_sessions;
-    if sessions.is_empty() {
-        handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-            "(no saved sessions)",
-            s_system(),
-        ))));
-        return;
+/// Enter `/sessions` picker mode: swap the editable prompt for a hint,
+/// forward navigation keys to the app, and show a (possibly empty) list
+/// window. The daemon's reply arrives asynchronously and fills the window.
+fn enter_picker(app: &mut AppState, handle: &TermHandle) {
+    app.picker = Some(SessionPicker {
+        sessions: Vec::new(),
+        selected: 0,
+        first: 0,
+        block_id: None,
+        loaded: false,
+    });
+    handle.set_buffer(String::new(), 0);
+    handle.set_left_prompt(picker_prompt());
+    handle.clear_status_line();
+    handle.set_picker(true);
+    render_session_picker(app, handle);
+}
+
+/// Leave `/sessions` picker mode: restore the editable prompt and remove the
+/// live list block (the transcript behind it stays untouched).
+fn exit_picker(app: &mut AppState, handle: &TermHandle) {
+    if let Some(picker) = app.picker.take() {
+        if let Some(id) = picker.block_id {
+            handle.remove_block(id);
+        }
     }
-    let mut st = StyledText::from(Span::new(
-        format!("Saved sessions ({}, newest first):\n", sessions.len()),
+    handle.set_picker(false);
+    handle.set_left_prompt(default_prompt());
+    refresh_cache_status(handle, app);
+}
+
+/// Enter in picker mode: resume the highlighted session (like `/resume <n>`)
+/// and leave picker mode.
+fn picker_select(app: &mut AppState, handle: &TermHandle, cmd_tx: &Sender<DaemonCmd>) {
+    let name = {
+        let Some(picker) = app.picker.as_ref() else {
+            return;
+        };
+        let Some(info) = picker.sessions.get(picker.selected) else {
+            return;
+        };
+        info.session_id.clone()
+    };
+    app.session_id = name.clone();
+    handle.clear_output();
+    let _ = cmd_tx.send(DaemonCmd::Resume(name.clone()));
+    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+        format!("Resuming: {name}"),
         s_system(),
-    ));
-    for (i, s) in sessions.iter().enumerate() {
-        let idx = i + 1;
-        let time = relative_time(&s.updated_at);
-        st.push(Span::new(format!("{idx:>2}. {}", s.title()), s_assistant()));
-        if !time.is_empty() {
-            st.push(Span::new(format!("   [{time}]"), s_system()));
+    ))));
+    exit_picker(app, handle);
+}
+
+/// Handle a navigation key while the `/sessions` picker is active.
+fn handle_picker_key(
+    app: &mut AppState,
+    handle: &TermHandle,
+    cmd_tx: &Sender<DaemonCmd>,
+    key: KeyCode,
+) {
+    match key {
+        KeyCode::Enter => {
+            picker_select(app, handle, cmd_tx);
+            return;
         }
-        st.push(Span::new("\n", Style::default()));
-        let mut meta = format!("     {} · {} message(s)", s.session_id, s.message_count);
-        if let Some(last) = s.last_message.as_deref() {
-            meta.push_str(&format!(" · \"{last}\""));
-        }
-        st.push(Span::new(meta, s_system()));
-        st.push(Span::new("\n", Style::default()));
+        _ => {}
     }
-    handle.print_output(StyledBlock::new(st));
+    let Some(picker) = app.picker.as_mut() else {
+        return;
+    };
+    match key {
+        KeyCode::Up => {
+            if picker.selected > 0 {
+                picker.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if !picker.sessions.is_empty() && picker.selected + 1 < picker.sessions.len() {
+                picker.selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            picker.selected = picker.selected.saturating_sub(PICKER_WINDOW);
+        }
+        KeyCode::PageDown => {
+            if !picker.sessions.is_empty() {
+                picker.selected =
+                    (picker.selected + PICKER_WINDOW).min(picker.sessions.len() - 1);
+            }
+        }
+        KeyCode::Home => picker.selected = 0,
+        KeyCode::End => picker.selected = picker.sessions.len().saturating_sub(1),
+        _ => return,
+    }
+    render_session_picker(app, handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +287,7 @@ fn render_session_list(app: &AppState, handle: &TermHandle) {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Change model   (/model <name>)"),
     ("/models", "List available models"),
-    ("/sessions", "List sessions, newest first   (/sessions [search])"),
-    ("/resume", "Resume a session   (/resume <id|index>)"),
+    ("/sessions", "List & resume sessions, newest first   (/sessions [search])"),
     ("/new", "Create a new session   (/new [id])"),
     ("/compact", "Compact session history"),
     ("/interrupt", "Interrupt the agent"),
@@ -302,6 +462,11 @@ struct Streaming {
     /// user sees the model's reasoning trace live instead of nothing.
     thinking_block_id: Option<cli::BlockId>,
     thinking_buf: String,
+    /// True once the current turn's thinking has been closed (by
+    /// ThinkingComplete, TextComplete or Done). Duplicate or late
+    /// ThinkingComplete events are then ignored, and a fresh ThinkingDelta
+    /// re-opens it for the next turn.
+    thinking_done: bool,
 }
 
 impl Streaming {
@@ -311,6 +476,9 @@ impl Streaming {
         self.finalized = false;
         self.thinking_block_id = None;
         self.thinking_buf.clear();
+        // After a turn ends, a stray ThinkingComplete is late — ignore it
+        // until the next ThinkingDelta re-opens reasoning.
+        self.thinking_done = true;
     }
 }
 
@@ -336,7 +504,18 @@ fn tool_call_line(name: &str, input: &serde_json::Value) -> String {
         }
     }
     let json = serde_json::to_string(input).unwrap_or_default();
-    if json == "{}" || json == "null" {
+    // A payload that is empty, null, or only empty/whitespace strings carries
+    // nothing worth showing — just the tool name.
+    let trivial = json == "{}"
+        || json == "null"
+        || input
+            .as_object()
+            .map(|o| {
+                o.values()
+                    .all(|v| v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+            })
+            .unwrap_or(false);
+    if trivial {
         format!("tool call {name}")
     } else {
         format!("tool call {name}: {}", cli::truncate_to_width(&json, 120))
@@ -347,19 +526,30 @@ fn tool_call_line(name: &str, input: &serde_json::Value) -> String {
 // Handle a daemon event → update terminal output
 // ---------------------------------------------------------------------------
 
+/// Refresh the persistent cache-bar status line after any change.
+fn refresh_cache_status(handle: &TermHandle, app: &AppState) {
+    let (w, _) = handle.size();
+    handle.set_status_line(app.cache.to_status_block(w.max(40)));
+}
+
 fn handle_daemon_event(
     handle: &TermHandle,
     app: &mut AppState,
     streaming: &mut Streaming,
     event: ServerEvent,
 ) {
-    // Helper to refresh the cache status line after any change.
-    let refresh_cache_status = |handle: &TermHandle, app: &AppState| {
-        let (w, _) = handle.size();
-        handle.set_status_line(app.cache.to_status_block(w.max(40)));
-    };
     match event {
-        ServerEvent::Chunk { chunk, .. } => match chunk {
+        ServerEvent::Chunk {
+            session_id, chunk, ..
+        } => {
+            // Only render chunks belonging to the session we're currently
+            // showing. After /new or /resume the transcript belongs to a
+            // different session, and stale chunks from the previous one must
+            // not bleed into it.
+            if session_id != app.session_id {
+                return;
+            }
+            match chunk {
             OutputChunk::TextDelta(s) => {
                 if s.is_empty() {
                     return;
@@ -387,13 +577,35 @@ fn handle_daemon_event(
                 }
             }
             OutputChunk::TextComplete(s) => {
+                // TextComplete closes the turn even when no Done follows:
+                // finalize any still-open reasoning block so it can't leak
+                // into the next turn's thinking.
+                if let Some(tid) = streaming.thinking_block_id.take() {
+                    let tbuf = std::mem::take(&mut streaming.thinking_buf);
+                    if !tbuf.is_empty() {
+                        let tblock = StyledBlock::new(StyledText::from(Span::new(
+                            format!("… {tbuf}"),
+                            s_thinking(),
+                        )));
+                        handle.set_block(tid, tblock);
+                        handle.redraw();
+                    }
+                }
+                streaming.thinking_done = true;
                 // Only act if there is an active streaming block to finalize.
                 // Standalone TextComplete without prior TextDelta is silently
                 // ignored — the block must first be created via TextDelta.
                 if let Some(id) = streaming.block_id.take() {
-                    streaming.buf.clear();
+                    // An empty completion must not wipe the streamed text:
+                    // keep whatever deltas already accumulated.
+                    let text = if s.trim().is_empty() {
+                        std::mem::take(&mut streaming.buf)
+                    } else {
+                        streaming.buf.clear();
+                        s
+                    };
                     // Render the complete text as markdown.
-                    let block = render_md_block(handle, &s);
+                    let block = render_md_block(handle, &text);
                     handle.set_block(id, block);
                     handle.redraw();
                     streaming.finalized = true;
@@ -403,6 +615,9 @@ fn handle_daemon_event(
                 if s.is_empty() {
                     return;
                 }
+                // A fresh reasoning stream starts (or restarts after a turn
+                // boundary) — late-completion suppression no longer applies.
+                streaming.thinking_done = false;
                 // Accumulate reasoning into ONE block so the trace is readable
                 // instead of one noisy block per delta.
                 streaming.thinking_buf.push_str(&s);
@@ -418,6 +633,11 @@ fn handle_daemon_event(
                 }
             }
             OutputChunk::ThinkingComplete(s) => {
+                // A second ThinkingComplete for the same turn, or one that
+                // arrives after the turn already ended, is a no-op.
+                if streaming.thinking_done {
+                    return;
+                }
                 // Prefer the authoritative final text when provided.
                 if !s.is_empty() {
                     streaming.thinking_buf = s;
@@ -442,6 +662,7 @@ fn handle_daemon_event(
                 } else {
                     streaming.thinking_buf.clear();
                 }
+                streaming.thinking_done = true;
             }
             OutputChunk::ToolStart { name, input, .. } => {
                 handle.print_output(StyledBlock::new(StyledText::from(Span::new(
@@ -485,7 +706,7 @@ fn handle_daemon_event(
                             let full_path = cwd.join(&out_name);
                             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                                 format!("  ✓ Transferred to: {}", full_path.display()),
-                                s_highlight(),
+                                s_tool_ok(),
                             ))));
                         }
                         Err(e) => {
@@ -496,21 +717,26 @@ fn handle_daemon_event(
                         }
                     }
                 } else if result.is_error {
+                    let text = if result.text.trim().is_empty() {
+                        "failed".to_string()
+                    } else {
+                        result.text.clone()
+                    };
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        format!("  ✗ {}", result.text),
+                        format!("  ✗ {text}"),
                         s_error(),
                     ))));
                 } else if !result.text.is_empty() {
                     let preview = cli::truncate_to_width(&result.text, 80);
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                         format!("  ✓ {preview}"),
-                        s_tool(),
+                        s_tool_ok(),
                     ))));
                 } else {
                     // Tool succeeded with empty output — still acknowledge it.
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                         "  ✓ done",
-                        s_tool(),
+                        s_tool_ok(),
                     ))));
                 }
             }
@@ -571,13 +797,16 @@ fn handle_daemon_event(
                 );
                 refresh_cache_status(handle, app);
             }
-            OutputChunk::AskUserQuestion { .. } => {}
             OutputChunk::Unknown => {}
+            }
         },
         ServerEvent::Created {
             session_id,
             session_name,
         } => {
+            if session_id != app.session_id {
+                return;
+            }
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("Session ready: {session_name} ({session_id})"),
                 s_system(),
@@ -585,13 +814,21 @@ fn handle_daemon_event(
             refresh_cache_status(handle, app);
         }
         ServerEvent::SessionList { sessions } => {
-            app.last_sessions = sessions;
-            render_session_list(app, handle);
+            // Only `/sessions` requests the list, and it always opens the
+            // picker — so there is nothing to render without one.
+            if let Some(picker) = app.picker.as_mut() {
+                picker.sessions = sessions;
+                picker.loaded = true;
+                render_session_picker(app, handle);
+            }
         }
         ServerEvent::SessionResumed {
             session_id,
             session_name,
         } => {
+            if session_id != app.session_id {
+                return;
+            }
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("Resumed: {session_name} ({session_id})"),
                 s_system(),
@@ -599,8 +836,15 @@ fn handle_daemon_event(
             refresh_cache_status(handle, app);
         }
         ServerEvent::HistoryMessage {
-            role, content, ..
+            session_id,
+            role,
+            content,
+            ..
         } => {
+            // Only replay history for the session we're currently showing.
+            if session_id != app.session_id {
+                return;
+            }
             // Replayed history is rendered exactly like a live conversation
             // (same styles as a new chat), never as a "[History]" dump.
             match role.as_str() {
@@ -624,7 +868,10 @@ fn handle_daemon_event(
                 s_system(),
             ))));
         }
-        ServerEvent::SessionCompacted { .. } => {
+        ServerEvent::SessionCompacted { session_id } => {
+            if session_id != app.session_id {
+                return;
+            }
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 "Session compacted.",
                 s_system(),
@@ -715,7 +962,7 @@ impl CacheStats {
     }
 
     /// Render a compact one-line status summary matching pi-agent's format.
-    fn to_status_block(&self, _terminal_width: usize) -> StyledBlock {
+    fn to_status_block(&self, terminal_width: usize) -> StyledBlock {
         if self.request_count == 0 {
             return StyledBlock::new(StyledText::from(Span::new(
                 " cache: \u{2014}",
@@ -725,13 +972,16 @@ impl CacheStats {
         let pct = self.hit_rate_pct();
 
         let text = format!(
-            " cache: ↑{} ↓{} R{} CH{:5.1}%",
+            " cache: \u{2191}{} \u{2193}{} R{} CH{:5.1}%",
             Self::fmt_tokens(self.total_input_tokens),
             Self::fmt_tokens(self.total_output_tokens),
             Self::fmt_tokens(self.total_cache_read_tokens),
             pct,
         );
-        StyledBlock::new(StyledText::from(Span::new(text, s_cache_hit())))
+        // Never let the status line overflow the terminal width — it is a
+        // fixed block and wrapping it corrupts the layout.
+        let fit = cli::truncate_to_width(&text, terminal_width.max(1));
+        StyledBlock::new(StyledText::from(Span::new(fit, s_cache_hit())))
     }
 }
 
@@ -741,9 +991,27 @@ struct AppState {
     /// (via `ModelChanged` on session creation, or from `OPENAI_MODEL` env).
     model: Option<String>,
     cache: CacheStats,
-    /// The most recent session list from the daemon (newest first), used by
-    /// `/resume <index>`.
-    last_sessions: Vec<SessionInfo>,
+    /// Active `/sessions` picker, if the user is currently navigating the
+    /// session list interactively (j/k or arrows, Enter to resume).
+    picker: Option<SessionPicker>,
+}
+
+/// Interactive `/sessions` navigation state.
+///
+/// The list is rendered as a single live block showing only a limited
+/// number of rows (the terminal-height-sized window) at a time; the window
+/// scrolls to keep the highlighted session visible.
+struct SessionPicker {
+    sessions: Vec<SessionInfo>,
+    /// Index of the highlighted session.
+    selected: usize,
+    /// First session visible in the window.
+    first: usize,
+    /// Block id of the live list block (replaced on every move).
+    block_id: Option<BlockId>,
+    /// True once a `SessionList` has arrived — distinguishes "fetching…"
+    /// from a genuinely empty list.
+    loaded: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -790,7 +1058,6 @@ fn process_line(
         "/compact",
         "/model",
         "/new",
-        "/resume",
     ];
     if !known_commands.contains(&cmd) {
         // Unknown slash command — treat as user text, not an error.
@@ -837,10 +1104,9 @@ fn process_line(
         "/sessions" => {
             let query = parts.get(1).copied().map(|q| q.to_string());
             let _ = cmd_tx.send(DaemonCmd::ListSessions(query));
-            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                "Fetching sessions…",
-                s_system(),
-            ))));
+            // Enter the interactive picker: the window shows "Fetching
+            // sessions…" until the daemon's SessionList reply arrives.
+            enter_picker(app, handle);
         }
         "/interrupt" => {
             let _ = cmd_tx.send(DaemonCmd::Interrupt(app.session_id.clone()));
@@ -887,47 +1153,6 @@ fn process_line(
                 format!("New session: {name}"),
                 s_system(),
             ))));
-        }
-        "/resume" => {
-            if let Some(arg) = parts.get(1) {
-                let name = match arg.parse::<usize>() {
-                    // A number is treated as the 1-based index from the last
-                    // `/sessions` listing, so `/sessions foo` → `/resume 2`
-                    // just works.
-                    Ok(idx) if idx >= 1 => match app.last_sessions.get(idx - 1) {
-                        Some(info) => info.session_id.clone(),
-                        None => {
-                            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                                format!("No session #{idx} — run /sessions first"),
-                                s_error(),
-                            ))));
-                            return LineOutcome::Continue;
-                        }
-                    },
-                    // 0 is not a valid index — clearly a typo for 1.
-                    Ok(0) => {
-                        handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                            "Index must be 1-based — run /sessions and pick a number",
-                            s_error(),
-                        ))));
-                        return LineOutcome::Continue;
-                    }
-                    // Anything else is a raw session id.
-                    _ => arg.to_string(),
-                };
-                app.session_id = name.clone();
-                handle.clear_output();
-                let _ = cmd_tx.send(DaemonCmd::Resume(name.clone()));
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    format!("Resuming: {name}"),
-                    s_system(),
-                ))));
-            } else {
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    "Usage: /resume <session-id | index>  (see /sessions)",
-                    s_error(),
-                ))));
-            }
         }
         _ => {
             // Should not reach here due to the known_commands check above,
@@ -1000,10 +1225,14 @@ fn run_loop(
         finalized: false,
         thinking_block_id: None,
         thinking_buf: String::new(),
+        thinking_done: false,
     };
     let mut history: Vec<String> = Vec::new();
     // Set while a `/status` ping is awaiting the daemon's ModelList reply.
     let mut status_pending: Option<std::time::Instant> = None;
+    // Only print the "daemon disconnected" warning once — the daemon task
+    // re-emits Disconnected every ~500ms while the socket is dead.
+    let mut disconnected_notified = false;
 
     while let Ok(event) = app_rx.recv() {
         match event {
@@ -1033,10 +1262,13 @@ fn run_loop(
                         s_error(),
                     ))));
                 }
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    "⚠ Daemon disconnected. /quit to exit.",
-                    s_error(),
-                ))));
+                if !disconnected_notified {
+                    disconnected_notified = true;
+                    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                        "⚠ Daemon disconnected. /quit to exit.",
+                        s_error(),
+                    ))));
+                }
             }
             AppEvent::StatusTimeout => {
                 if let Some(since) = status_pending {
@@ -1081,8 +1313,14 @@ fn run_loop(
                 }
             }
             AppEvent::Term(Event::Escape) => {
-                // Esc = steering interrupt: stop the model / abort the tool
-                // call so the user can immediately type a steering message.
+                // In `/sessions` picker mode, Esc cancels the picker back to
+                // the prompt; otherwise it's a steering interrupt: stop the
+                // model / abort the tool call so the user can immediately
+                // type a steering message.
+                if app.picker.is_some() {
+                    exit_picker(app, handle);
+                    continue;
+                }
                 // Non-empty buffers are preserved — an accidental Esc while
                 // typing shouldn't wipe input.
                 if handle.get_buffer().is_empty() {
@@ -1094,13 +1332,23 @@ fn run_loop(
                     s_system(),
                 ))));
             }
+            AppEvent::Term(Event::Key(key)) => {
+                // Navigation keys only arrive while the `/sessions` picker is
+                // active (the input thread forwards them instead of editing
+                // the prompt). Ignore them otherwise.
+                if app.picker.is_some() {
+                    handle_picker_key(app, handle, cmd_tx, key);
+                }
+            }
             AppEvent::Term(Event::Resize { width, height: _ }) => {
-                // Refresh the status line (e.g. cache bar) at the new width.
-                // Use the resize event's width directly since the Term's internal
-                // SharedState may not have been updated yet (this event arrives
-                // via the app channel, not the raw input channel).
-                let w = width.max(1) as usize;
-                handle.set_status_line(app.cache.to_status_block(w.max(40)));
+                // Refresh an existing status line (e.g. cache bar) at the new
+                // width. Don't conjure a "cache: —" bar out of thin air just
+                // because the terminal was resized — only refresh once cache
+                // telemetry has actually arrived.
+                if app.cache.request_count > 0 {
+                    let w = width.max(1) as usize;
+                    handle.set_status_line(app.cache.to_status_block(w.max(40)));
+                }
             }
         }
     }
@@ -1121,7 +1369,7 @@ fn main() -> Result<()> {
     // ── Create terminal FIRST — no daemon dependency ────────────────────
     // The terminal appears instantly so the user sees something immediately.
     // Daemon connection and model negotiation happen in the background.
-    let prompt = StyledText::from(Span::new("▸ ", Style::default().fg(Color::DarkYellow)));
+    let prompt = default_prompt();
     let (term, handle) = Term::new(prompt)?;
 
     // Show immediate feedback while we connect in the background.
@@ -1179,7 +1427,7 @@ fn main() -> Result<()> {
         session_id,
         model: env_model,
         cache: CacheStats::default(),
-        last_sessions: Vec::new(),
+        picker: None,
     };
 
     // ── Welcome (printed immediately — no daemon round-trip) ───────────
@@ -1256,7 +1504,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
-                last_sessions: Vec::new(),
+                picker: None,
             },
             streaming: Streaming {
                 block_id: None,
@@ -1264,6 +1512,7 @@ mod tests {
                 finalized: false,
                 thinking_block_id: None,
                 thinking_buf: String::new(),
+                thinking_done: false,
             },
         }
     }
@@ -1705,7 +1954,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
-                last_sessions: Vec::new(),
+                picker: None,
             },
             app_tx,
             app_rx,
@@ -2256,18 +2505,21 @@ mod tests {
         );
     }
 
-    /// BUG: `/new` also calls `clear_output` and resets the session id,
-    /// but `streaming.block_id` in the run-loop is untouched — subsequent
-    /// deltas land on a block with no zone.
+    /// BUG: `/new` switches the active session but `handle_daemon_event`
+    /// ignored the chunk's session_id — stale chunks from the old session
+    /// kept rendering into the new session's transcript.
     #[test]
-    fn new_session_during_streaming_orphans_the_block() {
+    fn new_session_ignores_old_session_chunks() {
         let mut fx = fixture();
-        // Streaming is live.
+        // Streaming is live for the current session.
         handle_daemon_event(
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("old-session".into())),
+            ServerEvent::Chunk {
+                session_id: "sess-1".into(),
+                chunk: OutputChunk::TextDelta("old-session".into()),
+            },
         );
         assert!(fx.streaming.block_id.is_some());
 
@@ -2275,25 +2527,79 @@ mod tests {
         process_line("/new fresh", &mut fx.app, &fx.handle, &fx.cmd_tx);
         fx.handle.redraw_sync();
 
-        // More deltas arrive for the same logical block.
+        // The OLD session keeps streaming — its chunks must be ignored.
         handle_daemon_event(
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::TextDelta("new-text".into())),
+            ServerEvent::Chunk {
+                session_id: "sess-1".into(),
+                chunk: OutputChunk::TextDelta("stale".into()),
+            },
         );
         handle_daemon_event(
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::Done),
+            ServerEvent::Chunk {
+                session_id: "sess-1".into(),
+                chunk: OutputChunk::Done,
+            },
         );
         fx.handle.redraw_sync();
-
-        assert!(
-            count_rows_containing(&fx, "new-text") > 0,
-            "BUG: new-session during streaming orphans the block — text is invisible"
+        assert_eq!(
+            count_rows_containing(&fx, "stale"),
+            0,
+            "BUG: stale chunks from the previous session rendered into the new session"
         );
+
+        // The new session's own chunks render normally.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "fresh".into(),
+                chunk: OutputChunk::TextDelta("fresh output".into()),
+            },
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "fresh".into(),
+                chunk: OutputChunk::Done,
+            },
+        );
+        fx.handle.redraw_sync();
+        assert!(
+            transcript_contains(&fx, "fresh output"),
+            "new session's own output must render"
+        );
+    }
+
+    /// A chunk tagged with a session id different from the current one must
+    /// never render (direct guard check).
+    #[test]
+    fn chunk_from_other_session_ignored() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "some-other-session".into(),
+                chunk: OutputChunk::TextDelta("intruder".into()),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "intruder"),
+            0,
+            "BUG: chunk from another session rendered into the current transcript"
+        );
+        assert!(fx.streaming.block_id.is_none());
     }
 
     /// BUG: When only TextComplete arrives (no Done follows), streaming
@@ -5512,22 +5818,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_with_spaces_in_id() {
-        let mut fx = fixture();
-        process_line(
-            "/resume session-id extra",
-            &mut fx.app,
-            &fx.handle,
-            &fx.cmd_tx,
-        );
-        assert_eq!(fx.app.session_id, "session-id");
-        match fx.cmd_rx.try_recv() {
-            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "session-id"),
-            other => panic!("expected Resume, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn interrupt_before_any_streaming_does_not_panic() {
         let mut fx = fixture();
         // /interrupt with no active stream should be safe
@@ -5843,7 +6133,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Session listing — search + recency + resume-by-index
+    // Session listing — search + resume via the /sessions picker
     // =========================================================================
 
     /// /sessions forwards the search query to the daemon.
@@ -5870,46 +6160,254 @@ mod tests {
         }
     }
 
-    fn sample_session(id: &str, conv: Option<&str>, last: Option<&str>) -> SessionInfo {
+    fn sample_session(
+        id: &str,
+        conv: Option<&str>,
+        first: Option<&str>,
+        last: Option<&str>,
+    ) -> SessionInfo {
         SessionInfo {
             session_id: id.to_string(),
-            name: "Picrust Agent".to_string(),
+            name: "omega-tui".to_string(),
             conversation_name: conv.map(|s| s.to_string()),
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             message_count: 3,
             last_message: last.map(|s| s.to_string()),
+            first_user_message: first.map(|s| s.to_string()),
         }
     }
 
-    /// The SessionList event stores the list (for /resume <index>) and renders
-    /// it as a numbered, newest-first picker with metadata.
+    // =========================================================================
+    // /sessions picker — interactive navigation (j/k, arrows, Enter, Esc)
+    // =========================================================================
+
+    /// /sessions enters interactive picker mode: navigation keys are
+    /// forwarded to the app and the window shows a fetching placeholder
+    /// until the daemon replies.
     #[test]
-    fn session_list_renders_numbered_with_metadata() {
+    fn sessions_command_enters_picker() {
         let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert!(fx.app.picker.is_some());
+        assert!(fx.handle.picker_active());
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ListSessions(query)) => assert_eq!(query, None),
+            other => panic!("expected ListSessions, got {other:?}"),
+        }
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Fetching sessions"), 1);
+    }
+
+    /// The picker shows at most PICKER_WINDOW sessions, one line each (the
+    /// first user prompt), and scrolls the window as the selection moves;
+    /// the footer announces hidden rows and the raw session id never shows.
+    #[test]
+    fn picker_window_is_limited_and_scrolls() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        let sessions: Vec<SessionInfo> = (1..=8)
+            .map(|i| {
+                sample_session(
+                    &format!("sess-{i}"),
+                    Some(&format!("Session {i}")),
+                    Some(&format!("First prompt {i}")),
+                    None,
+                )
+            })
+            .collect();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList { sessions },
+        );
+        fx.handle.redraw_sync();
+
+        // PICKER_WINDOW = 5 sessions per page; ids are abstracted away.
+        assert_eq!(count_rows_containing(&fx, "Sessions (8, newest first)"), 1);
+        assert_eq!(count_rows_containing(&fx, "1. First prompt 1"), 1);
+        assert_eq!(count_rows_containing(&fx, "5. First prompt 5"), 1);
+        assert_eq!(count_rows_containing(&fx, "6. First prompt 6"), 0, "window is limited");
+        assert_eq!(count_rows_containing(&fx, "↓ 3 more"), 1);
+        assert_eq!(count_rows_containing(&fx, "sess-1"), 0, "session ids never shown");
+
+        // Moving within the window doesn't scroll it.
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Down);
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "▸ 2. First prompt 2"), 1);
+        assert_eq!(count_rows_containing(&fx, "6. First prompt 6"), 0);
+
+        // Moving past the window edge scrolls it to keep the selection
+        // visible, and both scroll indicators appear.
+        for _ in 0..4 {
+            handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Down);
+        }
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.picker.as_ref().unwrap().selected, 5);
+        assert_eq!(count_rows_containing(&fx, "▸ 6. First prompt 6"), 1);
+        assert_eq!(count_rows_containing(&fx, "↑ 1 more"), 1);
+        assert_eq!(count_rows_containing(&fx, "↓ 2 more"), 1);
+
+        // Arrow keys and the g/G top/bottom jumps move the selection too
+        // (the cli layer maps j/k → arrows; see cli term tests).
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Up);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Home);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Down);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::End);
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.picker.as_ref().unwrap().selected, 7);
+        assert_eq!(count_rows_containing(&fx, "▸ 8. First prompt 8"), 1);
+    }
+
+    /// PgUp/PgDn page the selection by a full window and clamp at the ends.
+    #[test]
+    fn picker_page_up_down_moves_by_window() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        let sessions: Vec<SessionInfo> = (1..=12)
+            .map(|i| {
+                sample_session(
+                    &format!("sess-{i}"),
+                    Some(&format!("Session {i}")),
+                    Some(&format!("First prompt {i}")),
+                    None,
+                )
+            })
+            .collect();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList { sessions },
+        );
+        fx.handle.redraw_sync();
+
+        // PageDown moves by PICKER_WINDOW (5).
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::PageDown);
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.picker.as_ref().unwrap().selected, 5);
+        assert_eq!(count_rows_containing(&fx, "▸ 6. First prompt 6"), 1);
+        assert_eq!(count_rows_containing(&fx, "↑ 1 more"), 1);
+
+        // Second page clamps at the last session (index 11).
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::PageDown);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::PageDown);
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.picker.as_ref().unwrap().selected, 11);
+        assert_eq!(count_rows_containing(&fx, "▸12. First prompt 12"), 1);
+
+        // PageUp goes back a window; from the top it saturates at 0.
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::PageUp);
+        assert_eq!(fx.app.picker.as_ref().unwrap().selected, 6);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Home);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::PageUp);
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.picker.as_ref().unwrap().selected, 0);
+        assert_eq!(count_rows_containing(&fx, "▸ 1. First prompt 1"), 1);
+    }
+
+    /// Long first user prompts are truncated to a single line.
+    #[test]
+    fn picker_truncates_long_prompts() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        let long = "please fix the build pipeline and run the full test suite";
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![sample_session("sess-1", None, Some(long), None)],
+            },
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let lines = em.screen_lines();
+        let row = lines
+            .iter()
+            .find(|l| l.contains("1. "))
+            .expect("picker row");
+        assert!(
+            row.ends_with('…'),
+            "line should be truncated to one row, got: {row}"
+        );
+        assert_eq!(count_rows_containing(&fx, long), 0, "full text must not appear");
+    }
+
+    /// Enter in picker mode resumes the highlighted session — the
+    /// interactive list is the frontend replacement for /resume — and
+    /// leaves picker mode.
+    #[test]
+    fn picker_enter_resumes_selected() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
         handle_daemon_event(
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
             ServerEvent::SessionList {
                 sessions: vec![
-                    sample_session("sess-b", Some("Fix the build"), Some("cargo test")),
-                    sample_session("sess-a", None, None),
+                    sample_session("sess-b", Some("Fix the build"), Some("fix the build"), None),
+                    sample_session("sess-a", None, Some("second convo"), None),
                 ],
             },
         );
-        fx.handle.redraw_sync();
-        assert_eq!(fx.app.last_sessions.len(), 2);
-        assert_eq!(count_rows_containing(&fx, "Saved sessions (2, newest first)"), 1);
-        assert_eq!(count_rows_containing(&fx, "1. Fix the build"), 1);
-        assert_eq!(count_rows_containing(&fx, "2. sess-a"), 1);
-        assert_eq!(count_rows_containing(&fx, "sess-b · 3 message(s)"), 1);
+        // Move down to the second session, then select it with Enter.
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Down);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Enter);
+        assert_eq!(fx.app.session_id, "sess-a");
+        assert!(fx.app.picker.is_none(), "picker closes after selecting");
+        assert!(!fx.handle.picker_active());
+        // First command is the ListSessions from /sessions; second is Resume.
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ListSessions(_)) => {}
+            other => panic!("expected ListSessions, got {other:?}"),
+        }
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "sess-a"),
+            other => panic!("expected Resume, got {other:?}"),
+        }
     }
 
-    /// Empty session list renders a friendly placeholder and clears the stored list.
+    /// Esc in picker mode cancels the picker and restores the editable
+    /// prompt without resuming anything.
     #[test]
-    fn session_list_empty_renders_placeholder() {
+    fn picker_escape_exits_without_resuming() {
         let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![sample_session(
+                    "sess-b",
+                    Some("Fix the build"),
+                    Some("fix the build"),
+                    None,
+                )],
+            },
+        );
+        assert!(fx.handle.picker_active());
+        // Simulate the run_loop's Escape arm while the picker is active.
+        exit_picker(&mut fx.app, &fx.handle);
+        assert!(fx.app.picker.is_none());
+        assert!(!fx.handle.picker_active());
+        assert_eq!(fx.app.session_id, "sess-1", "no session resumed");
+        assert!(!matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::Resume(_))));
+        // The picker hint is gone and the editable prompt is restored.
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "PgUp/PgDn"), 0);
+        assert_eq!(count_rows_containing(&fx, "▸"), 1);
+    }
+
+    /// An empty session list keeps the picker open with a placeholder;
+    /// Esc still exits.
+    #[test]
+    fn picker_empty_list_shows_placeholder() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
         handle_daemon_event(
             &fx.handle,
             &mut fx.app,
@@ -5918,62 +6416,9 @@ mod tests {
         );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "(no saved sessions)"), 1);
-        assert!(fx.app.last_sessions.is_empty());
-    }
-
-    /// /resume with a numeric argument resolves to the session at that index
-    /// in the most recent listing (1-based).
-    #[test]
-    fn resume_by_index_resolves_from_list() {
-        let mut fx = fixture();
-        fx.app.last_sessions = vec![
-            sample_session("sess-recent", Some("Recent"), None),
-            sample_session("sess-old", Some("Old"), None),
-        ];
-        process_line("/resume 2", &mut fx.app, &fx.handle, &fx.cmd_tx);
-        assert_eq!(fx.app.session_id, "sess-old");
-        match fx.cmd_rx.try_recv() {
-            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "sess-old"),
-            other => panic!("expected Resume, got {other:?}"),
-        }
-    }
-
-    /// /resume with an out-of-range index shows a helpful error instead of resuming.
-    #[test]
-    fn resume_by_index_out_of_range_shows_error() {
-        let mut fx = fixture();
-        fx.app.last_sessions = vec![sample_session("sess-1", None, None)];
-        process_line("/resume 5", &mut fx.app, &fx.handle, &fx.cmd_tx);
-        fx.handle.redraw_sync();
-        assert_eq!(count_rows_containing(&fx, "No session #5"), 1);
-        // Must NOT send a Resume command.
-        assert!(!matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::Resume(_))));
-    }
-
-    /// /resume with a non-numeric argument is still treated as a raw session id.
-    #[test]
-    fn resume_by_id_still_works() {
-        let mut fx = fixture();
-        process_line("/resume tui-abc123", &mut fx.app, &fx.handle, &fx.cmd_tx);
-        assert_eq!(fx.app.session_id, "tui-abc123");
-        match fx.cmd_rx.try_recv() {
-            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "tui-abc123"),
-            other => panic!("expected Resume, got {other:?}"),
-        }
-    }
-
-    /// /resume 0 is invalid (indices are 1-based) and must show an error
-    /// instead of treating "0" as a raw session id.
-    #[test]
-    fn resume_index_zero_shows_error() {
-        let mut fx = fixture();
-        fx.app.last_sessions = vec![sample_session("sess-1", None, None)];
-        process_line("/resume 0", &mut fx.app, &fx.handle, &fx.cmd_tx);
-        fx.handle.redraw_sync();
-        assert_eq!(count_rows_containing(&fx, "Index must be 1-based"), 1);
-        // Must NOT send a Resume command.
-        assert!(!matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::Resume(_))));
-        assert_eq!(fx.app.session_id, "sess-1", "session must not change");
+        assert!(fx.app.picker.is_some());
+        exit_picker(&mut fx.app, &fx.handle);
+        assert!(fx.app.picker.is_none());
     }
 
     // =========================================================================
@@ -6070,30 +6515,2573 @@ mod tests {
     }
 
     // =========================================================================
-    // relative_time formatting
+    // Session list — invalid data must not crash the picker
+    // =========================================================================
+    // =========================================================================
+    // Multiline (wrapped) prompt rendering
     // =========================================================================
 
+    /// A wrapped prompt must survive daemon output arriving mid-typing: the
+    /// agent output renders above the wrapped prompt and the cursor stays on
+    /// the prompt's second row.
     #[test]
-    fn relative_time_parses_rfc3339() {
-        // Timestamps in the past produce human-readable ages.
-        let now = chrono::Utc::now();
-        let five_min = (now - chrono::Duration::minutes(5)).to_rfc3339();
-        assert_eq!(relative_time(&five_min), "5m ago");
-        let three_h = (now - chrono::Duration::hours(3)).to_rfc3339();
-        assert_eq!(relative_time(&three_h), "3h ago");
-        let two_d = (now - chrono::Duration::days(2)).to_rfc3339();
-        assert_eq!(relative_time(&two_d), "2d ago");
+    fn output_during_wrapped_prompt_keeps_prompt_pinned() {
+        let mut fx = fixture();
+        // Wrapped prompt: 50 chars on a 40-col screen = 2 visual rows.
+        fx.handle.set_buffer("w".repeat(COLS + 10), COLS + 10);
+        // Agent output arrives while the user is mid-typing.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("agent output".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let out_row = screen.iter().position(|l| l.contains("agent output")).unwrap();
+        let prompt_start = screen.iter().position(|l| l.contains("www")).unwrap();
+        assert!(out_row < prompt_start, "agent output must be above the prompt");
+        // The wrapped prompt occupies the last two rows.
+        assert_eq!(
+            screen.iter().filter(|l| l.contains("www")).count(),
+            2,
+            "prompt should wrap to exactly 2 rows: {screen:?}"
+        );
+        let (cr, _) = em.cursor();
+        assert!(cr >= prompt_start, "cursor must be on the wrapped prompt rows");
+    }
+
+    /// A wrapped prompt must stay pinned at the bottom of the terminal once
+    /// output overflows, with the cursor on its second (wrapped) row.
+    #[test]
+    fn wrapped_prompt_pinned_after_overflow() {
+        let fx = fixture();
+        fx.handle.set_buffer("p".repeat(COLS + 10), COLS + 10);
+        for i in 0..30 {
+            fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                format!("LINE{i}"),
+                s_assistant(),
+            ))));
+        }
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let prompt_row = screen.iter().position(|l| l.contains("ppp")).unwrap();
+        assert_eq!(
+            prompt_row,
+            ROWS - 2,
+            "wrapped prompt must be pinned to the bottom two rows: {screen:?}"
+        );
+        let (cr, _) = em.cursor();
+        assert_eq!(cr, ROWS - 1, "cursor must be on the second wrapped prompt row");
+    }
+
+    /// Submitting a long (wrapped) prompt echoes it fully wrapped, then places
+    /// a fresh prompt directly below the echo — no interleaving with the prompt.
+    #[test]
+    fn long_prompt_echo_wraps_and_prompt_follows() {
+        let mut fx = fixture();
+        let long = "x".repeat(COLS + 20); // 60 chars → 2 echo rows
+        process_line(&long, &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let joined: String = screen.iter().cloned().collect();
+        assert!(
+            joined.contains(&long),
+            "echo must contain the full wrapped line: {screen:?}"
+        );
+        let echo_first = screen.iter().position(|l| l.contains("▸")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.trim_end() == "P>").unwrap();
+        assert_eq!(
+            prompt_row,
+            echo_first + 2,
+            "fresh prompt must sit below the 2-row echo: {screen:?}"
+        );
+        assert_eq!(em.cursor(), (prompt_row, 3));
+    }
+
+    /// An echo that exactly fills the terminal width must not create a phantom
+    /// blank row between the echo and the prompt.
+    #[test]
+    fn echo_exact_width_wrap_no_phantom_row() {
+        let mut fx = fixture();
+        // "▸ " (2 cols incl. glyph) + 38 chars = exactly 40 cols.
+        let line = "x".repeat(COLS - 2);
+        process_line(&line, &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let echo_row = screen.iter().position(|l| l.contains("▸")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.trim_end() == "P>").unwrap();
+        assert_eq!(
+            prompt_row,
+            echo_row + 1,
+            "no phantom blank row between echo and prompt: {screen:?}"
+        );
+    }
+
+    /// Escape while a wrapped prompt is typed must keep the drawing consistent:
+    /// the interrupt message appears above the wrapped prompt, the buffer is
+    /// preserved, and the cursor stays on the prompt's second row.
+    #[test]
+    fn wrapped_prompt_escape_keeps_drawing_consistent() {
+        let mut fx = loop_fixture();
+        fx.handle.set_buffer("a".repeat(COLS + 10), COLS + 10);
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        // Buffer preserved.
+        assert_eq!(fx.handle.get_buffer(), "a".repeat(COLS + 10));
+        assert_eq!(fx.count("Interrupted"), 1);
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        let screen = em.screen_lines();
+        let msg_row = screen.iter().position(|l| l.contains("Interrupted")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.contains("aaa")).unwrap();
+        assert!(msg_row < prompt_row, "message must be above the prompt");
+        // Prompt wraps to 2 rows: msg, P> aaa…, aaa…
+        assert_eq!(screen.iter().filter(|l| l.contains("aaa")).count(), 2);
+        // Cursor on the second wrapped row: msg(0) + prompt row0(1) → row 2.
+        assert_eq!(em.cursor(), (2, 13));
+        fx.shutdown();
+    }
+
+    /// A wrapped prompt + persistent status line: cursor must sit below the
+    /// status line, and the wrapped prompt must not overlap it.
+    #[test]
+    fn wrapped_prompt_with_status_line_cursor_below_status() {
+        let fx = fixture();
+        fx.handle.set_status_line(StyledBlock::new(StyledText::from(Span::new(
+            "status bar",
+            Style::default(),
+        ))));
+        fx.handle.set_buffer("z".repeat(COLS + 5), COLS + 5);
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let status_row = screen.iter().position(|l| l.contains("status bar")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.contains("zzz")).unwrap();
+        assert!(
+            status_row < prompt_row,
+            "status line must be above the prompt: {screen:?}"
+        );
+        let (cr, _) = em.cursor();
+        assert!(cr > status_row, "cursor must be below the status line");
+        assert_eq!(cr, prompt_row + 1, "cursor on the wrapped prompt second row");
+    }
+
+    /// Ctrl-U on a wrapped prompt must collapse it back to a single row and
+    /// clear the stale wrapped row.
+    #[test]
+    fn ctrl_u_on_wrapped_prompt_redraws_single_row() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("u".repeat(COLS + 10), COLS + 10);
+        fx.handle.redraw_sync();
+        assert_eq!(
+            emulator(&fx).screen_lines().iter().filter(|l| l.contains("uuu")).count(),
+            2,
+            "sanity: prompt is wrapped"
+        );
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        let _ = fx.term.next_event();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.handle.get_buffer(), "");
+        let screen = emulator(&fx).screen_lines();
+        let non_empty: Vec<&String> = screen.iter().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "only the single-row prompt should remain after Ctrl-U: {screen:?}"
+        );
+        assert_eq!(non_empty[0].trim_end(), "P>");
+    }
+
+    /// Ctrl-L clears output blocks but must preserve a wrapped input buffer
+    /// and redraw the wrapped prompt cleanly.
+    #[test]
+    fn ctrl_l_preserves_wrapped_buffer() {
+        let fx = fixture();
+        fx.handle.set_buffer("m".repeat(COLS + 10), COLS + 10);
+        fx.handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "garbage",
+                s_assistant(),
+            ))));
+        fx.handle.redraw_sync();
+        assert!(count_rows_containing(&fx, "garbage") > 0);
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        fx.handle.redraw_sync();
+        assert_eq!(fx.handle.get_buffer(), "m".repeat(COLS + 10));
+        assert_eq!(count_rows_containing(&fx, "garbage"), 0);
+        assert!(transcript_contains(&fx, "mmm"), "wrapped prompt must redraw");
+    }
+
+    /// A wrapped prompt with output overflow keeps the prompt pinned and the
+    /// streamed text complete (no lost text during markdown finalize).
+    #[test]
+    fn stream_overflow_with_wrapped_prompt_keeps_prompt() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("b".repeat(COLS + 10), COLS + 10);
+        for i in 0..40 {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(format!("row {i}\n\n"))),
+            );
+        }
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let prompt_row = screen.iter().position(|l| l.contains("bbb")).unwrap();
+        assert_eq!(
+            prompt_row,
+            ROWS - 2,
+            "wrapped prompt must be pinned after overflow: {screen:?}"
+        );
+        let (cr, _) = em.cursor();
+        assert_eq!(cr, ROWS - 1);
+        assert!(
+            transcript_contains(&fx, "row 39"),
+            "last streamed row must still be visible"
+        );
+    }
+
+    // =========================================================================
+    // Interrupt / cancel behaviours and rendering
+    // =========================================================================
+
+    /// /interrupt mid-stream must not disturb the active streaming block:
+    /// subsequent deltas keep accumulating into the same block.
+    #[test]
+    fn interrupt_mid_stream_then_deltas_keep_single_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("part one ".into())),
+        );
+        process_line("/interrupt", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("part two".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "part one part two"), 1);
+        assert_eq!(count_rows_containing(&fx, "Interrupted"), 1);
+    }
+
+    /// Escape during active streaming followed by a steering message: the whole
+    /// transcript (old response, interrupt notice, steering echo, new response)
+    /// must render in order without corruption.
+    #[test]
+    fn interrupt_then_steer_message_full_loop() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("first response".into()),
+                ))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Line("steer".to_string())));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("second response".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.count("first response"), 1);
+        assert_eq!(fx.count("▸ steer"), 1);
+        assert_eq!(fx.count("second response"), 1);
+        assert!(fx.transcript_contains("Interrupted"));
+        // Order: first response → interrupt → steer echo → second response.
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+        assert!(pos("first response") < pos("Interrupted"), "{all:?}");
+        assert!(pos("Interrupted") < pos("▸ steer"), "{all:?}");
+        assert!(pos("▸ steer") < pos("second response"), "{all:?}");
+        fx.shutdown();
+    }
+
+    /// A wrapped prompt submitted through the real run_loop must echo fully and
+    /// stream a reply below it.
+    #[test]
+    fn wrapped_prompt_submit_then_stream_full_loop() {
+        let mut fx = loop_fixture();
+        let long = "n".repeat(COLS + 15);
+        let long_for_driver = long.clone();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Term(Event::Line(long_for_driver)));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("reply".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert!(fx.transcript_contains(&long), "echo must contain the full line");
+        assert_eq!(fx.count("reply"), 1);
+        fx.shutdown();
+    }
+
+    /// CancelPrompt (Ctrl-C on an empty buffer) while the daemon is streaming
+    /// must exit the loop cleanly without panicking.
+    #[test]
+    fn cancel_prompt_during_streaming_no_crash() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("mid".into()),
+                ))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::CancelPrompt));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.shutdown();
+    }
+
+    // =========================================================================
+    // Streaming state machine edge cases
+    // =========================================================================
+
+    /// An empty TextComplete after streamed deltas must NOT wipe the streamed
+    /// text — the block content should be preserved.
+    #[test]
+    fn empty_textcomplete_wipes_streamed_text() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("visible streaming text".into())),
+        );
+        fx.handle.redraw_sync();
+        assert!(count_rows_containing(&fx, "visible streaming text") > 0);
+        // Provider finalizes with an EMPTY TextComplete.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete(String::new())),
+        );
+        fx.handle.redraw_sync();
+        assert!(
+            count_rows_containing(&fx, "visible streaming text") > 0,
+            "BUG: empty TextComplete wiped the streamed text"
+        );
+    }
+
+    /// Thinking deltas that are never completed (no ThinkingComplete, no Done)
+    /// must not merge with the next turn's thinking.
+    #[test]
+    fn thinking_merges_across_turns_without_done() {
+        let mut fx = fixture();
+        // Turn 1: thinking + text, finalized via TextComplete (no Done).
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("first thought ".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("answer one".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("answer one".into())),
+        );
+        // Turn 2 thinking arrives without Done or ThinkingComplete.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("second thought".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "… first thought second thought"),
+            0,
+            "BUG: turn-2 thinking merged into turn-1 thinking block"
+        );
+        assert_eq!(count_rows_containing(&fx, "… first thought"), 1);
+        assert_eq!(count_rows_containing(&fx, "… second thought"), 1);
+    }
+
+    /// A second ThinkingComplete for the same turn must not create a duplicate
+    /// thinking block.
+    #[test]
+    fn double_thinkingcomplete_creates_duplicate() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("reasoning".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("reasoning".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("reasoning".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "… reasoning"),
+            1,
+            "BUG: duplicate ThinkingComplete created a second thinking block"
+        );
+    }
+
+    /// A ThinkingComplete arriving after Done must be ignored, not rendered as
+    /// a phantom thinking block.
+    #[test]
+    fn late_thinkingcomplete_after_done_creates_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("thought".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        // Late ThinkingComplete after the turn already ended.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("thought".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "… thought"),
+            1,
+            "BUG: late ThinkingComplete after Done created a phantom thinking block"
+        );
+    }
+
+    /// Streaming text containing newlines must render as multiple rows and
+    /// finalize via markdown without losing rows.
+    #[test]
+    fn streaming_text_with_newlines_renders_multiline() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("alpha\nbeta\ngamma".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "alpha"), 1);
+        assert_eq!(count_rows_containing(&fx, "beta"), 1);
+        assert_eq!(count_rows_containing(&fx, "gamma"), 1);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("alpha\nbeta\ngamma".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "alpha"), 1);
+        assert_eq!(count_rows_containing(&fx, "gamma"), 1);
+    }
+
+    /// A streaming block that shrinks on finalize must clear its old rows — no
+    /// stale text left on screen.
+    #[test]
+    fn shrink_streaming_block_clears_stale_rows() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta(
+                "line one\nline two\nline three\nline four".into(),
+            )),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "line four"), 1);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("short".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "short"), 1);
+        assert_eq!(
+            count_rows_containing(&fx, "line three"),
+            0,
+            "BUG: stale rows left after the block shrank"
+        );
+        assert_eq!(count_rows_containing(&fx, "line four"), 0);
+    }
+
+    /// ThinkingComplete without any prior ThinkingDelta renders the supplied
+    /// text as-is.
+    #[test]
+    fn thinking_complete_without_prior_delta_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("final reasoning".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "… final reasoning"), 1);
+    }
+
+    /// Multi-line tool progress output renders one indented line per line.
+    #[test]
+    fn tool_progress_multiline_renders_each_line() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolProgress {
+                id: "t1".into(),
+                output: "line1\nline2\nline3".into(),
+            }),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "  line1"), 1);
+        assert_eq!(count_rows_containing(&fx, "  line2"), 1);
+        assert_eq!(count_rows_containing(&fx, "  line3"), 1);
+    }
+
+    /// Two complete turns with separate thinking traces must never merge their
+    /// thinking blocks.
+    #[test]
+    fn multiple_turns_thinking_blocks_separate() {
+        let mut fx = fixture();
+        for (t, a) in [("t1", "a1"), ("t2", "a2")] {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::ThinkingDelta(format!("{t} "))),
+            );
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::ThinkingComplete(t.into())),
+            );
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(a.into())),
+            );
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::Done),
+            );
+        }
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "… t1"), 1);
+        assert_eq!(count_rows_containing(&fx, "… t2"), 1);
+        assert_eq!(count_rows_containing(&fx, "… t1 t2"), 0);
+        assert_eq!(count_rows_containing(&fx, "… t1 … t2"), 0);
+    }
+
+    /// A growing streaming block that overflows the viewport must scroll rows
+    /// into scrollback exactly once each (no duplication).
+    #[test]
+    fn growing_streaming_block_scrolls_without_duplication() {
+        let mut fx = fixture();
+        for i in 0..40 {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(format!("row {i}\n"))),
+            );
+        }
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        assert_eq!(
+            all.iter().filter(|l| l.contains("row 0")).count(),
+            1,
+            "row 0 must appear exactly once (in scrollback)"
+        );
+        assert_eq!(
+            all.iter().filter(|l| l.contains("row 39")).count(),
+            1,
+            "row 39 must appear exactly once (on screen)"
+        );
+        let screen = em.screen_lines();
+        assert!(screen.iter().any(|l| l.contains("row 39")), "last row visible");
+        assert_eq!(screen.last().map(|l| l.trim_end()), Some("P>"));
+    }
+
+    // =========================================================================
+    // Connection / status rendering
+    // =========================================================================
+
+    /// Repeated Disconnected events (the daemon task re-emits them every 500ms)
+    /// must not spam the transcript with repeated warnings.
+    #[test]
+    fn disconnected_spams_warning() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(
+            fx.count("Daemon disconnected"),
+            1,
+            "BUG: repeated Disconnected events spam the warning line"
+        );
+        fx.shutdown();
+    }
+
+    /// Resizing the terminal before any cache telemetry arrived must not conjure
+    /// a "cache: —" status bar that the user never saw.
+    #[test]
+    fn resize_shows_cache_bar_without_telemetry() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Resize {
+                    width: 60,
+                    height: 15,
+                }));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(
+            fx.count("cache:"),
+            0,
+            "BUG: resize shows a 'cache:' status bar even though no telemetry arrived"
+        );
+        fx.shutdown();
+    }
+
+    // =========================================================================
+    // History / resume rendering
+    // =========================================================================
+
+    /// Multi-line user history messages get the "▸ " prefix on the first line
+    /// only, and all lines render.
+    #[test]
+    fn history_multiline_user_message_prefix_only_first_line() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "sess-1".into(),
+                role: "user".into(),
+                content: "line one\nline two".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "▸ line one"), 1);
+        assert_eq!(count_rows_containing(&fx, "line two"), 1);
+    }
+
+    /// Resuming via the picker during streaming: the clear_output that
+    /// picker_select performs must not orphan the streaming tracker.
+    #[test]
+    fn picker_resume_during_streaming_does_not_orphan() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("pre-resume".into())),
+        );
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![sample_session(
+                    "other-session",
+                    None,
+                    Some("other prompt"),
+                    None,
+                )],
+            },
+        );
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Enter);
+        // New session's chunks arrive (they carry the resumed session id).
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "other-session".into(),
+                chunk: OutputChunk::TextDelta(" post".into()),
+            },
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "other-session".into(),
+                chunk: OutputChunk::Done,
+            },
+        );
+        fx.handle.redraw_sync();
+        assert!(
+            transcript_contains(&fx, "post"),
+            "BUG: picker resume during streaming orphaned the streaming block"
+        );
+        // Chunks still tagged with the previous session id must be ignored.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("intruder".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "intruder"), 0);
+    }
+
+    /// Prompt follows the transcript (not pinned) before the viewport overflows.
+    #[test]
+    fn prompt_follows_transcript_before_overflow() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("hello".into())),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let hello_row = screen.iter().position(|l| l.contains("hello")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.trim_end() == "P>").unwrap();
+        assert_eq!(
+            prompt_row,
+            hello_row + 1,
+            "prompt must follow the transcript before overflow: {screen:?}"
+        );
+        assert_eq!(em.cursor(), (prompt_row, 3));
+    }
+
+    /// Clear during a wrapped prompt, then stream: output must render and the
+    /// wrapped input buffer must survive the clear.
+    #[test]
+    fn clear_during_wrapped_prompt_then_stream_renders() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("q".repeat(COLS + 5), COLS + 5);
+        fx.handle.clear_output();
+        fx.handle.redraw_sync();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("after clear".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "after clear"));
+        assert_eq!(fx.handle.get_buffer(), "q".repeat(COLS + 5));
+    }
+
+    // =========================================================================
+    // Second batch: deeper rendering / streaming probes
+    // =========================================================================
+
+    /// The cursor must land exactly on the wrapped prompt's second row after
+    /// streaming output arrives (not on the output or the first prompt row).
+    #[test]
+    fn cursor_stays_on_wrapped_prompt_after_streaming() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("c".repeat(COLS + 10), COLS + 10); // 2-row prompt
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("reply".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        // reply(0), prompt row0(1), prompt row1(2) → cursor (2, 13).
+        assert_eq!(
+            em.cursor(),
+            (2, 13),
+            "cursor must sit on the wrapped prompt's second row"
+        );
+    }
+
+    /// Streaming deltas must never disturb a wrapped prompt's drawing or
+    /// cursor position.
+    #[test]
+    fn streaming_deltas_do_not_disturb_wrapped_prompt_cursor() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("d".repeat(COLS + 10), COLS + 10);
+        for part in ["one ", "two ", "three"] {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(part.into())),
+            );
+        }
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        assert!(screen[0].contains("one two three"));
+        assert_eq!(
+            screen.iter().filter(|l| l.contains("ddd")).count(),
+            2,
+            "wrapped prompt must remain 2 rows: {screen:?}"
+        );
+        assert_eq!(em.cursor(), (2, 13));
+    }
+
+    /// Markdown finalization that collapses a tall streamed block down to a
+    /// few rows must keep the final text visible on screen (full-render path).
+    #[test]
+    fn markdown_finalize_after_overflow_keeps_text_visible() {
+        let mut fx = fixture();
+        for i in 0..60 {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(format!("token {i}\n"))),
+            );
+        }
+        fx.handle.redraw_sync();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let visible_text = screen.iter().filter(|l| l.contains("token")).count();
+        assert!(
+            visible_text > 0,
+            "BUG: markdown finalize hid all streamed text behind rubber: {screen:?}"
+        );
+        assert!(transcript_contains(&fx, "token 59"));
+    }
+
+    /// Thinking, tool calls and text interleaved in one turn must render in
+    /// the order they arrived.
+    #[test]
+    fn thinking_text_tool_interleaved_blocks_in_order() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("think".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolStart {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("answer".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+                result: ToolResultWire {
+                    text: "done".into(),
+                    is_error: false,
+                    content: None,
+                },
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("think".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+        assert!(pos("… think") < pos("tool call Bash"), "{all:?}");
+        assert!(pos("tool call Bash") < pos("answer"), "{all:?}");
+        assert!(pos("answer") < pos("done"), "{all:?}");
+    }
+
+    /// /compact during streaming must not orphan the streaming block.
+    #[test]
+    fn compact_during_streaming_does_not_orphan() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("pre-compact".into())),
+        );
+        process_line("/compact", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta(" post".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert!(
+            transcript_contains(&fx, "pre-compact post"),
+            "BUG: /compact during streaming orphaned the streaming block"
+        );
+    }
+
+    /// A model change event mid-stream must not disturb the streaming block.
+    #[test]
+    fn model_change_during_streaming_keeps_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("before ".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ModelChanged {
+                model: "gpt-b".into(),
+            },
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("after".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "before after"), 1);
+        assert_eq!(count_rows_containing(&fx, "Model changed: gpt-b"), 1);
+    }
+
+    /// Error output mid-stream must keep the streaming block intact.
+    #[test]
+    fn error_during_streaming_keeps_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("before ".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Error("oops".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("after".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "before after"), 1);
+        assert_eq!(count_rows_containing(&fx, "oops"), 1);
+    }
+
+    /// Esc must not move the cursor or alter a wrapped buffer (Term-level).
+    #[test]
+    fn escape_keeps_cursor_position_on_wrapped_buffer() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("e".repeat(COLS + 10), 20); // cursor mid-buffer
+        let before = fx.handle.get_cursor();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(fx.term.next_event(), Some(Event::Escape));
+        assert_eq!(fx.handle.get_buffer(), "e".repeat(COLS + 10));
+        assert_eq!(fx.handle.get_cursor(), before);
+    }
+
+    /// Two wrapped prompts submitted back-to-back with replies must stay in
+    /// order: echo1, reply1, echo2, reply2.
+    #[test]
+    fn two_wrapped_turns_in_order() {
+        let mut fx = fixture();
+        for (prompt, reply) in [("x".repeat(COLS + 5), "reply one"), ("y".repeat(COLS + 5), "reply two")] {
+            process_line(&prompt, &mut fx.app, &fx.handle, &fx.cmd_tx);
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(reply.into())),
+            );
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextComplete(reply.into())),
+            );
+            fx.streaming.reset();
+        }
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+        assert!(pos("reply one") < pos("reply two"), "{all:?}");
+        assert!(pos("▸ yyy") > pos("reply one"), "{all:?}");
+        assert!(all.iter().filter(|l| l.contains("▸")).count() >= 2);
+    }
+
+    /// Up arrow recalls a wrapped (long) submitted line in full.
+    #[test]
+    fn wrapped_history_recall_via_up_arrow() {
+        let mut fx = fixture();
+        let long = "h".repeat(COLS + 20);
+        type_str(&mut fx, &long);
+        let line = submit(&mut fx);
+        assert_eq!(line, long);
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_buffer(), long);
+        assert_eq!(fx.handle.get_cursor(), long.len());
+    }
+
+    /// Pasting a long wrapped text keeps the full buffer and puts the cursor
+    /// at the end.
+    #[test]
+    fn paste_long_wrapped_text_keeps_cursor_at_end() {
+        let fx = fixture();
+        let long = "p".repeat(COLS + 25);
+        fx.input.send(RawEvent::Paste(long.clone())).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fx.handle.get_buffer(), long);
+        assert_eq!(fx.handle.get_cursor(), long.len());
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        assert!(
+            em.screen_lines().iter().filter(|l| l.contains("ppp")).count() >= 2,
+            "pasted text must wrap across rows"
+        );
+    }
+
+    /// Unicode wide-char streamed text must render and survive finalize.
+    #[test]
+    fn streaming_unicode_wide_chars_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("漢字テスト".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("漢字テスト".into())),
+        );
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "漢字テスト"));
+    }
+
+    /// ServerEvent::SystemMsg renders as a system-style line.
+    #[test]
+    fn system_msg_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SystemMsg("daemon says hi".into()),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "daemon says hi"), 1);
+    }
+
+    /// PermissionRequest renders a prompt line.
+    #[test]
+    fn permission_request_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::PermissionRequest {
+                tool_name: "Bash".into(),
+                action: "run".into(),
+                input: "ls".into(),
+                details: None,
+            }),
+        );
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "Bash wants to run"));
+    }
+
+    // --- unit-level edge cases -------------------------------------------
+
+    #[test]
+    fn tool_call_line_null_input() {
+        assert_eq!(
+            tool_call_line("read_file", &serde_json::Value::Null),
+            "tool call read_file"
+        );
     }
 
     #[test]
-    fn relative_time_recent_is_just_now() {
-        let now = chrono::Utc::now().to_rfc3339();
-        assert_eq!(relative_time(&now), "just now");
+    fn tool_call_line_empty_primary_value_falls_back() {
+        // A primary key that is present but empty must not produce a trailing
+        // colon line — fall back to the tool name.
+        let line = tool_call_line("Bash", &serde_json::json!({"command": "  "}));
+        assert_eq!(line, "tool call Bash");
+        let line = tool_call_line("Bash", &serde_json::json!({"command": ""}));
+        assert_eq!(line, "tool call Bash");
     }
 
     #[test]
-    fn relative_time_invalid_returns_empty() {
-        assert_eq!(relative_time("not-a-timestamp"), "");
-        assert_eq!(relative_time(""), "");
+    fn complete_slash_expands_first_command() {
+        assert_eq!(complete("/").unwrap(), "/model ");
+        assert_eq!(complete("/mo").unwrap(), "/model ");
+        assert_eq!(complete("hello"), None);
+        assert_eq!(complete(""), None);
+        assert_eq!(complete("/nonexistent"), None);
     }
+
+    #[test]
+    fn session_list_invalid_timestamp_no_crash() {
+        // SessionList only renders inside the picker; garbage metadata must
+        // not crash it, and a session with no prompt/name gets a generic
+        // label instead of the raw id.
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![SessionInfo {
+                    session_id: "sess-bad".into(),
+                    name: "Agent".into(),
+                    conversation_name: None,
+                    created_at: "garbage".into(),
+                    updated_at: "garbage".into(),
+                    message_count: 1,
+                    last_message: None,
+                    first_user_message: None,
+                }],
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "(no messages)"), 1);
+        assert_eq!(count_rows_containing(&fx, "sess-bad"), 0, "session ids never shown");
+    }
+
+    #[test]
+    fn cache_fmt_tokens_units() {
+        assert_eq!(CacheStats::fmt_tokens(0), "0");
+        assert_eq!(CacheStats::fmt_tokens(999), "999");
+        assert_eq!(CacheStats::fmt_tokens(1000), "1.0k");
+        assert_eq!(CacheStats::fmt_tokens(1_000_000), "1.0m");
+    }
+
+    // =========================================================================
+    // Third batch: small terminals, session guards, narrow layouts
+    // =========================================================================
+
+    /// On a small terminal, a status line + wrapped prompt + overflowing log
+    /// must keep the prompt pinned with the cursor on its last row.
+    #[test]
+    fn small_terminal_status_wrapped_prompt_overflow_layout() {
+        let mut fx = fixture();
+        fx.input.send(RawEvent::Resize(30, 6)).unwrap();
+        let _ = fx.term.next_event(); // drain Resize
+        fx.handle.set_status_line(StyledBlock::new(StyledText::from(Span::new(
+            "status",
+            Style::default(),
+        ))));
+        fx.handle.set_buffer("s".repeat(40), 40); // wraps at 30 cols → 2 rows
+        for i in 0..10 {
+            fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                format!("LINE{i}"),
+                s_assistant(),
+            ))));
+        }
+        fx.handle.redraw_sync();
+        let em = Emulator::from_capture(6, 30, &fx.buf);
+        let screen = em.screen_lines();
+        let prompt_row = screen.iter().position(|l| l.contains("sss")).unwrap();
+        assert_eq!(
+            prompt_row,
+            4,
+            "wrapped prompt must be pinned above the status line: {screen:?}"
+        );
+        assert!(screen.iter().any(|l| l.contains("status")));
+        assert_eq!(em.cursor(), (5, 13));
+    }
+
+    /// A chunk arriving for the current session id (the common case) must of
+    /// course still render — the guard must not be over-eager.
+    #[test]
+    fn chunk_for_current_session_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("mine".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "mine"), 1);
+    }
+
+    /// History replays tagged with a different session id must be ignored.
+    #[test]
+    fn history_message_from_other_session_ignored() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "other".into(),
+                role: "user".into(),
+                content: "intruder message".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "intruder message"),
+            0,
+            "BUG: history replay from another session rendered"
+        );
+    }
+
+    /// A streaming block that keeps growing while the user has a wrapped
+    /// prompt typed must keep the prompt pinned and the cursor on it.
+    #[test]
+    fn growing_stream_with_wrapped_prompt_keeps_cursor_on_prompt() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("g".repeat(COLS + 10), COLS + 10);
+        for i in 0..60 {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(format!("row {i}\n"))),
+            );
+            // Force intermediate frames so the scrolling path is exercised.
+            if i % 10 == 9 {
+                fx.handle.redraw_sync();
+            }
+        }
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let prompt_row = screen.iter().position(|l| l.contains("ggg")).unwrap();
+        assert_eq!(
+            prompt_row,
+            ROWS - 2,
+            "wrapped prompt must stay pinned during growth: {screen:?}"
+        );
+        let (cr, _) = em.cursor();
+        assert_eq!(
+            cr, ROWS - 1,
+            "cursor must remain on the wrapped prompt's second row during growth"
+        );
+        // No duplicated rows in scrollback.
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        assert_eq!(all.iter().filter(|l| l.contains("row 0")).count(), 1);
+    }
+
+    /// TextComplete whose markdown renders taller than the streamed draft
+    /// must grow the block in place (no duplicates, full text visible).
+    #[test]
+    fn textcomplete_with_markdown_list_grows_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("streamed draft".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("- one\n- two\n- three".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "one"), 1);
+        assert_eq!(count_rows_containing(&fx, "two"), 1);
+        assert_eq!(count_rows_containing(&fx, "three"), 1);
+        // The draft text was replaced, not duplicated.
+        assert_eq!(count_rows_containing(&fx, "streamed draft"), 0);
+    }
+
+    /// The status line must stay pinned with the prompt once the log overflows.
+    #[test]
+    fn status_line_pinned_during_overflow() {
+        let fx = fixture();
+        fx.handle.set_status_line(StyledBlock::new(StyledText::from(Span::new(
+            "cache: xxx",
+            Style::default(),
+        ))));
+        for i in 0..30 {
+            fx.handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                format!("LINE{i}"),
+                s_assistant(),
+            ))));
+        }
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let status_row = screen.iter().position(|l| l.contains("cache:")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.trim_end() == "P>").unwrap();
+        assert_eq!(status_row, ROWS - 2, "status pinned: {screen:?}");
+        assert_eq!(prompt_row, ROWS - 1, "prompt pinned: {screen:?}");
+        assert_eq!(em.cursor(), (ROWS - 1, 3));
+    }
+
+    /// clear_output must leave the status line and a wrapped input buffer
+    /// intact.
+    #[test]
+    fn clear_keeps_status_and_wrapped_prompt() {
+        let fx = fixture();
+        fx.handle.set_status_line(StyledBlock::new(StyledText::from(Span::new(
+            "cache: bar",
+            Style::default(),
+        ))));
+        fx.handle.set_buffer("c".repeat(COLS + 10), COLS + 10);
+        fx.handle
+            .print_output(StyledBlock::new(StyledText::from(Span::new(
+                "garbage",
+                s_assistant(),
+            ))));
+        fx.handle.redraw_sync();
+        fx.handle.clear_output();
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "garbage"), 0);
+        assert!(transcript_contains(&fx, "cache: bar"), "status must survive clear");
+        assert!(transcript_contains(&fx, "ccc"), "wrapped prompt must survive clear");
+        assert_eq!(fx.handle.get_buffer(), "c".repeat(COLS + 10));
+    }
+
+    /// TextComplete after a /clear (orphaned block) must still render the
+    /// final markdown.
+    #[test]
+    fn textcomplete_after_clear_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("in flight".into())),
+        );
+        fx.handle.clear_output();
+        fx.handle.redraw_sync();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("finalized after clear".into())),
+        );
+        fx.handle.redraw_sync();
+        assert!(
+            transcript_contains(&fx, "finalized after clear"),
+            "BUG: TextComplete after clear dropped the final text"
+        );
+    }
+
+    // =========================================================================
+    // Fourth batch: session-scoped event guards + more layout probes
+    // =========================================================================
+
+    /// Created events for a session we're no longer showing must be ignored.
+    #[test]
+    fn created_for_other_session_ignored() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Created {
+                session_id: "other".into(),
+                session_name: "other".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "Session ready"),
+            0,
+            "BUG: Created event for another session rendered"
+        );
+    }
+
+    /// SessionResumed events for a session we're no longer showing must be
+    /// ignored.
+    #[test]
+    fn session_resumed_for_other_session_ignored() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionResumed {
+                session_id: "other".into(),
+                session_name: "other".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "Resumed:"),
+            0,
+            "BUG: SessionResumed for another session rendered"
+        );
+    }
+
+    /// SessionCompacted for another session must not reset our cache bar.
+    #[test]
+    fn compacted_for_other_session_ignored() {
+        let mut fx = fixture();
+        fx.app.cache.update(100, 50, 50, 10);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionCompacted {
+                session_id: "other".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "Session compacted"),
+            0,
+            "BUG: SessionCompacted for another session rendered"
+        );
+        assert_eq!(
+            fx.app.cache.request_count,
+            1,
+            "BUG: foreign compaction reset our cache stats"
+        );
+    }
+
+    /// A huge streamed block that markdown-collapses while a status line and a
+    /// wrapped prompt are present must keep the final text visible.
+    #[test]
+    fn shrink_after_overflow_with_status_and_wrapped_prompt() {
+        let mut fx = fixture();
+        fx.handle.set_status_line(StyledBlock::new(StyledText::from(Span::new(
+            "status",
+            Style::default(),
+        ))));
+        fx.handle.set_buffer("z".repeat(COLS + 10), COLS + 10);
+        for i in 0..60 {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(format!("token {i}\n"))),
+            );
+        }
+        fx.handle.redraw_sync();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        assert!(
+            screen.iter().any(|l| l.contains("token")),
+            "BUG: collapsed final text not visible: {screen:?}"
+        );
+        assert!(transcript_contains(&fx, "token 59"));
+        // Status + wrapped prompt must still be visible.
+        assert!(screen.iter().any(|l| l.contains("status")));
+        assert!(screen.iter().any(|l| l.contains("zzz")));
+    }
+
+    /// Double Esc must keep the drawing consistent: two messages, intact
+    /// wrapped prompt, cursor on the prompt's wrapped row.
+    #[test]
+    fn double_escape_drawing_consistent() {
+        let mut fx = loop_fixture();
+        fx.handle.set_buffer("a".repeat(COLS + 10), COLS + 10);
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.count("Interrupted"), 2, "two Esc presses → two notices");
+        assert_eq!(fx.handle.get_buffer(), "a".repeat(COLS + 10));
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        let screen = em.screen_lines();
+        assert_eq!(screen.iter().filter(|l| l.contains("aaa")).count(), 2);
+        // Layout: msg1, msg2, prompt row0, prompt row1 → cursor on row 3.
+        assert_eq!(em.cursor(), (3, 13));
+        fx.shutdown();
+    }
+
+    /// /status while the agent is streaming: the status resolution must not
+    /// disturb the in-flight block.
+    #[test]
+    fn status_during_streaming_keeps_block() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Term(Event::Line("/status".to_string())));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("streamed ".into()),
+                ))));
+                // The ModelList reply resolves the /status ping.
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(
+                    ServerEvent::ModelList {
+                        models: vec!["gpt-a".into()],
+                    },
+                )));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("content".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.count("streamed content"), 1);
+        assert_eq!(fx.count("omega-loop connection OK"), 1);
+        fx.shutdown();
+    }
+
+    /// /help while a wrapped prompt is typed: the help block renders above the
+    /// wrapped prompt and the cursor stays put.
+    #[test]
+    fn help_output_with_wrapped_prompt_layout() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("k".repeat(COLS + 10), COLS + 10);
+        process_line("/help", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        // The tall help block is present in the transcript (part may have
+        // scrolled into scrollback).
+        assert_eq!(count_rows_containing(&fx, "Available commands"), 1);
+        assert_eq!(count_rows_containing(&fx, "/quit"), 1);
+        // The wrapped prompt stays pinned at the bottom.
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let prompt_row = screen.iter().position(|l| l.contains("kkk")).unwrap();
+        assert_eq!(screen.iter().filter(|l| l.contains("kkk")).count(), 2);
+        let (cr, _) = em.cursor();
+        assert_eq!(cr, prompt_row + 1);
+    }
+
+    // =========================================================================
+    // Fifth batch: cache bar width, steering flows, combined layouts
+    // =========================================================================
+
+    /// The cache status bar must never overflow the terminal width — it is
+    /// rendered as a fixed block and overflowing it corrupts the layout.
+    #[test]
+    fn cache_bar_fits_narrow_width() {
+        let mut cs = CacheStats::default();
+        // Pathological but representable totals (1e12 tokens).
+        cs.total_input_tokens = 1_000_000_000_000;
+        cs.total_output_tokens = 1_000_000_000_000;
+        cs.total_cache_read_tokens = 1_000_000_000_000;
+        cs.request_count = 1;
+        let block = cs.to_status_block(40);
+        let text: String = block
+            .content
+            .spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            cli::display_width(&text) <= 40,
+            "BUG: cache bar text ({text:?}) overflows a 40-col terminal"
+        );
+    }
+
+    /// After an empty TextComplete, a fresh turn must still stream normally
+    /// (the empty completion must not wedge the text block).
+    #[test]
+    fn new_turn_after_empty_textcomplete_streams() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("first".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete(String::new())),
+        );
+        // Next turn.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("second".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete("second".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "first"), 1);
+        assert_eq!(count_rows_containing(&fx, "second"), 1);
+        // The second turn's completion legitimately re-finalizes.
+        assert!(fx.streaming.finalized);
+    }
+
+    /// A new turn's thinking after an empty TextComplete must open its own
+    /// block (TextComplete closes thinking; the next ThinkingDelta reopens).
+    #[test]
+    fn thinking_after_empty_textcomplete_starts_new_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("thought one".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextComplete(String::new())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("thought two".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("thought two".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "… thought one"), 1);
+        assert_eq!(count_rows_containing(&fx, "… thought two"), 1);
+        assert_eq!(
+            count_rows_containing(&fx, "… thought one thought two"),
+            0,
+            "BUG: turn-2 thinking merged into turn-1 block after empty TextComplete"
+        );
+    }
+
+    /// Tool output while a wrapped prompt is typed: tool blocks render above
+    /// the wrapped prompt without disturbing it.
+    #[test]
+    fn tool_output_with_wrapped_prompt_layout() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("t".repeat(COLS + 10), COLS + 10);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolStart {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolProgress {
+                id: "t1".into(),
+                output: "file.txt\nother.txt".into(),
+            }),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+                result: ToolResultWire {
+                    text: "done".into(),
+                    is_error: false,
+                    content: None,
+                },
+            }),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let tool_row = screen.iter().position(|l| l.contains("tool call Bash")).unwrap();
+        let prompt_row = screen.iter().position(|l| l.contains("ttt")).unwrap();
+        assert!(tool_row < prompt_row, "tool output must be above the prompt");
+        assert_eq!(screen.iter().filter(|l| l.contains("ttt")).count(), 2);
+        assert!(transcript_contains(&fx, "file.txt"));
+        assert!(transcript_contains(&fx, "other.txt"));
+    }
+
+    /// Escape + cache telemetry + streaming together: all must render without
+    /// corrupting the wrapped prompt.
+    #[test]
+    fn escape_cache_stream_wrapped_prompt_layout() {
+        let mut fx = loop_fixture();
+        fx.handle.set_buffer("q".repeat(COLS + 10), COLS + 10);
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("streamed ".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::CacheTelemetry {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        cache_read_tokens: 50,
+                        cache_creation_tokens: 10,
+                    },
+                ))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("content".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.count("streamed content"), 1);
+        assert_eq!(fx.count("Interrupted"), 1);
+        assert!(fx.transcript_contains("cache:"));
+        assert_eq!(fx.handle.get_buffer(), "q".repeat(COLS + 10));
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        let screen = em.screen_lines();
+        assert_eq!(screen.iter().filter(|l| l.contains("qqq")).count(), 2);
+        fx.shutdown();
+    }
+
+    // =========================================================================
+    // Sixth batch: stress, sessions-with-prompt, tool-end warts
+    // =========================================================================
+
+    /// Interleaved deltas/thinking/tools/telemetry/Escape on top of a wrapped
+    /// prompt must never corrupt the drawing: key texts present, prompt intact,
+    /// no panic.
+    #[test]
+    fn stress_interleaved_events_no_corruption() {
+        let mut fx = loop_fixture();
+        fx.handle.set_buffer("r".repeat(COLS + 10), COLS + 10);
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                for i in 0..10 {
+                    let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                        OutputChunk::TextDelta(format!("chunk {i} ")),
+                    ))));
+                    let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                        OutputChunk::CacheTelemetry {
+                            input_tokens: 10 + i,
+                            output_tokens: 5 + i,
+                            cache_read_tokens: 3 + i,
+                            cache_creation_tokens: 1,
+                        },
+                    ))));
+                    if i == 3 {
+                        let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                            OutputChunk::ThinkingDelta("reasoning ".into()),
+                        ))));
+                    }
+                    if i == 5 {
+                        let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::ThinkingComplete("reasoning".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert!(fx.transcript_contains("chunk 0"));
+        assert!(fx.transcript_contains("chunk 9"));
+        assert!(fx.transcript_contains("… reasoning"));
+        assert_eq!(fx.count("Interrupted"), 1);
+        assert_eq!(fx.app.cache.request_count, 10);
+        assert_eq!(fx.handle.get_buffer(), "r".repeat(COLS + 10));
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        assert_eq!(em.screen_lines().iter().filter(|l| l.contains("rrr")).count(), 2);
+        fx.shutdown();
+    }
+
+    /// The /sessions picker list renders above the fixed hint line; the
+    /// transcript behind it stays untouched.
+    #[test]
+    fn sessions_list_with_prompt_layout() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![
+                    sample_session("sess-a", Some("Alpha"), Some("alpha prompt"), None),
+                    sample_session("sess-b", Some("Beta"), Some("beta prompt"), None),
+                ],
+            },
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let list_row = screen
+            .iter()
+            .position(|l| l.contains("Sessions (2"))
+            .unwrap();
+        // The hint prompt line is unique to picker mode (starts with ↑/k).
+        let hint_row = screen.iter().position(|l| l.contains("PgUp/PgDn page")).unwrap();
+        assert!(list_row < hint_row, "session list must be above the hint");
+        assert!(transcript_contains(&fx, "alpha prompt"));
+    }
+
+    /// ToolEnd with an error and empty text must still render a marker, not a
+    /// dangling "✗ " row.
+    #[test]
+    fn toolend_error_empty_text_renders_marker() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "false"}),
+                result: ToolResultWire {
+                    text: String::new(),
+                    is_error: true,
+                    content: None,
+                },
+            }),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        assert!(
+            all.iter().any(|l| l.contains("✗ failed")),
+            "BUG: error ToolEnd with empty text must render '✗ failed', got: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|l| l.trim_end() == "✗" || l.trim() == "✗"),
+            "BUG: dangling bare ✗ marker rendered: {all:?}"
+        );
+    }
+
+    // =========================================================================
+    // Seventh batch: cursor navigation on wrapped prompts, tiny deltas
+    // =========================================================================
+
+    /// Home/End on a wrapped prompt must move the cursor across wrap rows.
+    #[test]
+    fn wrapped_prompt_cursor_navigation() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("n".repeat(COLS + 10), COLS + 10);
+        fx.handle.redraw_sync();
+        // Cursor at end: prompt row 1, col 13.
+        assert_eq!(emulator(&fx).cursor(), (1, 13));
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        let _ = fx.term.next_event();
+        fx.handle.redraw_sync();
+        assert_eq!(emulator(&fx).cursor(), (0, 3));
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)))
+            .unwrap();
+        let _ = fx.term.next_event();
+        fx.handle.redraw_sync();
+        assert_eq!(emulator(&fx).cursor(), (1, 13));
+    }
+
+    /// A long reasoning trace (multiple rows) while a wrapped prompt is typed
+    /// must keep both visible and the cursor on the prompt.
+    #[test]
+    fn long_thinking_trace_wraps_with_prompt() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("z".repeat(COLS + 10), COLS + 10);
+        let long = (0..50).map(|i| format!("thought token {i}")).collect::<Vec<_>>().join(" ");
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta(long.clone())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete(long)),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("answer".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        // The trace's first row may have scrolled into history.
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(screen.iter().cloned())
+            .collect();
+        let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+        let prompt_row = screen.iter().position(|l| l.contains("zzz")).unwrap();
+        assert!(pos("… thought token") < pos("answer"), "{all:?}");
+        assert!(pos("answer") < pos("zzz"), "{all:?}");
+        assert!(transcript_contains(&fx, "thought token 49"));
+        assert_eq!(screen.iter().filter(|l| l.contains("zzz")).count(), 2);
+        assert_eq!(em.cursor(), (prompt_row + 1, 13));
+    }
+
+    /// Many tiny single-char deltas with a wrapped prompt must keep the
+    /// drawing consistent (exercises the differential update path).
+    #[test]
+    fn tiny_deltas_with_wrapped_prompt_consistent() {
+        let mut fx = fixture();
+        fx.handle.set_buffer("m".repeat(COLS + 10), COLS + 10);
+        for ch in "The quick brown fox jumps over the lazy dog".chars() {
+            handle_daemon_event(
+                &fx.handle,
+                &mut fx.app,
+                &mut fx.streaming,
+                chunk(OutputChunk::TextDelta(ch.to_string())),
+            );
+        }
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        assert!(transcript_contains(&fx, "The quick brown fox"));
+        assert_eq!(screen.iter().filter(|l| l.contains("mmm")).count(), 2);
+        let prompt_row = screen.iter().position(|l| l.contains("mmm")).unwrap();
+        assert_eq!(em.cursor(), (prompt_row + 1, 13));
+    }
+
+    /// Escape with an empty buffer while the agent is streaming: the notice
+    /// renders above the streaming block, which keeps accumulating.
+    #[test]
+    fn escape_empty_buffer_while_streaming() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("before esc ".into()),
+                ))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("after esc".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.count("before esc after esc"), 1, "streaming must continue across Esc");
+        assert_eq!(fx.count("Interrupted"), 1);
+        fx.shutdown();
+    }
+
+    /// Resuming via the picker while streaming: the new session's chunks
+    /// render into the (cleared) transcript.
+    #[test]
+    fn picker_resume_during_streaming_renders() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![sample_session(
+                    "sess-target",
+                    Some("Target"),
+                    Some("target prompt"),
+                    None,
+                )],
+            },
+        );
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Enter);
+        assert_eq!(fx.app.session_id, "sess-target");
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "sess-target".into(),
+                chunk: OutputChunk::TextDelta("resumed stream".into()),
+            },
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::Chunk {
+                session_id: "sess-target".into(),
+                chunk: OutputChunk::Done,
+            },
+        );
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "resumed stream"));
+        assert!(transcript_contains(&fx, "Resuming: sess-target"));
+    }
+
+    // =========================================================================
+    // Eighth batch: Term-level editing on wrapped prompts
+    // =========================================================================
+
+    /// Ctrl-K kill + Ctrl-Y yank on a wrapped prompt must preserve the buffer
+    /// and re-lay the wrapped prompt correctly.
+    #[test]
+    fn ctrl_k_yank_on_wrapped_prompt() {
+        let mut fx = fixture();
+        let full = "x".repeat(COLS + 5); // 45 chars → 2 prompt rows
+        fx.handle.set_buffer(full.clone(), full.len());
+        fx.handle.redraw_sync();
+        assert_eq!(emulator(&fx).screen_lines().iter().filter(|l| l.contains("xxx")).count(), 2);
+        // Kill from the middle (position 10) to the end.
+        fx.handle.set_buffer(full.clone(), 10);
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_buffer(), &full[..10]);
+        fx.handle.redraw_sync();
+        assert_eq!(
+            emulator(&fx).screen_lines().iter().filter(|l| l.contains("xxx")).count(),
+            1,
+            "killed buffer must be a single row"
+        );
+        // Yank restores the full wrapped buffer with the cursor at the end.
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        let _ = fx.term.next_event();
+        fx.handle.redraw_sync();
+        assert_eq!(fx.handle.get_buffer(), full);
+        assert_eq!(fx.handle.get_cursor(), full.len());
+        let em = emulator(&fx);
+        let screen = em.screen_lines();
+        let prompt_row = screen.iter().position(|l| l.contains("xxx")).unwrap();
+        // 45 chars: 37 on row 0, 8 on row 1 → cursor (prompt_row + 1, 8).
+        assert_eq!(em.cursor(), (prompt_row + 1, 8));
+    }
+
+    /// Alt-F / Alt-B word navigation across the wrap boundary of a wrapped
+    /// prompt must track the cursor row correctly.
+    #[test]
+    fn word_nav_on_wrapped_prompt() {
+        let mut fx = fixture();
+        let words: Vec<String> = (0..10).map(|i| format!("word{i}")).collect();
+        let buf = words.join(" ");
+        fx.handle.set_buffer(buf.clone(), buf.len());
+        fx.handle.redraw_sync();
+        // Alt-B from the end lands on the start of the last word.
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::ALT,
+            )))
+            .unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), buf.len() - "word9".len());
+        // Alt-F from the start lands on the start of word1.
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        let _ = fx.term.next_event();
+        fx.input
+            .send(RawEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)))
+            .unwrap();
+        let _ = fx.term.next_event();
+        assert_eq!(fx.handle.get_cursor(), "word0 ".len());
+        fx.handle.redraw_sync();
+        // Cursor row/col consistent with the byte position.
+        let (row, col) = emulator(&fx).cursor();
+        assert!(row <= 1, "cursor on a wrapped row, got row {row}");
+        assert!(col < COLS);
+    }
+
+    // =========================================================================
+    // Ninth batch: CRLF tool output, whitespace-only completions
+    // =========================================================================
+
+    /// CRLF tool progress must not leak carriage returns into the rendered
+    /// rows as replacement glyphs.
+    #[test]
+    fn tool_progress_crlf_renders_cleanly() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolProgress {
+                id: "t1".into(),
+                output: "line1\r\nline2\r\n".into(),
+            }),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "  line1"), 1);
+        assert_eq!(count_rows_containing(&fx, "  line2"), 1);
+        assert_eq!(
+            count_rows_containing(&fx, "�"),
+            0,
+            "BUG: CRLF tool progress renders U+FFFD replacement glyphs"
+        );
+    }
+
+    /// ToolEnd error text with CRLF must also render cleanly.
+    #[test]
+    fn toolend_error_crlf_renders_cleanly() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "false"}),
+                result: ToolResultWire {
+                    text: "boom\r\ntrace".into(),
+                    is_error: true,
+                    content: None,
+                },
+            }),
+        );
+        fx.handle.redraw_sync();
+        assert!(transcript_contains(&fx, "boom"));
+        assert!(transcript_contains(&fx, "trace"));
+        assert_eq!(
+            count_rows_containing(&fx, "�"),
+            0,
+            "BUG: CRLF ToolEnd error renders replacement glyphs"
+        );
+    }
+
+    /// A completion that leaves a trailing space must not accumulate on
+    /// repeated Tab presses.
+    #[test]
+    fn repeated_tab_completion_no_space_accumulation() {
+        let mut fx = fixture();
+        type_str(&mut fx, "/mo");
+        // Simulate two Tab presses through the run_loop handler.
+        let mut buf = fx.handle.get_buffer();
+        for _ in 0..2 {
+            let tabbed = format!("{buf}\t");
+            let trimmed = tabbed[..tabbed.len() - 1].to_string();
+            if let Some(completed) = complete(&trimmed) {
+                buf = completed.clone();
+            } else {
+                buf = trimmed;
+            }
+        }
+        assert_eq!(buf, "/model ", "BUG: repeated Tab accumulated spaces");
+    }
+
+    // =========================================================================
+    // Tenth batch: full steering flow with a wrapped prompt
+    // =========================================================================
+
+    /// The exact scenario the user reported: a long wrapped prompt typed while
+    /// the agent streams a long response, then Esc-interrupt, then submit the
+    /// wrapped prompt, then a new response. The whole transcript must render in
+    /// order with the prompt pinned at the bottom.
+    #[test]
+    fn full_steering_flow_with_wrapped_prompt() {
+        let mut fx = loop_fixture();
+        let long = "s".repeat(COLS + 10);
+        let long_for_driver = long.clone();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                // Agent streams a long response while the user types.
+                for i in 0..30 {
+                    let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                        OutputChunk::TextDelta(format!("old chunk {i} ")),
+                    ))));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                // Esc interrupt — the wrapped prompt must survive.
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(20));
+                // Submit the wrapped prompt.
+                let _ = app_tx.send(AppEvent::Term(Event::Line(long_for_driver)));
+                // Daemon finalizes the old turn and starts the new one.
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
+                    OutputChunk::TextDelta("new reply".into()),
+                ))));
+                let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
+                std::thread::sleep(Duration::from_millis(40));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        fx.handle.redraw_sync();
+        // Key texts present.
+        assert_eq!(fx.count("old chunk 0"), 1);
+        assert_eq!(fx.count("old chunk 29"), 1);
+        assert_eq!(fx.count("Interrupted"), 1);
+        assert_eq!(fx.count("new reply"), 1);
+        assert!(fx.transcript_contains(&long), "echo of wrapped prompt must be present");
+        // Order preserved: old response → interrupt → steer echo → new response.
+        let em = Emulator::from_capture(ROWS, COLS, &fx.buf);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+        assert!(pos("old chunk 0") < pos("Interrupted"), "{all:?}");
+        assert!(pos("Interrupted") < pos("▸ sss"), "{all:?}");
+        assert!(pos("▸ sss") < pos("new reply"), "{all:?}");
+        // Fresh prompt at the bottom.
+        let screen = em.screen_lines();
+        assert_eq!(screen.last().map(|l| l.trim_end()), Some("P>"));
+        fx.shutdown();
+    }
+
+
+
+
 }

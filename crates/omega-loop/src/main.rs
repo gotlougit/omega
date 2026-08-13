@@ -10,7 +10,6 @@
 //! **Client → Server**
 //! ```json
 //! {"type":"run","session_id":"...","content":"...","config":{"stream":true,"think":false}}
-//! {"type":"ask_response","session_id":"...","request_id":"...","answers":{"...":"..."}}
 //! ```
 //!
 //! **Server → Client**
@@ -55,8 +54,6 @@ struct ClientRequest {
     session_id: Option<String>,
     content: Option<String>,
     config: Option<SessionConfig>,
-    request_id: Option<String>,
-    answers: Option<HashMap<String, String>>,
     model: Option<String>,
     max_tokens: Option<u32>,
     /// Optional search filter for `list_sessions` (case-insensitive substring).
@@ -171,8 +168,20 @@ fn history_to_replay(messages: &[Message]) -> Vec<HistoryReplay> {
     out
 }
 
-/// Build a `SessionInfo` for a stored session, including a short preview of
-/// its last meaningful message, plus the full replayed text used for search.
+/// Truncate `text` to at most `max` characters, appending an ellipsis when
+/// cut. Used for the preview strings embedded in [`SessionInfo`].
+fn preview(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}…")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Build a `SessionInfo` for a stored session, including short previews of
+/// its first user prompt and last meaningful message, plus the full replayed
+/// text used for search.
 ///
 /// Returns `(info, search_blob)` where `search_blob` is every replayable
 /// message joined together, so a query can match any point in the chat — not
@@ -185,14 +194,11 @@ fn build_session_info(
     let messages = storage.load_messages(session_id).unwrap_or_default();
     let replay = history_to_replay(&messages);
     let message_count = replay.len();
-    let last_message = replay.last().map(|r| {
-        if r.content.chars().count() > 80 {
-            let truncated: String = r.content.chars().take(80).collect();
-            format!("{truncated}…")
-        } else {
-            r.content.clone()
-        }
-    });
+    let last_message = replay.last().map(|r| preview(&r.content, 80));
+    let first_user_message = replay
+        .iter()
+        .find(|r| r.role == "user")
+        .map(|r| preview(&r.content, 80));
     let search_blob = replay
         .iter()
         .map(|r| r.content.as_str())
@@ -208,6 +214,7 @@ fn build_session_info(
             updated_at: metadata.updated_at.to_rfc3339(),
             message_count,
             last_message,
+            first_user_message,
         },
         search_blob,
     )
@@ -234,6 +241,10 @@ fn list_sessions_filtered(
     sessions
         .into_iter()
         .map(|(sid, meta)| build_session_info(storage, &sid, &meta))
+        // Drop empty sessions entirely: only show chats where the user
+        // actually prompted something. This also keeps the search from
+        // matching session ids/names of chats that have no conversation.
+        .filter(|(info, _)| info.first_user_message.is_some())
         .filter(|(info, blob)| match &q {
             Some(q) => blob.to_lowercase().contains(q) || info.matches_query(q),
             None => true,
@@ -414,8 +425,8 @@ async fn handle_connection(
 
                     let agent_session = match AgentSession::new_with_storage(
                         &session_id,
-                        "picrust",
-                        "Picrust Agent",
+                        "omega",
+                        "omega-tui",
                         "A coding agent",
                         &system_prompt,
                         storage,
@@ -487,21 +498,6 @@ async fn handle_connection(
                             if let Err(e) = handle.send_input(content.clone()).await {
                                 tracing::warn!(%session_id, "send input: {e}");
                             }
-                        }
-                    }
-                }
-            }
-
-            "ask_response" => {
-                let sessions_lock = sessions.lock().await;
-                if let Some(handle) = sessions_lock.get(&session_id) {
-                    if let (Some(request_id), Some(answers)) = (&req.request_id, &req.answers) {
-                        let msg = InputMessage::UserQuestionResponse {
-                            request_id: request_id.clone(),
-                            answers: answers.clone(),
-                        };
-                        if let Err(e) = handle.send(msg).await {
-                            tracing::warn!(%session_id, "send ask_response: {e}");
                         }
                     }
                 }
@@ -888,13 +884,50 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = SessionStorage::with_dir(temp.path());
         for (id, conv) in names {
-            let mut meta = crate::session::metadata::SessionMetadata::new(*id, "picrust", "Picrust Agent", "d");
+            let mut meta = crate::session::metadata::SessionMetadata::new(*id, "omega", "omega-tui", "d");
             if !conv.is_empty() {
                 meta.set_conversation_name(*conv);
             }
             storage.save_metadata(&meta).unwrap();
+            // A session only appears in listings once the user has actually
+            // prompted something — give named fixtures a real user message.
+            if !conv.is_empty() {
+                storage.append_message(id, &Message::user(*conv)).unwrap();
+            }
         }
         (storage, temp)
+    }
+
+    /// A session where the user never prompted anything must not appear in
+    /// the listing — even if it has a name or assistant-only messages.
+    #[test]
+    fn list_sessions_excludes_empty_sessions() {
+        let (storage, _t) = storage_with_sessions(&[("real", "Real chat")]);
+        // A session with metadata only (no messages at all).
+        let mut empty_meta = crate::session::metadata::SessionMetadata::new(
+            "empty",
+            "omega",
+            "omega-tui",
+            "d",
+        );
+        empty_meta.set_conversation_name("Empty chat");
+        storage.save_metadata(&empty_meta).unwrap();
+        // A session with only an assistant message (no user prompt).
+        storage
+            .append_message("assistant-only", &Message::assistant("hello there"))
+            .unwrap();
+        let assistant_meta = crate::session::metadata::SessionMetadata::new(
+            "assistant-only",
+            "omega",
+            "omega-tui",
+            "d",
+        );
+        storage.save_metadata(&assistant_meta).unwrap();
+
+        let list = list_sessions_filtered(&storage, None);
+        assert_eq!(list.len(), 1, "only the session with a user prompt shows");
+        assert_eq!(list[0].session_id, "real");
+        assert!(list[0].first_user_message.is_some());
     }
 
     /// Sessions must come back most-recently-updated first so the TUI can
@@ -974,6 +1007,26 @@ mod tests {
         assert!(preview.chars().count() <= 81, "preview must be truncated");
         assert!(preview.ends_with('…'));
         assert!(!blob.is_empty(), "search blob must contain the message");
+    }
+
+    /// build_session_info captures the FIRST user prompt for the picker line
+    /// (and the last message for search), not some later turn.
+    #[test]
+    fn session_info_first_user_message() {
+        let (storage, _t) = storage_with_sessions(&[("sess", "")]);
+        storage
+            .append_message("sess", &Message::user("first prompt"))
+            .unwrap();
+        storage
+            .append_message("sess", &Message::assistant("reply"))
+            .unwrap();
+        storage
+            .append_message("sess", &Message::user("second prompt"))
+            .unwrap();
+        let meta = storage.load_metadata("sess").unwrap();
+        let (info, _) = build_session_info(&storage, "sess", &meta);
+        assert_eq!(info.first_user_message.as_deref(), Some("first prompt"));
+        assert_eq!(info.last_message.as_deref(), Some("second prompt"));
     }
 
     /// A query matching an EARLIER message (not the last one) still finds the

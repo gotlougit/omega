@@ -378,14 +378,6 @@ mod tests {
     impl omega_core::core::ToolRuntime for DummyRuntime {
         fn send_output(&self, _chunk: omega_core::core::OutputChunk) {}
 
-        async fn ask_user_question(
-            &mut self,
-            _request_id: &str,
-            _questions: Vec<omega_core::core::UserQuestion>,
-        ) -> omega_core::core::FrameworkResult<std::collections::HashMap<String, String>> {
-            Ok(std::collections::HashMap::new())
-        }
-
         fn is_interrupted(&self) -> bool {
             false
         }

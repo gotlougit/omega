@@ -2,25 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
 use super::state::AgentState;
-
-/// A single question option
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionOption {
-    pub label: String,
-    pub description: String,
-}
-
-/// A single question in an AskUserQuestion request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserQuestion {
-    pub question: String,
-    pub header: String,
-    pub options: Vec<QuestionOption>,
-    pub multi_select: bool,
-}
 
 /// Messages that can be sent TO an agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,14 +25,6 @@ pub enum InputMessage {
         session_id: String,
         /// Final result/summary from subagent
         result: Option<String>,
-    },
-
-    /// Response to an AskUserQuestion request
-    UserQuestionResponse {
-        /// Unique ID matching the request
-        request_id: String,
-        /// Map of question header to selected answer(s)
-        answers: HashMap<String, String>,
     },
 
     /// Request graceful interrupt
@@ -130,15 +105,6 @@ pub enum OutputChunk {
         session_id: String,
         /// Final result/summary
         result: Option<String>,
-    },
-
-    // --- User Questions ---
-    /// Request user to answer questions
-    AskUserQuestion {
-        /// Unique ID for this request
-        request_id: String,
-        /// The questions to ask
-        questions: Vec<UserQuestion>,
     },
 
     // --- State & Status ---

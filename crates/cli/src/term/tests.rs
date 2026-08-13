@@ -496,3 +496,118 @@ fn eof_when_input_channel_closes() {
         other => panic!("expected Eof, got {other:?}"),
     }
 }
+
+#[test]
+fn picker_mode_forwards_navigation_keys() {
+    let mut tt = test_term();
+    tt.handle.redraw_sync();
+    // Type some text first — it must be left untouched while picker is on.
+    type_str(&mut tt.term, &tt.input, "abc");
+    assert_eq!(tt.handle.get_buffer(), "abc");
+
+    tt.handle.set_picker(true);
+
+    // j / Down → Key(Down)
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::Down) => {}
+        other => panic!("expected Key(Down), got {other:?}"),
+    }
+
+    // k / Up → Key(Up)
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::Up) => {}
+        other => panic!("expected Key(Up), got {other:?}"),
+    }
+
+    // Arrow keys pass through as-is.
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::Down) => {}
+        other => panic!("expected Key(Down), got {other:?}"),
+    }
+
+    // g / G jump to top / bottom.
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::End) => {}
+        other => panic!("expected Key(End), got {other:?}"),
+    }
+
+    // PgUp / PgDn pass through as-is.
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::PageDown) => {}
+        other => panic!("expected Key(PageDown), got {other:?}"),
+    }
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::PageUp) => {}
+        other => panic!("expected Key(PageUp), got {other:?}"),
+    }
+
+    // Enter → Key(Enter), never a submitted Line.
+    tt.input.send(enter()).expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Key(_)), "Key") {
+        Event::Key(KeyCode::Enter) => {}
+        other => panic!("expected Key(Enter), got {other:?}"),
+    }
+
+    // Esc → Escape (app decides to cancel the picker).
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("input open");
+    match wait_for(&mut tt.term, |e| matches!(e, Event::Escape), "Escape") {
+        Event::Escape => {}
+        other => panic!("expected Escape, got {other:?}"),
+    }
+
+    // Plain letters no longer edit the buffer in picker mode.
+    tt.input
+        .send(RawEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .expect("input open");
+    // Give the input thread a moment, then assert the buffer is untouched.
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(tt.handle.get_buffer(), "abc");
+
+    // Leaving picker mode restores normal editing.
+    tt.handle.set_picker(false);
+    type_str(&mut tt.term, &tt.input, "d");
+    assert_eq!(tt.handle.get_buffer(), "abcd");
+
+    tt.handle.request_input_shutdown();
+}

@@ -31,6 +31,11 @@ pub struct SessionInfo {
     /// Short text preview of the last meaningful message (for scanning).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
+
+    /// Short text preview of the first user prompt in the session. This is
+    /// what a resume picker shows on its single-line entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_user_message: Option<String>,
 }
 
 impl SessionInfo {
@@ -61,6 +66,11 @@ impl SessionInfo {
                 .as_deref()
                 .map(|s| s.to_lowercase().contains(&q))
                 .unwrap_or(false)
+            || self
+                .first_user_message
+                .as_deref()
+                .map(|s| s.to_lowercase().contains(&q))
+                .unwrap_or(false)
     }
 }
 
@@ -71,12 +81,13 @@ mod tests {
     fn info(id: &str, conv: Option<&str>, last: Option<&str>) -> SessionInfo {
         SessionInfo {
             session_id: id.to_string(),
-            name: "Picrust Agent".to_string(),
+            name: "omega-tui".to_string(),
             conversation_name: conv.map(|s| s.to_string()),
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
             message_count: 3,
             last_message: last.map(|s| s.to_string()),
+            first_user_message: None,
         }
     }
 

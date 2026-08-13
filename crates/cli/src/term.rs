@@ -72,6 +72,13 @@ struct SharedState {
     // --- kill ring ---
     kill_ring: Vec<String>,
 
+    // --- picker mode ---
+    /// When true, the input thread forwards navigation keys (j/k, arrows,
+    /// Enter, Esc) to the app as [`Event::Key`] / [`Event::Escape`] instead
+    /// of editing the prompt buffer. Used by interactive lists such as the
+    /// `/sessions` picker.
+    picker_active: bool,
+
     // --- terminal ---
     width: usize,
     height: usize,
@@ -106,6 +113,7 @@ impl SharedState {
             input_history: Vec::new(),
             history_index: None,
             kill_ring: Vec::new(),
+            picker_active: false,
             width,
             height,
             shutdown: false,
@@ -174,6 +182,11 @@ pub enum Event {
     BufferChanged,
     /// Escape pressed.
     Escape,
+    /// A navigation/selection key pressed while the terminal is in picker
+    /// mode (see [`TermHandle::set_picker`]). Carries the raw key so the
+    /// app can decide what it means (move up/down, jump to top/bottom,
+    /// select with Enter, …).
+    Key(KeyCode),
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +386,26 @@ impl TermHandle {
     pub fn request_input_shutdown(&self) {
         self.lock().input_shutdown = true;
         let _ = self.input_tx.send(InputMessage::Shutdown);
+    }
+
+    // --- picker mode ---
+
+    /// Enter or leave picker mode.
+    ///
+    /// While active, the input thread forwards navigation keys to the app
+    /// as [`Event::Key`] / [`Event::Escape`] events and never touches the
+    /// prompt buffer — the app is expected to hide the editable prompt
+    /// (e.g. via [`Self::set_left_prompt`]) and render an interactive list.
+    pub fn set_picker(&self, active: bool) {
+        let mut st = self.lock();
+        st.picker_active = active;
+        drop(st);
+        self.redraw.notify();
+    }
+
+    /// Whether picker mode is currently active.
+    pub fn picker_active(&self) -> bool {
+        self.lock().picker_active
     }
 }
 
@@ -690,6 +723,44 @@ fn dispatch_input_event(
 }
 
 fn handle_key_locked(st: &mut SharedState, key: KeyEvent, tx: &mpsc::Sender<InputMessage>) {
+    if st.picker_active {
+        // Picker mode: forward navigation keys to the app instead of
+        // editing the prompt buffer. j/k map to the arrow keys so the app
+        // only ever handles Up/Down/Home/End/Enter; everything else is
+        // ignored (or maps to Escape to cancel the picker).
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::Down)));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::Up)));
+            }
+            KeyCode::Char('g') => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::Home)));
+            }
+            KeyCode::Char('G') => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::End)));
+            }
+            KeyCode::PageUp => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::PageUp)));
+            }
+            KeyCode::PageDown => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::PageDown)));
+            }
+            KeyCode::Enter => {
+                let _ = tx.send(InputMessage::Event(Event::Key(KeyCode::Enter)));
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let _ = tx.send(InputMessage::Event(Event::Escape));
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let _ = tx.send(InputMessage::Event(Event::Escape));
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
             'a' => {

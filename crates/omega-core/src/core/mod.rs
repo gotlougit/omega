@@ -17,8 +17,7 @@ pub mod tool_runtime;
 pub use context::{AgentContext, ResourceMap};
 pub use error::{FrameworkError, FrameworkResult};
 pub use output::{
-    CacheTelemetry, InputMessage, OutputChunk, QuestionOption, ToolInfo, ToolResult,
-    ToolResultData, UserQuestion,
+    CacheTelemetry, InputMessage, OutputChunk, ToolInfo, ToolResult, ToolResultData,
 };
 pub use session::SessionInfo;
 pub use state::AgentState;

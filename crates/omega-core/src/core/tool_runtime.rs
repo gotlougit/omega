@@ -4,12 +4,9 @@
 //! to interact with the agent (send output, ask user questions, check interruption)
 //! without depending on the concrete `AgentInternals` type in `omega-loop`.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 
-use crate::core::error::FrameworkResult;
-use crate::core::output::{OutputChunk, ToolResult, UserQuestion};
+use crate::core::output::{OutputChunk, ToolResult};
 
 /// Runtime context passed to every tool execution.
 ///
@@ -82,24 +79,6 @@ pub trait ToolRuntime: Send + Sync {
     fn send_done(&self) {
         self.send_output(OutputChunk::Done);
     }
-
-    /// Send an AskUserQuestion block
-    fn send_ask_user(&self, request_id: &str, questions: Vec<UserQuestion>) {
-        self.send_output(OutputChunk::AskUserQuestion {
-            request_id: request_id.to_string(),
-            questions,
-        });
-    }
-
-    /// Ask the user a question and wait for their response.
-    ///
-    /// This sends the questions via OutputChunk, then waits for a matching
-    /// UserQuestionResponse on the input channel.
-    async fn ask_user_question(
-        &mut self,
-        request_id: &str,
-        questions: Vec<UserQuestion>,
-    ) -> FrameworkResult<HashMap<String, String>>;
 
     /// Check whether the agent has been interrupted (e.g. by a user interrupt signal)
     fn is_interrupted(&self) -> bool;

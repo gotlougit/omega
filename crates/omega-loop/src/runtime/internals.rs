@@ -5,7 +5,6 @@
 //! - Input/output channels
 //! - Context (current tool, state, resources)
 
-use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -17,8 +16,7 @@ use tokio::sync::RwLock;
 use crate::runtime::channels::{InputReceiver, OutputSender};
 use crate::session::AgentSession;
 use omega_core::core::{
-    output::UserQuestion, AgentContext, AgentState, CacheTelemetry, FrameworkError,
-    FrameworkResult, InputMessage, OutputChunk,
+    AgentContext, AgentState, CacheTelemetry, InputMessage, OutputChunk,
 };
 use omega_core::core::{ToolResult, ToolRuntime};
 
@@ -159,46 +157,6 @@ impl AgentInternals {
     }
 
     // ------------------------------------------------------------------
-    // Ask User (question/response flow)
-    // ------------------------------------------------------------------
-
-    /// Ask the user a question and wait for their response
-    pub async fn ask_user_question(
-        &mut self,
-        request_id: impl Into<String>,
-        questions: Vec<UserQuestion>,
-    ) -> FrameworkResult<HashMap<String, String>> {
-        let request_id = request_id.into();
-
-        self.send(OutputChunk::AskUserQuestion {
-            request_id: request_id.clone(),
-            questions,
-        });
-
-        // Wait for response
-        loop {
-            match self.receive().await {
-                Some(InputMessage::UserQuestionResponse {
-                    request_id: resp_id,
-                    answers,
-                }) if resp_id == request_id => {
-                    return Ok(answers);
-                }
-                Some(InputMessage::Interrupt) => {
-                    return Err(FrameworkError::Interrupted);
-                }
-                Some(InputMessage::Shutdown) => {
-                    return Err(FrameworkError::Shutdown);
-                }
-                Some(_) => continue,
-                None => {
-                    return Err(FrameworkError::ChannelClosed);
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
     // State methods
     // ------------------------------------------------------------------
 
@@ -254,14 +212,6 @@ impl AgentInternals {
 impl ToolRuntime for AgentInternals {
     fn send_output(&self, chunk: OutputChunk) {
         self.send(chunk);
-    }
-
-    async fn ask_user_question(
-        &mut self,
-        request_id: &str,
-        questions: Vec<UserQuestion>,
-    ) -> FrameworkResult<HashMap<String, String>> {
-        self.ask_user_question(request_id, questions).await
     }
 
     fn is_interrupted(&self) -> bool {
