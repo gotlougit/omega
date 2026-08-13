@@ -285,7 +285,11 @@ fn create_llm_provider() -> Arc<dyn LlmProvider> {
             Ok(AuthConfig::with_base_url(api_key, base_url))
         })
         .with_model(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()))
-        .with_max_tokens(16384),
+        .with_max_tokens(
+            env::var("OPENAI_MAX_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+        ),
     )
 }
 
@@ -676,7 +680,7 @@ async fn handle_connection(
 
                     // Apply model from request if provided (on session creation only)
                     if let Some(ref model) = req.model {
-                        let max_tokens = req.max_tokens.unwrap_or(16384);
+                        let max_tokens = req.max_tokens;
                         let prov = current_provider.read().unwrap().clone();
                         let new_provider = prov.create_variant(model, max_tokens);
                         *current_provider.write().unwrap() = new_provider;
@@ -993,7 +997,7 @@ async fn handle_connection(
 
             "set_model" => {
                 if let Some(model) = &req.model {
-                    let max_tokens = req.max_tokens.unwrap_or(16384);
+                    let max_tokens = req.max_tokens;
                     let prov = current_provider.read().unwrap().clone();
                     let new_provider = prov.create_variant(model, max_tokens);
                     *current_provider.write().unwrap() = new_provider;

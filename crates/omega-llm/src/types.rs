@@ -98,8 +98,9 @@ pub struct MessageRequest {
     /// The model to use
     pub model: String,
 
-    /// Maximum tokens to generate
-    pub max_tokens: u32,
+    /// Maximum tokens to generate (None = no limit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 
     /// Input messages
     pub messages: Vec<Message>,

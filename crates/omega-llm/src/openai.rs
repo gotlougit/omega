@@ -262,7 +262,7 @@ pub struct OpenAIProvider {
     client: Client,
     auth: AuthSource,
     model: String,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
 }
 
 impl OpenAIProvider {
@@ -272,7 +272,7 @@ impl OpenAIProvider {
     /// - `OPENAI_API_KEY` (required)
     /// - `OPENAI_MODEL` (optional, defaults to `gpt-4o`)
     /// - `OPENAI_BASE_URL` (optional, defaults to OpenAI API)
-    /// - `OPENAI_MAX_TOKENS` (optional, defaults to 8192)
+    /// - `OPENAI_MAX_TOKENS` (optional, defaults to no limit)
     pub fn from_env() -> Result<Self> {
         tracing::info!("Creating OpenAI provider from environment");
 
@@ -283,11 +283,10 @@ impl OpenAIProvider {
         let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
         let max_tokens = env::var("OPENAI_MAX_TOKENS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8192);
+            .and_then(|s| s.parse().ok());
 
         tracing::info!("Using model: {}", model);
-        tracing::info!("Max tokens: {}", max_tokens);
+        tracing::info!("Max tokens: {:?}", max_tokens);
 
         Ok(Self {
             client: Client::new(),
@@ -303,7 +302,7 @@ impl OpenAIProvider {
             client: Client::new(),
             auth: AuthSource::Static(AuthConfig::new(api_key)),
             model: String::new(),
-            max_tokens: 8192,
+            max_tokens: None,
         }
     }
 
@@ -317,7 +316,7 @@ impl OpenAIProvider {
             client: Client::new(),
             auth: AuthSource::Dynamic(Arc::new(auth_provider(provider))),
             model: String::new(),
-            max_tokens: 8192,
+            max_tokens: None,
         }
     }
 
@@ -327,8 +326,8 @@ impl OpenAIProvider {
         self
     }
 
-    /// Set max tokens
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+    /// Set max tokens (None = no limit)
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
     }
@@ -338,17 +337,21 @@ impl OpenAIProvider {
         &self.model
     }
 
-    /// Create a variant with a different model and max tokens, sharing auth
+    /// Create a variant with a different model, sharing auth.
+    ///
+    /// A `None` max_tokens *inherits* the current provider's value rather
+    /// than clearing it, so a client that doesn't send max_tokens (e.g. the
+    /// TUI) can't silently drop a configured output cap. `Some(n)` overrides.
     pub fn with_model_and_tokens_override(
         &self,
         model: impl Into<String>,
-        max_tokens: u32,
+        max_tokens: Option<u32>,
     ) -> Self {
         Self {
             client: Client::new(),
             auth: self.auth.clone(),
             model: model.into(),
-            max_tokens,
+            max_tokens: max_tokens.or(self.max_tokens),
         }
     }
 
@@ -712,7 +715,7 @@ impl LlmProvider for OpenAIProvider {
             },
             tool_choice: openai_tool_choice,
             temperature: None,
-            max_tokens: Some(self.max_tokens),
+            max_tokens: self.max_tokens,
             stream: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
@@ -777,7 +780,7 @@ impl LlmProvider for OpenAIProvider {
         Ok(model_ids)
     }
 
-    fn create_variant(&self, model: &str, max_tokens: u32) -> Arc<dyn LlmProvider> {
+    fn create_variant(&self, model: &str, max_tokens: Option<u32>) -> Arc<dyn LlmProvider> {
         Arc::new(self.with_model_and_tokens_override(model, max_tokens))
     }
 }
@@ -988,9 +991,21 @@ fn convert_assistant_message(msg: &Message, out: &mut Vec<OpenAIMessage>) {
                 }
             }
 
+            // The wire format requires assistant messages to carry either
+            // content or tool_calls. A turn cut short by the output token
+            // limit (or one that produced only thinking blocks) would
+            // otherwise serialize with neither, and strict gateways reject
+            // that with "content or tool_calls must be set". Fall back to a
+            // present-but-empty content string in that case.
+            let content = if tool_calls.is_empty() {
+                Some(text_content.unwrap_or_default())
+            } else {
+                text_content
+            };
+
             out.push(OpenAIMessage::Assistant {
                 role: "assistant".to_string(),
-                content: text_content,
+                content,
                 reasoning_content: if reasoning_parts.is_empty() {
                     None
                 } else {
@@ -1320,6 +1335,48 @@ mod tests {
         assert!(json.get("reasoning_content").is_none());
     }
 
+    #[test]
+    fn test_assistant_message_with_empty_blocks_has_content_field() {
+        // A turn cut off by the max output token limit can leave an assistant
+        // message with no text blocks (and no tool calls). The serializer must
+        // still emit `content` — gateways reject assistant messages that have
+        // neither content nor tool_calls.
+        let msg = Message::assistant_with_blocks(vec![]);
+        let mut out = Vec::new();
+        convert_assistant_message(&msg, &mut out);
+        assert_eq!(out.len(), 1);
+        let json = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(json.get("content"), Some(&serde_json::json!("")));
+        assert!(json.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_assistant_message_with_only_thinking_has_content_field() {
+        // Reasoning-only turns (model hit the token limit before any text)
+        // must also serialize with a present `content` key, keeping the
+        // reasoning trace in `reasoning_content`.
+        let msg = Message::assistant_with_blocks(vec![ContentBlock::Thinking {
+            thinking: "hmm...".into(),
+            signature: String::new(),
+        }]);
+        let mut out = Vec::new();
+        convert_assistant_message(&msg, &mut out);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OpenAIMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } => {
+                assert_eq!(content.as_deref(), Some(""));
+                assert_eq!(reasoning_content.as_deref(), Some("hmm..."));
+                assert!(tool_calls.is_none());
+            }
+            _ => panic!("Expected Assistant message"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Bug B fix: usage captured from final chunk (not first chunk)
     // -----------------------------------------------------------------------
@@ -1544,6 +1601,51 @@ mod tests {
     // -----------------------------------------------------------------------
     // Unit tests: OpenAIRequest serialization
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_variant_inherits_max_tokens_when_not_overridden() {
+        // The TUI sends model changes without a max_tokens value. A None
+        // must inherit the current provider's cap (e.g. from
+        // OPENAI_MAX_TOKENS) instead of silently dropping it, otherwise a
+        // configured output limit would be lost on every model switch.
+        let base = OpenAIProvider::with_auth_provider(|| async {
+            Ok(AuthConfig::new("test-key"))
+        })
+        .with_model("base-model")
+        .with_max_tokens(Some(65536));
+
+        // Explicit override wins.
+        let explicit = base.with_model_and_tokens_override("new-model", Some(128));
+        let json = serde_json::to_value(OpenAIRequest {
+            model: explicit.model().to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: explicit.max_tokens,
+            stream: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        })
+        .unwrap();
+        assert_eq!(json["max_tokens"], 128);
+
+        // None inherits the base provider's cap.
+        let inherited = base.with_model_and_tokens_override("new-model", None);
+        let json = serde_json::to_value(OpenAIRequest {
+            model: inherited.model().to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            max_tokens: inherited.max_tokens,
+            stream: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        })
+        .unwrap();
+        assert_eq!(json["max_tokens"], 65536);
+    }
 
     #[test]
     fn test_request_serializes_prompt_cache_fields() {

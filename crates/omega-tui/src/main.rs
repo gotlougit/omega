@@ -477,7 +477,7 @@ async fn daemon_loop(
                     }
                 }
                 Ok(DaemonCmd::SetModel { session_id, model }) => {
-                    if let Err(e) = writer.send_set_model(&session_id, &model, 16384).await {
+                    if let Err(e) = writer.send_set_model(&session_id, &model, None).await {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "send_set_model failed");
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                     }

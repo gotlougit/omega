@@ -200,6 +200,11 @@ in
           OPENAI_API_KEY=sk-...
           OPENAI_BASE_URL=https://api.openai.com/v1
           OPENAI_MODEL=gpt-4o
+          # Output token cap sent with every request. Leave unset to let the
+          # upstream apply its own default (often ~8k even for 1M-context
+          # models). Set to the model's real output limit to avoid
+          # finish_reason="length" truncation.
+          OPENAI_MAX_TOKENS=65536
 
         If null, env vars must be provided by other means
         (e.g. sops-nix, agenix, or environment: directives).

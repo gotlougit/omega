@@ -618,12 +618,14 @@ impl DaemonWriter {
         self.write_json(&req).await
     }
 
-    /// Change the model for a session.
+    /// Change the model for a session. A `max_tokens` of `Some(n)` overrides
+    /// the configured output cap; `None` inherits the daemon's current value
+    /// (from `OPENAI_MAX_TOKENS`, if set).
     pub async fn send_set_model(
         &mut self,
         session_id: &str,
         model: &str,
-        max_tokens: u32,
+        max_tokens: Option<u32>,
     ) -> Result<()> {
         let req = serde_json::json!({
             "type": "set_model",

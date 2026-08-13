@@ -298,7 +298,7 @@ impl StandardAgent {
             }
 
             // Call LLM with streaming (always enabled)
-            let (content_blocks, stop_reason) = self
+            let (mut content_blocks, stop_reason) = self
                 .call_llm_streaming_with_cache(
                     internals,
                     messages_with_cache,
@@ -373,6 +373,24 @@ impl StandardAgent {
                         break;
                     }
                 }
+            }
+
+            // A turn cut short by the max output token limit can leave the
+            // assistant message with no text (e.g. a reasoning-only turn that
+            // never reached output). Append a truncation notice so the stored
+            // message still has visible content — some OpenAI-compatible
+            // gateways reject assistant messages with neither content nor
+            // tool_calls — and the user can see the response was cut off.
+            if matches!(stop_reason, Some(StopReason::MaxTokens))
+                && !content_blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. }))
+            {
+                content_blocks.push(ContentBlock::Text {
+                    text: "(response truncated — max output tokens reached)"
+                        .to_string(),
+                    cache_control: None,
+                });
             }
 
             // Add assistant message to history
@@ -1115,7 +1133,7 @@ impl omega_llm::LlmProvider for MockProvider {
     fn create_variant(
         &self,
         _model: &str,
-        _max_tokens: u32,
+        _max_tokens: Option<u32>,
     ) -> std::sync::Arc<dyn omega_llm::LlmProvider> {
         std::sync::Arc::new(MockProvider)
     }

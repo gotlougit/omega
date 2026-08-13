@@ -52,5 +52,6 @@ pub trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
 
     /// Create a lightweight variant of this provider with a different model and max tokens.
-    fn create_variant(&self, model: &str, max_tokens: u32) -> Arc<dyn LlmProvider>;
+    /// `None` max_tokens means no limit.
+    fn create_variant(&self, model: &str, max_tokens: Option<u32>) -> Arc<dyn LlmProvider>;
 }
