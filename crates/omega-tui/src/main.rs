@@ -13,6 +13,7 @@ use anyhow::Result;
 use tokio::runtime::Runtime;
 
 use cli::{Color, Event, Span, Style, StyledBlock, StyledText, Term, TermHandle};
+use omega_core::core::SessionInfo;
 use omega_loop_client::{
     connect, DaemonReader, DaemonWriter, OutputChunk, ServerEvent, SessionConfig,
 };
@@ -63,6 +64,61 @@ fn render_md_block(handle: &TermHandle, text: &str) -> StyledBlock {
     StyledBlock::new(styled)
 }
 
+/// Human-friendly age for an RFC3339 timestamp ("just now", "5m ago", …).
+/// Returns an empty string when the timestamp can't be parsed.
+fn relative_time(rfc3339: &str) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return String::new();
+    };
+    let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+    let secs = age.num_seconds();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 86400 * 30 {
+        format!("{}d ago", secs / 86400)
+    } else {
+        format!("{}mo ago", secs / (86400 * 30))
+    }
+}
+
+/// Render the stored session list (newest first, as returned by the daemon)
+/// as a numbered, scannable picker. The numbers are what `/resume <index>`
+/// accepts, so finding a chat is: `/sessions <search>` then `/resume <n>`.
+fn render_session_list(app: &AppState, handle: &TermHandle) {
+    let sessions = &app.last_sessions;
+    if sessions.is_empty() {
+        handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+            "(no saved sessions)",
+            s_system(),
+        ))));
+        return;
+    }
+    let mut st = StyledText::from(Span::new(
+        format!("Saved sessions ({}, newest first):\n", sessions.len()),
+        s_system(),
+    ));
+    for (i, s) in sessions.iter().enumerate() {
+        let idx = i + 1;
+        let time = relative_time(&s.updated_at);
+        st.push(Span::new(format!("{idx:>2}. {}", s.title()), s_assistant()));
+        if !time.is_empty() {
+            st.push(Span::new(format!("   [{time}]"), s_system()));
+        }
+        st.push(Span::new("\n", Style::default()));
+        let mut meta = format!("     {} · {} message(s)", s.session_id, s.message_count);
+        if let Some(last) = s.last_message.as_deref() {
+            meta.push_str(&format!(" · \"{last}\""));
+        }
+        st.push(Span::new(meta, s_system()));
+        st.push(Span::new("\n", Style::default()));
+    }
+    handle.print_output(StyledBlock::new(st));
+}
+
 // ---------------------------------------------------------------------------
 // Slash commands
 // ---------------------------------------------------------------------------
@@ -70,8 +126,8 @@ fn render_md_block(handle: &TermHandle, text: &str) -> StyledBlock {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Change model   (/model <name>)"),
     ("/models", "List available models"),
-    ("/sessions", "List saved sessions"),
-    ("/resume", "Resume a session   (/resume <id>)"),
+    ("/sessions", "List sessions, newest first   (/sessions [search])"),
+    ("/resume", "Resume a session   (/resume <id|index>)"),
     ("/new", "Create a new session   (/new [id])"),
     ("/compact", "Compact session history"),
     ("/interrupt", "Interrupt the agent"),
@@ -101,7 +157,8 @@ enum DaemonCmd {
         model: String,
     },
     ListModels,
-    ListSessions,
+    /// Fetch the session list, optionally filtered by a search query.
+    ListSessions(Option<String>),
     Resume(String),
     Compact(String),
     Interrupt(String),
@@ -178,8 +235,8 @@ async fn daemon_loop(
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                     }
                 }
-                Ok(DaemonCmd::ListSessions) => {
-                    if let Err(e) = writer.send_list_sessions().await {
+                Ok(DaemonCmd::ListSessions(query)) => {
+                    if let Err(e) = writer.send_list_sessions(query.as_deref()).await {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "send_list_sessions failed");
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                     }
@@ -241,6 +298,10 @@ struct Streaming {
     /// for this turn. A subsequent TextDelta auto-resets to start a
     /// fresh turn; a subsequent TextComplete is a no-op.
     finalized: bool,
+    /// In-progress reasoning block. Thinking deltas accumulate here so the
+    /// user sees the model's reasoning trace live instead of nothing.
+    thinking_block_id: Option<cli::BlockId>,
+    thinking_buf: String,
 }
 
 impl Streaming {
@@ -248,6 +309,8 @@ impl Streaming {
         self.block_id = None;
         self.buf.clear();
         self.finalized = false;
+        self.thinking_block_id = None;
+        self.thinking_buf.clear();
     }
 }
 
@@ -337,17 +400,47 @@ fn handle_daemon_event(
                 }
             }
             OutputChunk::ThinkingDelta(s) => {
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    s,
+                if s.is_empty() {
+                    return;
+                }
+                // Accumulate reasoning into ONE block so the trace is readable
+                // instead of one noisy block per delta.
+                streaming.thinking_buf.push_str(&s);
+                let block = StyledBlock::new(StyledText::from(Span::new(
+                    format!("… {}", streaming.thinking_buf),
                     s_thinking(),
-                ))));
+                )));
+                if let Some(id) = streaming.thinking_block_id {
+                    handle.set_block(id, block);
+                    handle.redraw();
+                } else {
+                    streaming.thinking_block_id = Some(handle.print_output(block));
+                }
             }
             OutputChunk::ThinkingComplete(s) => {
+                // Prefer the authoritative final text when provided.
                 if !s.is_empty() {
+                    streaming.thinking_buf = s;
+                }
+                if let Some(id) = streaming.thinking_block_id.take() {
+                    let buf = std::mem::take(&mut streaming.thinking_buf);
+                    if !buf.is_empty() {
+                        let block = StyledBlock::new(StyledText::from(Span::new(
+                            format!("… {buf}"),
+                            s_thinking(),
+                        )));
+                        handle.set_block(id, block);
+                        handle.redraw();
+                    }
+                } else if !streaming.thinking_buf.is_empty() {
+                    // ThinkingComplete without prior deltas: render as-is.
+                    let buf = std::mem::take(&mut streaming.thinking_buf);
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        s,
+                        format!("… {buf}"),
                         s_thinking(),
                     ))));
+                } else {
+                    streaming.thinking_buf.clear();
                 }
             }
             OutputChunk::ToolStart { name, input, .. } => {
@@ -439,6 +532,19 @@ fn handle_daemon_event(
                 handle.print_output(StyledBlock::new(StyledText::from(Span::new(s, s_error()))));
             }
             OutputChunk::Done => {
+                // Finalize any still-open reasoning block (some providers never
+                // send ThinkingComplete before Done).
+                if let Some(id) = streaming.thinking_block_id.take() {
+                    let buf = std::mem::take(&mut streaming.thinking_buf);
+                    if !buf.is_empty() {
+                        let block = StyledBlock::new(StyledText::from(Span::new(
+                            format!("… {buf}"),
+                            s_thinking(),
+                        )));
+                        handle.set_block(id, block);
+                        handle.redraw();
+                    }
+                }
                 // Finalize the current streaming block if one exists.
                 if let Some(id) = streaming.block_id.take() {
                     let buf = std::mem::take(&mut streaming.buf);
@@ -479,19 +585,8 @@ fn handle_daemon_event(
             refresh_cache_status(handle, app);
         }
         ServerEvent::SessionList { sessions } => {
-            if sessions.is_empty() {
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    "(no saved sessions)",
-                    s_system(),
-                ))));
-            } else {
-                let mut st =
-                    StyledText::from(Span::new("Saved sessions:\n".to_string(), s_system()));
-                for s in &sessions {
-                    st.push(Span::new(format!("  {s}\n"), s_assistant()));
-                }
-                handle.print_output(StyledBlock::new(st));
-            }
+            app.last_sessions = sessions;
+            render_session_list(app, handle);
         }
         ServerEvent::SessionResumed {
             session_id,
@@ -502,6 +597,25 @@ fn handle_daemon_event(
                 s_system(),
             ))));
             refresh_cache_status(handle, app);
+        }
+        ServerEvent::HistoryMessage {
+            role, content, ..
+        } => {
+            // Replayed history is rendered exactly like a live conversation
+            // (same styles as a new chat), never as a "[History]" dump.
+            match role.as_str() {
+                "user" => {
+                    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                        format!("▸ {content}"),
+                        s_user(),
+                    ))));
+                }
+                "assistant" => {
+                    let block = render_md_block(handle, &content);
+                    handle.print_output(block);
+                }
+                _ => {}
+            }
         }
         ServerEvent::ModelChanged { model } => {
             app.model = Some(model.clone());
@@ -627,6 +741,9 @@ struct AppState {
     /// (via `ModelChanged` on session creation, or from `OPENAI_MODEL` env).
     model: Option<String>,
     cache: CacheStats,
+    /// The most recent session list from the daemon (newest first), used by
+    /// `/resume <index>`.
+    last_sessions: Vec<SessionInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +835,8 @@ fn process_line(
             ))));
         }
         "/sessions" => {
-            let _ = cmd_tx.send(DaemonCmd::ListSessions);
+            let query = parts.get(1).copied().map(|q| q.to_string());
+            let _ = cmd_tx.send(DaemonCmd::ListSessions(query));
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 "Fetching sessions…",
                 s_system(),
@@ -771,8 +889,32 @@ fn process_line(
             ))));
         }
         "/resume" => {
-            if let Some(name) = parts.get(1) {
-                let name = name.to_string();
+            if let Some(arg) = parts.get(1) {
+                let name = match arg.parse::<usize>() {
+                    // A number is treated as the 1-based index from the last
+                    // `/sessions` listing, so `/sessions foo` → `/resume 2`
+                    // just works.
+                    Ok(idx) if idx >= 1 => match app.last_sessions.get(idx - 1) {
+                        Some(info) => info.session_id.clone(),
+                        None => {
+                            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                                format!("No session #{idx} — run /sessions first"),
+                                s_error(),
+                            ))));
+                            return LineOutcome::Continue;
+                        }
+                    },
+                    // 0 is not a valid index — clearly a typo for 1.
+                    Ok(0) => {
+                        handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                            "Index must be 1-based — run /sessions and pick a number",
+                            s_error(),
+                        ))));
+                        return LineOutcome::Continue;
+                    }
+                    // Anything else is a raw session id.
+                    _ => arg.to_string(),
+                };
                 app.session_id = name.clone();
                 handle.clear_output();
                 let _ = cmd_tx.send(DaemonCmd::Resume(name.clone()));
@@ -782,7 +924,7 @@ fn process_line(
                 ))));
             } else {
                 handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    "Usage: /resume <session-id>",
+                    "Usage: /resume <session-id | index>  (see /sessions)",
                     s_error(),
                 ))));
             }
@@ -856,6 +998,8 @@ fn run_loop(
         block_id: None,
         buf: String::new(),
         finalized: false,
+        thinking_block_id: None,
+        thinking_buf: String::new(),
     };
     let mut history: Vec<String> = Vec::new();
     // Set while a `/status` ping is awaiting the daemon's ModelList reply.
@@ -937,11 +1081,18 @@ fn run_loop(
                 }
             }
             AppEvent::Term(Event::Escape) => {
-                // Only clear buffer on Escape if it's empty (like CancelPrompt).
-                // Non-empty buffers are preserved — accidental Esc shouldn't wipe input.
+                // Esc = steering interrupt: stop the model / abort the tool
+                // call so the user can immediately type a steering message.
+                // Non-empty buffers are preserved — an accidental Esc while
+                // typing shouldn't wipe input.
                 if handle.get_buffer().is_empty() {
                     handle.set_buffer(String::new(), 0);
                 }
+                let _ = cmd_tx.send(DaemonCmd::Interrupt(app.session_id.clone()));
+                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                    "⏹ Interrupted — type a message to steer",
+                    s_system(),
+                ))));
             }
             AppEvent::Term(Event::Resize { width, height: _ }) => {
                 // Refresh the status line (e.g. cache bar) at the new width.
@@ -1028,6 +1179,7 @@ fn main() -> Result<()> {
         session_id,
         model: env_model,
         cache: CacheStats::default(),
+        last_sessions: Vec::new(),
     };
 
     // ── Welcome (printed immediately — no daemon round-trip) ───────────
@@ -1104,11 +1256,14 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
+                last_sessions: Vec::new(),
             },
             streaming: Streaming {
                 block_id: None,
                 buf: String::new(),
                 finalized: false,
+                thinking_block_id: None,
+                thinking_buf: String::new(),
             },
         }
     }
@@ -1550,6 +1705,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
+                last_sessions: Vec::new(),
             },
             app_tx,
             app_rx,
@@ -5476,5 +5632,468 @@ mod tests {
         assert_eq!(fx.app.cache.request_count, 20);
         assert!(fx.app.cache.total_input_tokens > 0);
         fx.shutdown();
+    }
+
+    // =========================================================================
+    // Esc → steering interrupt
+    // =========================================================================
+
+    /// Pressing Escape while the agent is working must send an interrupt to
+    /// the daemon so the user can immediately type a steering message.
+    #[test]
+    fn escape_sends_interrupt_to_daemon() {
+        let mut fx = loop_fixture();
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        // An interrupt command must have been sent for the current session.
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Interrupt(sid)) => assert_eq!(sid, "sess-1"),
+            other => panic!("expected Interrupt command, got {other:?}"),
+        }
+        fx.handle.redraw_sync();
+        assert_eq!(fx.count("Interrupted"), 1);
+        fx.shutdown();
+    }
+
+    /// Escape while typing must NOT wipe the input buffer (existing behavior),
+    /// but must still send the steering interrupt.
+    #[test]
+    fn escape_preserves_buffer_and_sends_interrupt() {
+        let mut fx = loop_fixture();
+        // Simulate the user having typed text: send BufferChanged and set buffer.
+        fx.handle.set_buffer("partial message".to_string(), 15);
+        let driver = {
+            let app_tx = fx.app_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Escape));
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = app_tx.send(AppEvent::Term(Event::Eof));
+            })
+        };
+        run_loop(
+            &fx.handle,
+            &mut fx.app,
+            &fx.app_tx,
+            &fx.app_rx,
+            &fx.cmd_tx,
+            Duration::from_millis(200),
+        );
+        driver.join().unwrap();
+        assert!(
+            matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::Interrupt(_))),
+            "Escape must send an interrupt even with a non-empty buffer"
+        );
+        assert_eq!(
+            fx.handle.get_buffer(),
+            "partial message",
+            "Escape must not wipe a non-empty input buffer"
+        );
+        fx.shutdown();
+    }
+
+    // =========================================================================
+    // Reasoning traces — thinking deltas accumulate into one block
+    // =========================================================================
+
+    /// Thinking deltas must accumulate into a single block (not one block per
+    /// delta) so the reasoning trace is readable.
+    #[test]
+    fn thinking_deltas_accumulate_into_one_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("let me ".into())),
+        );
+        let id = fx.streaming.thinking_block_id.expect("block created");
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("think about ".into())),
+        );
+        assert_eq!(fx.streaming.thinking_block_id, Some(id));
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("this problem".into())),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(
+            count_rows_containing(&fx, "… let me think about this problem"),
+            1,
+            "thinking text must be visible and in ONE block"
+        );
+    }
+
+    /// ThinkingComplete finalizes the accumulated reasoning block.
+    #[test]
+    fn thinking_complete_finalizes_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("reasoning".into())),
+        );
+        assert!(fx.streaming.thinking_block_id.is_some());
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("reasoning".into())),
+        );
+        fx.handle.redraw_sync();
+        assert!(
+            fx.streaming.thinking_block_id.is_none(),
+            "block id must be released after ThinkingComplete"
+        );
+        assert!(fx.streaming.thinking_buf.is_empty());
+        assert_eq!(count_rows_containing(&fx, "… reasoning"), 1);
+    }
+
+    /// A turn that ends with Done but no ThinkingComplete must still show the
+    /// accumulated reasoning (providers often skip the complete event).
+    #[test]
+    fn done_finalizes_open_thinking_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("half a thought".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert!(fx.streaming.thinking_block_id.is_none());
+        assert!(fx.streaming.thinking_buf.is_empty());
+        assert_eq!(count_rows_containing(&fx, "… half a thought"), 1);
+    }
+
+    /// Empty thinking deltas must not allocate a block.
+    #[test]
+    fn empty_thinking_delta_does_not_create_block() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta(String::new())),
+        );
+        fx.handle.redraw_sync();
+        assert!(fx.streaming.thinking_block_id.is_none());
+    }
+
+    /// Thinking block and text block are independent: a text reply after a
+    /// reasoning trace renders in its own block below the reasoning.
+    #[test]
+    fn thinking_then_text_render_separately() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingDelta("hmm".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ThinkingComplete("hmm".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::TextDelta("final answer".into())),
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::Done),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "… hmm"), 1);
+        assert_eq!(count_rows_containing(&fx, "final answer"), 1);
+    }
+
+    // =========================================================================
+    // Session listing — search + recency + resume-by-index
+    // =========================================================================
+
+    /// /sessions forwards the search query to the daemon.
+    #[test]
+    fn sessions_command_forwards_query() {
+        let mut fx = fixture();
+        process_line("/sessions build", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ListSessions(query)) => {
+                assert_eq!(query.as_deref(), Some("build"));
+            }
+            other => panic!("expected ListSessions, got {other:?}"),
+        }
+    }
+
+    /// /sessions without an argument sends no query.
+    #[test]
+    fn sessions_command_no_query() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ListSessions(query)) => assert_eq!(query, None),
+            other => panic!("expected ListSessions, got {other:?}"),
+        }
+    }
+
+    fn sample_session(id: &str, conv: Option<&str>, last: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            session_id: id.to_string(),
+            name: "Picrust Agent".to_string(),
+            conversation_name: conv.map(|s| s.to_string()),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            message_count: 3,
+            last_message: last.map(|s| s.to_string()),
+        }
+    }
+
+    /// The SessionList event stores the list (for /resume <index>) and renders
+    /// it as a numbered, newest-first picker with metadata.
+    #[test]
+    fn session_list_renders_numbered_with_metadata() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![
+                    sample_session("sess-b", Some("Fix the build"), Some("cargo test")),
+                    sample_session("sess-a", None, None),
+                ],
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.last_sessions.len(), 2);
+        assert_eq!(count_rows_containing(&fx, "Saved sessions (2, newest first)"), 1);
+        assert_eq!(count_rows_containing(&fx, "1. Fix the build"), 1);
+        assert_eq!(count_rows_containing(&fx, "2. sess-a"), 1);
+        assert_eq!(count_rows_containing(&fx, "sess-b · 3 message(s)"), 1);
+    }
+
+    /// Empty session list renders a friendly placeholder and clears the stored list.
+    #[test]
+    fn session_list_empty_renders_placeholder() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList { sessions: vec![] },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "(no saved sessions)"), 1);
+        assert!(fx.app.last_sessions.is_empty());
+    }
+
+    /// /resume with a numeric argument resolves to the session at that index
+    /// in the most recent listing (1-based).
+    #[test]
+    fn resume_by_index_resolves_from_list() {
+        let mut fx = fixture();
+        fx.app.last_sessions = vec![
+            sample_session("sess-recent", Some("Recent"), None),
+            sample_session("sess-old", Some("Old"), None),
+        ];
+        process_line("/resume 2", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert_eq!(fx.app.session_id, "sess-old");
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "sess-old"),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// /resume with an out-of-range index shows a helpful error instead of resuming.
+    #[test]
+    fn resume_by_index_out_of_range_shows_error() {
+        let mut fx = fixture();
+        fx.app.last_sessions = vec![sample_session("sess-1", None, None)];
+        process_line("/resume 5", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "No session #5"), 1);
+        // Must NOT send a Resume command.
+        assert!(!matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::Resume(_))));
+    }
+
+    /// /resume with a non-numeric argument is still treated as a raw session id.
+    #[test]
+    fn resume_by_id_still_works() {
+        let mut fx = fixture();
+        process_line("/resume tui-abc123", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert_eq!(fx.app.session_id, "tui-abc123");
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Resume(sid)) => assert_eq!(sid, "tui-abc123"),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    /// /resume 0 is invalid (indices are 1-based) and must show an error
+    /// instead of treating "0" as a raw session id.
+    #[test]
+    fn resume_index_zero_shows_error() {
+        let mut fx = fixture();
+        fx.app.last_sessions = vec![sample_session("sess-1", None, None)];
+        process_line("/resume 0", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Index must be 1-based"), 1);
+        // Must NOT send a Resume command.
+        assert!(!matches!(fx.cmd_rx.try_recv(), Ok(DaemonCmd::Resume(_))));
+        assert_eq!(fx.app.session_id, "sess-1", "session must not change");
+    }
+
+    // =========================================================================
+    // Resumed history — rendered exactly like a live chat
+    // =========================================================================
+
+    /// Replayed user turns render with the same "▸" prefix and user style as
+    /// a freshly typed message in a new chat.
+    #[test]
+    fn history_user_renders_like_live_user_turn() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "sess-1".into(),
+                role: "user".into(),
+                content: "remember to use Edit".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "▸ remember to use Edit"), 1);
+    }
+
+    /// Replayed assistant turns render as normal assistant output (markdown).
+    #[test]
+    fn history_assistant_renders_like_live_reply() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "sess-1".into(),
+                role: "assistant".into(),
+                content: "Here is the fix".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Here is the fix"), 1);
+    }
+
+    /// A resumed chat replays user→assistant in order, exactly like the
+    /// transcript of a live session (no "[History]" dump prefixes).
+    #[test]
+    fn resumed_chat_replays_in_order_like_live() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "sess-1".into(),
+                role: "user".into(),
+                content: "first question".into(),
+            },
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "sess-1".into(),
+                role: "assistant".into(),
+                content: "first answer".into(),
+            },
+        );
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::HistoryMessage {
+                session_id: "sess-1".into(),
+                role: "user".into(),
+                content: "second question".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        let em = emulator(&fx);
+        let all: Vec<String> = em
+            .history()
+            .iter()
+            .cloned()
+            .chain(em.screen_lines())
+            .collect();
+        let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
+        assert!(pos("▸ first question") < pos("first answer"), "{all:?}");
+        assert!(pos("first answer") < pos("▸ second question"), "{all:?}");
+        assert!(
+            all.iter().all(|l| !l.contains("[History]")),
+            "resumed chat must not use [History] dumps: {all:?}"
+        );
+    }
+
+    // =========================================================================
+    // relative_time formatting
+    // =========================================================================
+
+    #[test]
+    fn relative_time_parses_rfc3339() {
+        // Timestamps in the past produce human-readable ages.
+        let now = chrono::Utc::now();
+        let five_min = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(relative_time(&five_min), "5m ago");
+        let three_h = (now - chrono::Duration::hours(3)).to_rfc3339();
+        assert_eq!(relative_time(&three_h), "3h ago");
+        let two_d = (now - chrono::Duration::days(2)).to_rfc3339();
+        assert_eq!(relative_time(&two_d), "2d ago");
+    }
+
+    #[test]
+    fn relative_time_recent_is_just_now() {
+        let now = chrono::Utc::now().to_rfc3339();
+        assert_eq!(relative_time(&now), "just now");
+    }
+
+    #[test]
+    fn relative_time_invalid_returns_empty() {
+        assert_eq!(relative_time("not-a-timestamp"), "");
+        assert_eq!(relative_time(""), "");
     }
 }

@@ -157,10 +157,12 @@ impl StandardAgent {
                 }
 
                 Some(InputMessage::Interrupt) => {
-                    tracing::info!("[StandardAgent] Interrupted");
-                    internals.send_status("Interrupted");
-                    internals.set_done().await;
-                    break;
+                    // Steering interrupt: the user pressed Esc while the agent
+                    // was idle (between turns). This must NOT kill the agent —
+                    // it just acknowledges and keeps waiting for the next
+                    // message so the user can immediately steer with new input.
+                    tracing::info!("[StandardAgent] Interrupt received while idle");
+                    internals.send_status("Interrupted — type a message to steer");
                 }
 
                 Some(InputMessage::Shutdown) | None => {
@@ -839,6 +841,11 @@ impl StandardAgent {
                             cache_control: None,
                         });
 
+                        // Force a natural end-of-turn stop reason so the outer
+                        // loop breaks instead of re-invoking the LLM (which
+                        // would happen if stop_reason was left as ToolUse).
+                        stop_reason = Some(StopReason::EndTurn);
+
                         break;
                     }
                 }
@@ -1021,4 +1028,185 @@ mod tests {
         let result2 = stamp_message_end(&marker, &mut msg);
         assert!(result2);
     }
+}
+
+#[cfg(test)]
+mod interrupt_tests {
+    use super::*;
+// ---------------------------------------------------------------------------
+// Steering interrupt — agent must survive an idle Interrupt and keep working
+// ---------------------------------------------------------------------------
+
+/// A canned LLM provider for loop tests: always streams a single short
+/// text reply and stops with EndTurn.
+struct MockProvider;
+
+use std::pin::Pin;
+
+impl MockProvider {
+    fn events() -> Vec<Result<omega_llm::StreamEvent>> {
+        use omega_llm::{
+            ContentBlockStart, ContentDelta, DeltaUsage, MessageDeltaData, MessageDeltaEvent,
+            MessageStartData, MessageStartEvent, StopReason, Usage,
+        };
+        vec![
+            Ok(omega_llm::StreamEvent::MessageStart(MessageStartEvent {
+                message: MessageStartData {
+                    id: "mock-1".into(),
+                    message_type: "message".into(),
+                    role: "assistant".into(),
+                    content: vec![],
+                    model: "mock-model".into(),
+                    stop_reason: None,
+                    stop_sequence: None,
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                        thoughts_token_count: None,
+                    },
+                },
+            })),
+            Ok(omega_llm::StreamEvent::ContentBlockStart(
+                omega_llm::ContentBlockStartEvent {
+                    index: 0,
+                    content_block: ContentBlockStart::Text { text: String::new() },
+                },
+            )),
+            Ok(omega_llm::StreamEvent::ContentBlockDelta(
+                omega_llm::ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentDelta::TextDelta {
+                        text: "mock reply".into(),
+                    },
+                },
+            )),
+            Ok(omega_llm::StreamEvent::ContentBlockStop(
+                omega_llm::ContentBlockStopEvent { index: 0 },
+            )),
+            Ok(omega_llm::StreamEvent::MessageDelta(MessageDeltaEvent {
+                delta: MessageDeltaData {
+                    stop_reason: Some(StopReason::EndTurn),
+                    stop_sequence: None,
+                },
+                usage: DeltaUsage {
+                    output_tokens: 5,
+                    input_tokens: Some(10),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            })),
+            Ok(omega_llm::StreamEvent::MessageStop),
+        ]
+    }
+}
+
+#[async_trait::async_trait]
+impl omega_llm::LlmProvider for MockProvider {
+    async fn stream_with_tools_and_system(
+        &self,
+        _messages: Vec<Message>,
+        _system: Option<omega_llm::SystemPrompt>,
+        _tools: Vec<omega_llm::ToolDefinition>,
+        _tool_choice: Option<omega_llm::ToolChoice>,
+        _thinking: Option<omega_llm::ThinkingConfig>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = Result<omega_llm::StreamEvent>> + Send>>>
+    {
+        Ok(Box::pin(futures::stream::iter(Self::events())))
+    }
+
+    fn model(&self) -> String {
+        "mock-model".into()
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+
+    fn create_variant(
+        &self,
+        _model: &str,
+        _max_tokens: u32,
+    ) -> std::sync::Arc<dyn omega_llm::LlmProvider> {
+        std::sync::Arc::new(MockProvider)
+    }
+}
+
+/// Collect output chunks until Done (with a hard timeout so a stuck agent
+/// fails the test instead of hanging).
+async fn drain_until_done(
+    rx: &mut crate::runtime::channels::OutputReceiver,
+    chunks: &mut Vec<omega_core::core::OutputChunk>,
+) {
+    use tokio::time::timeout;
+    loop {
+        match timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(chunk)) => {
+                let is_done = matches!(chunk, omega_core::core::OutputChunk::Done);
+                chunks.push(chunk);
+                if is_done {
+                    return;
+                }
+            }
+            Ok(Err(_)) => panic!("output channel closed before Done"),
+            Err(_) => panic!("timed out waiting for Done"),
+        }
+    }
+}
+
+/// Regression test: an Interrupt received while the agent is idle (between
+/// turns — e.g. the user pressed Esc after the turn already finished) must
+/// NOT kill the agent. The agent must still accept and answer the next
+/// user message (the steering flow).
+#[tokio::test]
+async fn idle_interrupt_does_not_kill_agent() {
+    use omega_core::core::InputMessage;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let storage = crate::session::SessionStorage::with_dir(temp.path());
+    let session = crate::session::AgentSession::new_with_storage(
+        "steer-test",
+        "picrust",
+        "Picrust",
+        "test",
+        "You are helpful.",
+        storage,
+    )
+    .unwrap();
+
+    let config = AgentConfig::new();
+    let agent = StandardAgent::new(config, std::sync::Arc::new(MockProvider));
+    let runtime = crate::runtime::AgentRuntime::new();
+    let handle = runtime.spawn(session, |internals| agent.run(internals)).await.unwrap();
+
+    // Turn 1: normal user input → mock reply → Done.
+    handle.send_input("hello").await.unwrap();
+    let mut rx = handle.subscribe();
+    let mut chunks = Vec::new();
+    drain_until_done(&mut rx, &mut chunks).await;
+    assert!(
+        chunks.iter().any(|c| matches!(c, omega_core::core::OutputChunk::TextDelta(t) if t == "mock reply")),
+        "turn 1 must produce the mock reply"
+    );
+
+    // Esc pressed while idle: an Interrupt with no active turn.
+    handle.send(InputMessage::Interrupt).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Turn 2: the steering message. The agent must STILL be alive.
+    handle.send_input("steer: different direction").await.unwrap();
+    let mut chunks2 = Vec::new();
+    drain_until_done(&mut rx, &mut chunks2).await;
+    assert!(
+        chunks2
+            .iter()
+            .any(|c| matches!(c, omega_core::core::OutputChunk::TextDelta(t) if t == "mock reply")),
+        "agent must answer the steering message after an idle interrupt"
+    );
+
+    // Clean shutdown.
+    handle.shutdown().await.unwrap();
+}
 }

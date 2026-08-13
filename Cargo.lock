@@ -1129,6 +1129,7 @@ name = "omega-loop-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "omega-core",
  "serde",
  "serde_json",
  "tokio",
@@ -1193,6 +1194,7 @@ name = "omega-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "cli",
  "crossterm",
  "omega-core",

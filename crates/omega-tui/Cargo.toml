@@ -29,3 +29,6 @@ termimad = "0.35"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time / relative timestamps in session listings
+chrono = "0.4"

@@ -10,6 +10,7 @@
 pub mod context;
 pub mod error;
 pub mod output;
+pub mod session;
 pub mod state;
 pub mod tool_runtime;
 
@@ -19,5 +20,6 @@ pub use output::{
     CacheTelemetry, InputMessage, OutputChunk, QuestionOption, ToolInfo, ToolResult,
     ToolResultData, UserQuestion,
 };
+pub use session::SessionInfo;
 pub use state::AgentState;
 pub use tool_runtime::ToolRuntime;

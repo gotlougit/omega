@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use omega_core::core::SessionInfo;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -28,12 +29,20 @@ pub enum ServerEvent {
         session_id: String,
         chunk: OutputChunk,
     },
-    /// List of available sessions (response to list_sessions).
-    SessionList { sessions: Vec<String> },
+    /// List of available sessions (response to list_sessions), sorted
+    /// most-recently-updated first by the daemon.
+    SessionList { sessions: Vec<SessionInfo> },
     /// A session was resumed.
     SessionResumed {
         session_id: String,
         session_name: String,
+    },
+    /// A historical message replayed when resuming a session, rendered
+    /// exactly like a live user/assistant turn.
+    HistoryMessage {
+        session_id: String,
+        role: String,
+        content: String,
     },
     /// Model was changed.
     ModelChanged { model: String },
@@ -379,7 +388,7 @@ impl ServerEvent {
                     .and_then(|a| a.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .filter_map(|v| serde_json::from_value::<SessionInfo>(v.clone()).ok())
                             .collect()
                     })
                     .unwrap_or_default();
@@ -393,6 +402,23 @@ impl ServerEvent {
                     .to_string(),
                 session_name: obj
                     .get("session_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
+            "HistoryMessage" => Ok(ServerEvent::HistoryMessage {
+                session_id: obj
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                role: obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                content: obj
+                    .get("content")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
@@ -559,10 +585,19 @@ impl DaemonWriter {
     }
 
     /// Request the list of available sessions from the daemon.
-    pub async fn send_list_sessions(&mut self) -> Result<()> {
-        let req = serde_json::json!({
+    ///
+    /// `query` is an optional case-insensitive substring filter applied by
+    /// the daemon against session id / name / conversation name / last
+    /// message. The result is sorted most-recently-updated first.
+    pub async fn send_list_sessions(&mut self, query: Option<&str>) -> Result<()> {
+        let mut req = serde_json::json!({
             "type": "list_sessions",
         });
+        if let Some(q) = query {
+            if !q.trim().is_empty() {
+                req["query"] = serde_json::json!(q.trim());
+            }
+        }
         self.write_json(&req).await
     }
 
@@ -651,13 +686,46 @@ mod tests {
 
     #[test]
     fn test_parse_session_list_event() {
-        let json = r#"{"type":"SessionList","sessions":["sess1","sess2"]}"#;
+        let json = r#"{"type":"SessionList","sessions":[{"session_id":"sess1","name":"A","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-02T00:00:00Z","message_count":2}]}"#;
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
             ServerEvent::SessionList { sessions } => {
-                assert_eq!(sessions, vec!["sess1", "sess2"]);
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].session_id, "sess1");
+                assert_eq!(sessions[0].message_count, 2);
             }
             _ => panic!("Expected SessionList event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_session_list_with_full_info() {
+        let json = r#"{"type":"SessionList","sessions":[{"session_id":"sess1","name":"Picrust Agent","conversation_name":"Fix build","created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-02T00:00:00Z","message_count":5,"last_message":"hello"}]}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::SessionList { sessions } => {
+                assert_eq!(sessions[0].conversation_name.as_deref(), Some("Fix build"));
+                assert_eq!(sessions[0].last_message.as_deref(), Some("hello"));
+            }
+            _ => panic!("Expected SessionList event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_history_message_event() {
+        let json = r#"{"type":"HistoryMessage","session_id":"sess1","role":"user","content":"hello there"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::HistoryMessage {
+                session_id,
+                role,
+                content,
+            } => {
+                assert_eq!(session_id, "sess1");
+                assert_eq!(role, "user");
+                assert_eq!(content, "hello there");
+            }
+            _ => panic!("Expected HistoryMessage event"),
         }
     }
 
@@ -758,6 +826,13 @@ mod tests {
     fn test_send_list_sessions_json_shape() {
         let json = serde_json::json!({"type": "list_sessions"});
         assert_eq!(json["type"], "list_sessions");
+    }
+
+    #[test]
+    fn test_send_list_sessions_with_query() {
+        let json = serde_json::json!({"type": "list_sessions", "query": "build"});
+        assert_eq!(json["type"], "list_sessions");
+        assert_eq!(json["query"], "build");
     }
 
     #[test]

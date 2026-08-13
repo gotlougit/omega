@@ -35,8 +35,8 @@ mod helpers;
 mod runtime;
 mod session;
 
-use omega_core::core::{InputMessage, OutputChunk};
-use omega_llm::{AuthConfig, LlmProvider, OpenAIProvider};
+use omega_core::core::{InputMessage, OutputChunk, SessionInfo};
+use omega_llm::{AuthConfig, ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider};
 use omega_tools::ToolRegistry;
 
 use crate::agent::{AgentConfig, StandardAgent};
@@ -59,6 +59,8 @@ struct ClientRequest {
     answers: Option<HashMap<String, String>>,
     model: Option<String>,
     max_tokens: Option<u32>,
+    /// Optional search filter for `list_sessions` (case-insensitive substring).
+    query: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -81,11 +83,18 @@ enum ServerEvent {
         chunk: OutputChunk,
     },
     SessionList {
-        sessions: Vec<String>,
+        sessions: Vec<SessionInfo>,
     },
     SessionResumed {
         session_id: String,
         session_name: String,
+    },
+    /// A single message from a resumed session's history, replayed so the
+    /// client renders it exactly like a live turn.
+    HistoryMessage {
+        session_id: String,
+        role: String,
+        content: String,
     },
     ModelChanged {
         model: String,
@@ -99,6 +108,138 @@ enum ServerEvent {
     SystemMsg {
         message: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// History replay + session listing helpers
+// ---------------------------------------------------------------------------
+
+/// Marker text the agent inserts into history when a turn is interrupted.
+const INTERRUPT_MARKER: &str =
+    "<vibe-working-agent-system>User interrupted this message</vibe-working-agent-system>";
+
+/// A normalized, replayable message extracted from a session's history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryReplay {
+    role: String,
+    content: String,
+}
+
+/// Extract the user-visible text of a message.
+///
+/// Block messages (tool results, thinking, images) contribute only their
+/// `Text` blocks — everything else is skipped so the client never renders
+/// raw tool plumbing as a chat turn.
+fn message_text(msg: &Message) -> String {
+    match &msg.content {
+        MessageContent::Text(t) => t.clone(),
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Normalize a session's persisted history into replayable turns.
+///
+/// Filters out the rows that would render as confusing or empty chat:
+/// - empty user turns (e.g. tool-result messages, which are `user` role
+///   but contain no visible text),
+/// - assistant interrupt markers inserted when a user stopped a turn.
+fn history_to_replay(messages: &[Message]) -> Vec<HistoryReplay> {
+    let mut out = Vec::new();
+    for msg in messages {
+        if msg.role != "user" && msg.role != "assistant" {
+            continue;
+        }
+        let content = message_text(msg);
+        if content.trim().is_empty() {
+            continue;
+        }
+        if content.trim() == INTERRUPT_MARKER {
+            continue;
+        }
+        out.push(HistoryReplay {
+            role: msg.role.clone(),
+            content: content.trim().to_string(),
+        });
+    }
+    out
+}
+
+/// Build a `SessionInfo` for a stored session, including a short preview of
+/// its last meaningful message, plus the full replayed text used for search.
+///
+/// Returns `(info, search_blob)` where `search_blob` is every replayable
+/// message joined together, so a query can match any point in the chat — not
+/// just the last line.
+fn build_session_info(
+    storage: &crate::session::SessionStorage,
+    session_id: &str,
+    metadata: &crate::session::metadata::SessionMetadata,
+) -> (SessionInfo, String) {
+    let messages = storage.load_messages(session_id).unwrap_or_default();
+    let replay = history_to_replay(&messages);
+    let message_count = replay.len();
+    let last_message = replay.last().map(|r| {
+        if r.content.chars().count() > 80 {
+            let truncated: String = r.content.chars().take(80).collect();
+            format!("{truncated}…")
+        } else {
+            r.content.clone()
+        }
+    });
+    let search_blob = replay
+        .iter()
+        .map(|r| r.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (
+        SessionInfo {
+            session_id: session_id.to_string(),
+            name: metadata.name.clone(),
+            conversation_name: metadata.conversation_name.clone(),
+            created_at: metadata.created_at.to_rfc3339(),
+            updated_at: metadata.updated_at.to_rfc3339(),
+            message_count,
+            last_message,
+        },
+        search_blob,
+    )
+}
+
+/// List top-level sessions with metadata, most-recently-updated first, with
+/// an optional case-insensitive search filter.
+fn list_sessions_filtered(
+    storage: &crate::session::SessionStorage,
+    query: Option<&str>,
+) -> Vec<SessionInfo> {
+    let mut sessions = match storage.list_sessions_with_metadata(true) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("list_sessions error: {e}");
+            return Vec::new();
+        }
+    };
+
+    // Nearest first — most recently updated at the top.
+    sessions.sort_by_key(|(_, meta)| std::cmp::Reverse(meta.updated_at));
+    let q = query.map(str::trim).filter(|q| !q.is_empty());
+    let q = q.map(|q| q.to_lowercase());
+    sessions
+        .into_iter()
+        .map(|(sid, meta)| build_session_info(storage, &sid, &meta))
+        .filter(|(info, blob)| match &q {
+            Some(q) => blob.to_lowercase().contains(q) || info.matches_query(q),
+            None => true,
+        })
+        .map(|(info, _)| info)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -206,13 +347,7 @@ async fn handle_connection(
 
         // list_sessions doesn't need a session_id — handle it first.
         if req.msg_type == "list_sessions" {
-            let list = match session_storage.list_top_level_sessions() {
-                Ok(sessions) => sessions,
-                Err(e) => {
-                    tracing::warn!("list_sessions error: {e}");
-                    Vec::new()
-                }
-            };
+            let list = list_sessions_filtered(&session_storage, req.query.as_deref());
             let _ = event_tx.send(ServerEvent::SessionList { sessions: list });
             continue;
         }
@@ -449,58 +584,16 @@ async fn handle_connection(
                         session_name: session_id.clone(),
                     });
 
-                    // Load message history and replay it to the client
+                    // Load message history and replay it to the client,
+                    // rendered exactly like a live conversation (no empty
+                    // turns, no tool plumbing).
                     if let Ok(messages) = session_storage.load_messages(&session_id) {
-                        for msg in &messages {
-                            match msg.role.as_str() {
-                                "user" => {
-                                    let content = match &msg.content {
-                                        omega_llm::MessageContent::Text(t) => t.clone(),
-                                        omega_llm::MessageContent::Blocks(blocks) => blocks
-                                            .iter()
-                                            .filter_map(|b| {
-                                                if let omega_llm::ContentBlock::Text {
-                                                    text, ..
-                                                } = b
-                                                {
-                                                    Some(text.clone())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(" "),
-                                    };
-                                    let _ = event_tx.send(ServerEvent::SystemMsg {
-                                        message: format!("[History] User: {content}"),
-                                    });
-                                }
-                                "assistant" => {
-                                    let content = match &msg.content {
-                                        omega_llm::MessageContent::Text(t) => t.clone(),
-                                        omega_llm::MessageContent::Blocks(blocks) => blocks
-                                            .iter()
-                                            .filter_map(|b| {
-                                                if let omega_llm::ContentBlock::Text {
-                                                    text, ..
-                                                } = b
-                                                {
-                                                    Some(text.clone())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(" "),
-                                    };
-                                    if !content.is_empty() {
-                                        let _ = event_tx.send(ServerEvent::SystemMsg {
-                                            message: format!("[History] Assistant: {content}"),
-                                        });
-                                    }
-                                }
-                                _ => {}
-                            }
+                        for replay in history_to_replay(&messages) {
+                            let _ = event_tx.send(ServerEvent::HistoryMessage {
+                                session_id: session_id.clone(),
+                                role: replay.role,
+                                content: replay.content,
+                            });
                         }
                     }
                 } else {
@@ -664,5 +757,240 @@ async fn main() -> Result<()> {
                 tracing::error!("accept error: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omega_llm::{ContentBlock, Message};
+    use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // history_to_replay — resume replay normalization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_keeps_simple_user_and_assistant_turns() {
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant("hi there"),
+            Message::user("how are you?"),
+        ];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay.len(), 3);
+        assert_eq!(replay[0].role, "user");
+        assert_eq!(replay[0].content, "hello");
+        assert_eq!(replay[1].role, "assistant");
+        assert_eq!(replay[1].content, "hi there");
+    }
+
+    /// Tool results are stored as `user` messages with non-text blocks.
+    /// They must NOT be replayed as empty user turns (the reported bug).
+    #[test]
+    fn replay_skips_empty_user_turns_from_tool_results() {
+        let messages = vec![
+            Message::user("actual prompt"),
+            Message::assistant_with_blocks(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+                signature: None,
+            }]),
+            // The user turn that carries the tool result — role "user",
+            // but only ToolResult blocks (no visible text).
+            Message::user_with_blocks(vec![ContentBlock::tool_result("t1", "file1\nfile2", false)]),
+        ];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay.len(), 1, "only the real user prompt should survive");
+        assert_eq!(replay[0].content, "actual prompt");
+    }
+
+    #[test]
+    fn replay_skips_empty_text_messages() {
+        let messages = vec![
+            Message::user(""),
+            Message::assistant("   "),
+            Message::user("real content"),
+        ];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].content, "real content");
+    }
+
+    /// Interrupt markers inserted by the agent are noise for a resumed chat.
+    #[test]
+    fn replay_skips_interrupt_marker() {
+        let messages = vec![
+            Message::user("do the thing"),
+            Message::assistant(INTERRUPT_MARKER),
+            Message::user("no wait, do the other thing"),
+        ];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay.len(), 2);
+        assert!(
+            replay.iter().all(|r| r.content != INTERRUPT_MARKER),
+            "interrupt marker must not be replayed"
+        );
+    }
+
+    /// Assistant replies with mixed blocks (thinking + text + tool use)
+    /// contribute only their text.
+    #[test]
+    fn replay_assistant_blocks_only_use_text() {
+        let messages = vec![Message::assistant_with_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "let me think".into(),
+                signature: "sig".into(),
+            },
+            ContentBlock::Text {
+                text: "final answer".into(),
+                cache_control: None,
+            },
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+                signature: None,
+            },
+        ])];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].content, "final answer");
+    }
+
+    #[test]
+    fn replay_ignores_non_user_assistant_roles() {
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: "system".into(),
+                content: omega_llm::MessageContent::Text("sys".into()),
+            },
+            Message::assistant("world"),
+        ];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay.len(), 2);
+    }
+
+    #[test]
+    fn replay_trims_whitespace() {
+        let messages = vec![Message::user("  padded  ")];
+        let replay = history_to_replay(&messages);
+        assert_eq!(replay[0].content, "padded");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_sessions_filtered — recency sort + search
+    // -----------------------------------------------------------------------
+
+    fn storage_with_sessions(names: &[(&str, &str)]) -> (SessionStorage, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let storage = SessionStorage::with_dir(temp.path());
+        for (id, conv) in names {
+            let mut meta = crate::session::metadata::SessionMetadata::new(*id, "picrust", "Picrust Agent", "d");
+            if !conv.is_empty() {
+                meta.set_conversation_name(*conv);
+            }
+            storage.save_metadata(&meta).unwrap();
+        }
+        (storage, temp)
+    }
+
+    /// Sessions must come back most-recently-updated first so the TUI can
+    /// present a "nearest first" resume list.
+    #[test]
+    fn list_sessions_sorted_by_recency() {
+        let (storage, _t) = storage_with_sessions(&[("old", "Old chat"), ("new", "New chat")]);
+        // Force a distinct updated_at for "new" (touching bumps the timestamp).
+        {
+            let mut meta = storage.load_metadata("new").unwrap();
+            meta.touch();
+            storage.save_metadata(&meta).unwrap();
+        }
+        let list = list_sessions_filtered(&storage, None);
+        assert_eq!(list.len(), 2);
+        // "new" was touched after "old" was created → it must be first.
+        assert_eq!(list[0].session_id, "new");
+        assert_eq!(list[1].session_id, "old");
+    }
+
+    #[test]
+    fn list_sessions_query_filters() {
+        let (storage, _t) = storage_with_sessions(&[
+            ("sess-fix", "Fix the build"),
+            ("sess-tui", "TUI tests"),
+        ]);
+        let list = list_sessions_filtered(&storage, Some("build"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "sess-fix");
+    }
+
+    #[test]
+    fn list_sessions_query_matches_last_message() {
+        let (storage, _t) = storage_with_sessions(&[("sess-a", ""), ("sess-b", "")]);
+        // Add a message to sess-a so its preview contains the searchable text.
+        storage
+            .append_message("sess-a", &Message::user("refactor the parser"))
+            .unwrap();
+        let list = list_sessions_filtered(&storage, Some("parser"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "sess-a");
+        assert!(list[0].last_message.as_deref().unwrap().contains("parser"));
+    }
+
+    #[test]
+    fn list_sessions_query_blank_returns_all() {
+        let (storage, _t) = storage_with_sessions(&[("s1", "A"), ("s2", "B")]);
+        let list = list_sessions_filtered(&storage, Some("   "));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn list_sessions_excludes_subagents() {
+        let (storage, _t) = storage_with_sessions(&[("parent", "Parent")]);
+        let sub = crate::session::metadata::SessionMetadata::new_subagent(
+            "child",
+            "helper",
+            "Child",
+            "d",
+            "parent",
+            "tool_1",
+        );
+        storage.save_metadata(&sub).unwrap();
+        let list = list_sessions_filtered(&storage, None);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "parent");
+    }
+
+    #[test]
+    fn session_info_last_message_truncated() {
+        let (storage, _t) = storage_with_sessions(&[("sess", "")]);
+        let long = "x".repeat(200);
+        storage.append_message("sess", &Message::user(&long)).unwrap();
+        let meta = storage.load_metadata("sess").unwrap();
+        let (info, blob) = build_session_info(&storage, "sess", &meta);
+        let preview = info.last_message.unwrap();
+        assert!(preview.chars().count() <= 81, "preview must be truncated");
+        assert!(preview.ends_with('…'));
+        assert!(!blob.is_empty(), "search blob must contain the message");
+    }
+
+    /// A query matching an EARLIER message (not the last one) still finds the
+    /// session — search covers the whole conversation.
+    #[test]
+    fn list_sessions_query_matches_earlier_message() {
+        let (storage, _t) = storage_with_sessions(&[("sess-a", ""), ("sess-b", "")]);
+        storage.append_message("sess-a", &Message::user("lets discuss interrupt steering")).unwrap();
+        storage.append_message("sess-a", &Message::assistant("sure")).unwrap();
+        storage.append_message("sess-b", &Message::user("unrelated")).unwrap();
+        storage.append_message("sess-b", &Message::assistant("ok")).unwrap();
+
+        let list = list_sessions_filtered(&storage, Some("steering"));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session_id, "sess-a");
+        // The last message of sess-a is "sure", which doesn't match, so this
+        // proves the earlier user message was searched.
+        assert_eq!(list[0].last_message.as_deref(), Some("sure"));
     }
 }
