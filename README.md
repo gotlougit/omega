@@ -32,6 +32,7 @@ An agent runtime and tool execution framework in Rust.
 | **omega-llm** | LLM provider abstraction (`LlmProvider` trait, types, OpenAI backend) |
 | **omega-loop** | Agent daemon — `StandardAgent`, `AgentRuntime`, `AgentSession`, helpers, everything else |
 | **omega-loop-client** | Client library for the `omega-loop` daemon protocol |
+| **omega-projects** | Project store: register git repos (bare clone once) and create per-session git worktrees |
 | **omega-sh** | Unix-socket daemon for filesystem/shell tool execution |
 | **omega-sh-client** | Client library for `omega-sh` + proxy tools |
 | **cli** | Minimal TUI primitives (screen, style, terminal) |

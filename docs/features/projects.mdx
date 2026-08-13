@@ -1,0 +1,79 @@
+---
+title: 'Project Worktrees'
+description: 'Work on git repositories from the TUI with per-session git worktrees'
+---
+
+# Project Worktrees
+
+omega can bind a chat session to a git repository. Each session gets its own
+dedicated **git worktree**, so you can hop between repositories (or run several
+sessions on the same repo) without ever disturbing another session's checkout,
+index, or branch.
+
+## The `/project` command
+
+```text
+/project              # list registered projects (interactive picker)
+/project <name>       # switch to a registered project
+/project <git-url>    # register + clone a new project, then switch to it
+```
+
+### Bare `/project`
+
+Opens an interactive picker of every registered project. `j/k` or the arrow
+keys move the selection, `Enter` activates the highlighted project, `Esc`
+cancels.
+
+### `/project <name-or-url>`
+
+Activates directly, skipping the picker. If the name is already registered the
+existing bare clone is reused (and fetched). Any other input is treated as a
+git URL — the project is registered and cloned on first use.
+
+## How it works
+
+The daemon keeps a project store (default `./projects` relative to the daemon's
+working directory; the NixOS module sets it absolutely via
+`services.omega.projectsDir`, defaulting to `~clanker/projects`):
+
+```text
+<root>/
+  registry.json               — registered projects (name → url)
+  repos/<name>/               — bare clone of the repository (cloned once)
+  worktrees/<name>/           — one directory per session worktree
+    <session>-<rand>/         — `git worktree add` checkout on its own branch
+```
+
+When you activate a project, the daemon:
+
+1. Resolves the spec to a registered project, cloning the repository **once**
+   into `repos/` (a bare clone shared by every worktree).
+2. Creates a **brand-new** git worktree on its own `omega/<session>-<rand>`
+   branch inside `worktrees/`.
+3. Recreates the session so its system prompt describes the project and all of
+   its Bash/Read/Write/Edit tools run **inside the worktree**.
+
+Because every session works in its own worktree with its own branch, parallel
+sessions on the same repository are fully isolated: commits, uncommitted
+changes, and branches never leak between them. The shared bare clone is the
+only common state (objects and refs), which is exactly what makes the workflow
+cheap — no repeated cloning.
+
+## Session lifecycle
+
+- **Bound sessions persist.** The active project is stored in the session's
+  metadata, so `/sessions` → resume puts you right back in the same worktree.
+- **Missing worktrees are re-created.** If a worktree directory was deleted
+  (or a stale path is referenced), the next activation creates a fresh one.
+- **Switching projects** tears down the *current session's* worktree and its
+  branch, then creates a new one — other sessions' worktrees are never
+  touched.
+- **Doing `/project` is optional.** Sessions without a project behave exactly
+  as before, with tools rooted at the daemon's working directory.
+
+## Tips
+
+- Committing from inside a worktree is a normal `git commit` on the session's
+  own branch — nothing is pushed or merged unless you ask the agent to.
+- `git -C <root>/repos/<name>` inspects the shared repository (e.g. `worktree
+  list` to see every live session checkout).

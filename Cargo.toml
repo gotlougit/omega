@@ -12,4 +12,5 @@ members = [
     "crates/omega-tools",
     "crates/omega-tool-defs",
     "crates/clankersh",
+    "crates/omega-projects",
 ]

@@ -20,7 +20,7 @@
 //!
 //! - `OMEGA_SOCKET_PATH` — path to the Unix socket (default: /tmp/omega-sh.sock)
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -115,8 +115,23 @@ mod tools {
     const MAX_TIMEOUT_MS: u64 = 600_000;
     const MAX_OUTPUT_LENGTH: usize = 30_000;
 
-    /// Execute a shell command, return (combined_stdout_stderr, exit_code).
-    pub async fn bash(args: &Value) -> OmegaToolResult {
+    /// Resolve a tool `file_path` argument against the per-request working
+    /// directory. Absolute paths are used as-is; relative paths are joined
+    /// onto `dir` when one was provided.
+    pub fn resolve_path(dir: Option<&Path>, file_path: &str) -> PathBuf {
+        let path = Path::new(file_path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(dir) = dir {
+            dir.join(path)
+        } else {
+            path.to_path_buf()
+        }
+    }
+
+    /// Execute a shell command in `dir` (when given), return
+    /// (combined_stdout_stderr, exit_code).
+    pub async fn bash(args: &Value, dir: Option<&Path>) -> OmegaToolResult {
         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         let timeout_ms = args
             .get("timeout")
@@ -126,9 +141,13 @@ mod tools {
 
         let duration = Duration::from_millis(timeout_ms);
 
-        let child = Command::new("bash")
-            .arg("-c")
-            .arg(cmd)
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(cmd);
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+
+        let child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
@@ -183,8 +202,9 @@ mod tools {
         }
     }
 
-    /// Read a file — dispatches by extension.
-    pub async fn read(args: &Value) -> OmegaToolResult {
+    /// Read a file — dispatches by extension. Relative paths resolve
+    /// against the per-request working directory.
+    pub async fn read(args: &Value, dir: Option<&Path>) -> OmegaToolResult {
         let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         if file_path.is_empty() {
             return err("Missing required field: file_path");
@@ -199,7 +219,7 @@ mod tools {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        let path = Path::new(file_path);
+        let path = resolve_path(dir, file_path);
 
         match path
             .extension()
@@ -208,10 +228,10 @@ mod tools {
             .as_deref()
         {
             Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") => {
-                read_image(path)
+                read_image(&path)
             }
-            Some("pdf") => read_pdf(path),
-            _ => read_text(path, offset, limit),
+            Some("pdf") => read_pdf(&path),
+            _ => read_text(&path, offset, limit),
         }
     }
 
@@ -305,7 +325,8 @@ mod tools {
     }
 
     /// Write content to a file, creating parent directories as needed.
-    pub async fn write(args: &Value) -> OmegaToolResult {
+    /// Relative paths resolve against the per-request working directory.
+    pub async fn write(args: &Value, dir: Option<&Path>) -> OmegaToolResult {
         let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -313,7 +334,7 @@ mod tools {
             return err("Missing required field: file_path");
         }
 
-        let path = Path::new(file_path);
+        let path = resolve_path(dir, file_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -323,7 +344,7 @@ mod tools {
         }
 
         let existed = path.exists();
-        match std::fs::write(path, content) {
+        match std::fs::write(&path, content) {
             Ok(()) => {
                 if existed {
                     ok_text(format!("File updated successfully: {file_path}"))
@@ -335,8 +356,9 @@ mod tools {
         }
     }
 
-    /// Exact-string replacement in a file.
-    pub async fn edit(args: &Value) -> OmegaToolResult {
+    /// Exact-string replacement in a file. Relative paths resolve against
+    /// the per-request working directory.
+    pub async fn edit(args: &Value, dir: Option<&Path>) -> OmegaToolResult {
         let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         let old_string = args
             .get("old_string")
@@ -358,8 +380,8 @@ mod tools {
             return err("old_string and new_string must be different");
         }
 
-        let path = Path::new(file_path);
-        let content = match std::fs::read_to_string(path) {
+        let path = resolve_path(dir, file_path);
+        let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return err(format!("Failed to read file: {e}")),
         };
@@ -383,7 +405,7 @@ mod tools {
             content.replacen(old_string, new_string, 1)
         };
 
-        match std::fs::write(path, &new_content) {
+        match std::fs::write(&path, &new_content) {
             Ok(()) => {
                 if replace_all {
                     ok_text(format!(
@@ -488,11 +510,15 @@ async fn handle_connection(stream: UnixStream) {
             "request"
         );
 
+        // Per-request working directory: absolute tool paths are used
+        // as-is; relative Bash commands and file paths are rooted at it.
+        let dir_path = request.dir.as_deref().map(Path::new);
+
         let result = match request.tool.as_str() {
-            "Bash" => tools::bash(&request.args).await,
-            "Read" => tools::read(&request.args).await,
-            "Write" => tools::write(&request.args).await,
-            "Edit" => tools::edit(&request.args).await,
+            "Bash" => tools::bash(&request.args, dir_path).await,
+            "Read" => tools::read(&request.args, dir_path).await,
+            "Write" => tools::write(&request.args, dir_path).await,
+            "Edit" => tools::edit(&request.args, dir_path).await,
             other => OmegaToolResult {
                 content: OmegaContent::Text {
                     data: format!("Unknown tool: {other}"),
@@ -522,4 +548,114 @@ async fn write_response(
     writer.write_all(&buf).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn text(result: &OmegaToolResult) -> &str {
+        match &result.content {
+            OmegaContent::Text { data } => data,
+            _ => panic!("expected text content"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-request working directory (`dir` field)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bash_runs_in_requested_dir() {
+        let tmp = TempDir::new().unwrap();
+        let result = tools::bash(&serde_json::json!({"command": "pwd"}), Some(tmp.path())).await;
+        assert!(!result.is_error, "{}", text(&result));
+        let canon = tmp.path().canonicalize().unwrap();
+        assert!(
+            text(&result).contains(canon.display().to_string().as_str()),
+            "pwd should report the requested dir, got: {}",
+            text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_without_dir_uses_daemon_cwd() {
+        let result = tools::bash(&serde_json::json!({"command": "pwd"}), None).await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(!text(&result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_resolves_relative_paths_against_dir() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("file.txt"), "hello from dir").unwrap();
+        let result = tools::read(
+            &serde_json::json!({"file_path": "file.txt"}),
+            Some(tmp.path()),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(text(&result).contains("hello from dir"));
+    }
+
+    #[tokio::test]
+    async fn write_resolves_relative_paths_against_dir() {
+        let tmp = TempDir::new().unwrap();
+        let result = tools::write(
+            &serde_json::json!({"file_path": "sub/dir.txt", "content": "x"}),
+            Some(tmp.path()),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(tmp.path().join("sub/dir.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("sub/dir.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_resolves_relative_paths_against_dir() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "abc").unwrap();
+        let result = tools::edit(
+            &serde_json::json!({"file_path": "f.txt", "old_string": "b", "new_string": "X"}),
+            Some(tmp.path()),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "aXc"
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_paths_ignore_dir() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        std::fs::write(other.path().join("abs.txt"), "abs content").unwrap();
+        let abs = other.path().join("abs.txt");
+        let result = tools::read(&serde_json::json!({"file_path": abs}), Some(tmp.path())).await;
+        assert!(!result.is_error, "{}", text(&result));
+        assert!(text(&result).contains("abs content"));
+    }
+
+    #[test]
+    fn resolve_path_joins_relative_and_keeps_absolute() {
+        let dir = Path::new("/some/worktree");
+        assert_eq!(
+            tools::resolve_path(Some(dir), "src/main.rs"),
+            Path::new("/some/worktree/src/main.rs")
+        );
+        assert_eq!(
+            tools::resolve_path(Some(dir), "/abs/path.rs"),
+            Path::new("/abs/path.rs")
+        );
+        assert_eq!(
+            tools::resolve_path(None, "relative.rs"),
+            Path::new("relative.rs")
+        );
+    }
 }

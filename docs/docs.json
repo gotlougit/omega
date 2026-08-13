@@ -59,6 +59,7 @@
           {
             "group": "Features",
             "pages": [
+              "features/projects",
               "features/prompt-caching",
               "features/streaming",
               "features/interrupts",

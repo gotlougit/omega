@@ -1113,6 +1113,8 @@ dependencies = [
  "futures",
  "omega-core",
  "omega-llm",
+ "omega-loop-client",
+ "omega-projects",
  "omega-sh-client",
  "omega-tools",
  "regex",
@@ -1130,9 +1132,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "omega-core",
+ "omega-projects",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "omega-projects"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1143,6 +1160,7 @@ dependencies = [
  "base64 0.23.0",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

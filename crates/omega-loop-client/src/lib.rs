@@ -10,6 +10,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// Re-exported project types so clients only need to depend on this crate.
+pub use omega_projects::{ActiveProject, ProjectInfo};
+
 // ---------------------------------------------------------------------------
 // Wire types (deserialization of server → client events)
 // ---------------------------------------------------------------------------
@@ -48,6 +51,15 @@ pub enum ServerEvent {
     SessionCompacted { session_id: String },
     /// A list of available models from the daemon.
     ModelList { models: Vec<String> },
+    /// Registered projects (response to list_projects).
+    ProjectList { projects: Vec<ProjectInfo> },
+    /// A project was activated for the current session: the daemon created
+    /// a dedicated git worktree the session will operate in.
+    ProjectActive {
+        project: ProjectInfo,
+        worktree_path: String,
+        branch: String,
+    },
     /// A system message from the daemon.
     SystemMsg(String),
     /// An unrecognised variant (forward-compatibility).
@@ -390,6 +402,42 @@ impl ServerEvent {
                     })
                     .unwrap_or_default(),
             }),
+            "ProjectList" => {
+                let projects = obj
+                    .get("projects")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| serde_json::from_value::<ProjectInfo>(v.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(ServerEvent::ProjectList { projects })
+            }
+            "ProjectActive" => {
+                let project = obj
+                    .get("project")
+                    .and_then(|v| serde_json::from_value::<ProjectInfo>(v.clone()).ok())
+                    .unwrap_or_else(|| ProjectInfo {
+                        name: String::new(),
+                        url: String::new(),
+                        default_branch: None,
+                        created_at: Default::default(),
+                    });
+                Ok(ServerEvent::ProjectActive {
+                    project,
+                    worktree_path: obj
+                        .get("worktree_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    branch: obj
+                        .get("branch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            }
             "SystemMsg" => Ok(ServerEvent::SystemMsg(
                 obj.get("message")
                     .and_then(|v| v.as_str())
@@ -487,12 +535,15 @@ impl DaemonReader {
 impl DaemonWriter {
     /// Send a `run` request (creates session if new, then sends the message).
     /// If `model` is `Some`, it will be applied on session creation.
+    /// If `project` is `Some`, the session is bound to that project's
+    /// worktree (all tool calls run inside it).
     pub async fn send_run(
         &mut self,
         session_id: &str,
         content: &str,
         config: &SessionConfig,
         model: Option<&str>,
+        project: Option<&ActiveProject>,
     ) -> Result<()> {
         let mut req = serde_json::json!({
             "type": "run",
@@ -506,6 +557,9 @@ impl DaemonWriter {
         });
         if let Some(m) = model {
             req["model"] = serde_json::json!(m);
+        }
+        if let Some(p) = project {
+            req["project"] = serde_json::to_value(p)?;
         }
         self.write_json(&req).await
     }
@@ -531,6 +585,26 @@ impl DaemonWriter {
     pub async fn send_list_models(&mut self) -> Result<()> {
         let req = serde_json::json!({
             "type": "list_models",
+        });
+        self.write_json(&req).await
+    }
+
+    /// Request the list of registered projects from the daemon.
+    pub async fn send_list_projects(&mut self) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "list_projects",
+        });
+        self.write_json(&req).await
+    }
+
+    /// Activate a project for a session: `spec` is a registered project
+    /// name or a git URL. The daemon clones the repo if needed and creates
+    /// a dedicated git worktree for the session.
+    pub async fn send_activate_project(&mut self, session_id: &str, spec: &str) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "activate_project",
+            "session_id": session_id,
+            "spec": spec,
         });
         self.write_json(&req).await
     }
@@ -695,6 +769,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_project_list_event() {
+        let json = r#"{"type":"ProjectList","projects":[{"name":"omega","url":"https://example.com/omega.git","default_branch":"main","created_at":"2025-01-01T00:00:00Z"}]}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::ProjectList { projects } => {
+                assert_eq!(projects.len(), 1);
+                assert_eq!(projects[0].name, "omega");
+                assert_eq!(projects[0].url, "https://example.com/omega.git");
+                assert_eq!(projects[0].default_branch.as_deref(), Some("main"));
+            }
+            _ => panic!("Expected ProjectList event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_project_active_event() {
+        let json = r#"{"type":"ProjectActive","project":{"name":"omega","url":"https://example.com/omega.git","created_at":"2025-01-01T00:00:00Z"},"worktree_path":"/tmp/projects/worktrees/omega/sess-1-ab12cd","branch":"omega/sess-1-ab12cd"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::ProjectActive {
+                project,
+                worktree_path,
+                branch,
+            } => {
+                assert_eq!(project.name, "omega");
+                assert_eq!(worktree_path, "/tmp/projects/worktrees/omega/sess-1-ab12cd");
+                assert_eq!(branch, "omega/sess-1-ab12cd");
+            }
+            _ => panic!("Expected ProjectActive event"),
+        }
+    }
+
+    #[test]
     fn test_output_chunk_parse_text_delta() {
         let json = r#"{"TextDelta":"Hello"}"#;
         let val: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -746,6 +853,42 @@ mod tests {
         assert_eq!(json["content"], "Hello");
         assert_eq!(json["config"]["stream"], true);
         assert_eq!(json["config"]["think"], false);
+    }
+
+    #[test]
+    fn test_send_run_with_project_json_shape() {
+        let active = ActiveProject {
+            project: ProjectInfo {
+                name: "omega".into(),
+                url: "https://example.com/omega.git".into(),
+                default_branch: Some("main".into()),
+                created_at: Default::default(),
+            },
+            worktree_path: "/tmp/wt/omega/sess-1".into(),
+            branch: "omega/sess-1-abc123".into(),
+        };
+        let json = serde_json::to_value(&active).unwrap();
+        assert_eq!(json["project"]["name"], "omega");
+        assert_eq!(json["worktree_path"], "/tmp/wt/omega/sess-1");
+        assert_eq!(json["branch"], "omega/sess-1-abc123");
+    }
+
+    #[test]
+    fn test_send_activate_project_json_shape() {
+        let json = serde_json::json!({
+            "type": "activate_project",
+            "session_id": "sess-1",
+            "spec": "https://example.com/omega.git",
+        });
+        assert_eq!(json["type"], "activate_project");
+        assert_eq!(json["session_id"], "sess-1");
+        assert_eq!(json["spec"], "https://example.com/omega.git");
+    }
+
+    #[test]
+    fn test_send_list_projects_json_shape() {
+        let json = serde_json::json!({"type": "list_projects"});
+        assert_eq!(json["type"], "list_projects");
     }
 
     #[test]

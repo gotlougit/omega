@@ -20,9 +20,11 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use omega_projects::{ActiveProject, ProjectInfo, ProjectManager};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -58,6 +60,12 @@ struct ClientRequest {
     max_tokens: Option<u32>,
     /// Optional search filter for `list_sessions` (case-insensitive substring).
     query: Option<String>,
+    /// Project spec for `activate_project` — a registered project name or a
+    /// git URL.
+    spec: Option<String>,
+    /// Active project for a `run` request — binds the session's tools to
+    /// the project's git worktree.
+    project: Option<ActiveProject>,
 }
 
 #[derive(Deserialize, Default)]
@@ -101,6 +109,16 @@ enum ServerEvent {
     },
     ModelList {
         models: Vec<String>,
+    },
+    ProjectList {
+        projects: Vec<ProjectInfo>,
+    },
+    /// A project was activated for a session: the daemon created (or
+    /// re-created) a dedicated git worktree the session will operate in.
+    ProjectActive {
+        project: ProjectInfo,
+        worktree_path: String,
+        branch: String,
     },
     SystemMsg {
         message: String,
@@ -288,6 +306,177 @@ fn create_tools() -> Result<Arc<ToolRegistry>> {
 }
 
 // ---------------------------------------------------------------------------
+// Project support — per-session git worktrees
+// ---------------------------------------------------------------------------
+
+/// Custom-metadata key where a session's active project is persisted, so a
+/// resumed session is re-bound to its worktree across daemon restarts.
+const META_ACTIVE_PROJECT: &str = "active_project";
+
+/// Build a tool registry whose proxy tools run inside `dir` — used for
+/// project-bound sessions so every Bash/Read/Write/Edit executes in the
+/// session's git worktree.
+fn create_tools_for_dir(dir: &Path, session_id: &str) -> Arc<ToolRegistry> {
+    let mut registry = ToolRegistry::new();
+    let omega = OmegaClient::new()
+        .with_session(session_id.to_string())
+        .with_dir(dir.display().to_string());
+    omega_sh_client::register_proxy_tools(&mut registry, omega);
+    omega_tools::register_default_tools(&mut registry);
+    Arc::new(registry)
+}
+
+/// Pick the tool registry for a session: the project worktree's registry
+/// when a project is active, otherwise the daemon-wide default.
+fn tools_for_session(
+    default: &Arc<ToolRegistry>,
+    active: Option<&ActiveProject>,
+    session_id: &str,
+) -> Arc<ToolRegistry> {
+    match active {
+        Some(active) => create_tools_for_dir(Path::new(&active.worktree_path), session_id),
+        None => default.clone(),
+    }
+}
+
+/// System-prompt context injected into project-bound sessions, giving the
+/// agent immediate context about the repository it is working in.
+fn project_system_context(active: &ActiveProject) -> String {
+    format!(
+        "\n\nYou are working on the project '{}'.\n\
+         Repo URL: {}\n\
+         Worktree branch: {}\n\
+         Working directory: {}\n\
+         All file reads/writes/edits and shell commands operate inside this\n\
+         directory (a dedicated git worktree). Commit your work on the current\n\
+         branch; do not push or merge unless the user asks.",
+        active.project.name, active.project.url, active.branch, active.worktree_path
+    )
+}
+
+fn save_active_to_metadata(
+    meta: &mut crate::session::metadata::SessionMetadata,
+    active: &ActiveProject,
+) {
+    if let Ok(value) = serde_json::to_value(active) {
+        meta.set_custom(META_ACTIVE_PROJECT, value);
+    }
+}
+
+fn active_from_metadata(meta: &crate::session::metadata::SessionMetadata) -> Option<ActiveProject> {
+    meta.get_custom(META_ACTIVE_PROJECT)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// Resolve the project context a session should use: the explicitly
+/// requested project (from a `run`) or the one persisted in metadata
+/// (resume/compact). If the worktree directory no longer exists it is
+/// re-created, so a session always has a live checkout to operate in.
+async fn resolve_project_context(
+    projects: &ProjectManager,
+    session_id: &str,
+    requested: Option<&ActiveProject>,
+    persisted: Option<&ActiveProject>,
+) -> Option<ActiveProject> {
+    let candidate = requested.or(persisted)?;
+    if Path::new(&candidate.worktree_path).is_dir() {
+        return Some(candidate.clone());
+    }
+    match projects
+        .activate(&candidate.project.name, session_id, None)
+        .await
+    {
+        Ok(active) => {
+            tracing::info!(
+                %session_id,
+                project = %active.project.name,
+                worktree = %active.worktree_path,
+                "re-created missing worktree"
+            );
+            Some(active)
+        }
+        Err(e) => {
+            tracing::warn!(%session_id, project = %candidate.project.name, error = %e, "could not re-create worktree");
+            None
+        }
+    }
+}
+
+/// Create a brand-new agent session (persisted under `./sessions`), bound
+/// to `project` when given: the system prompt carries project context and
+/// the tool registry runs inside the worktree. Output chunks are forwarded
+/// to `event_tx` so the client renders them like a live conversation.
+#[allow(clippy::too_many_arguments)] // private daemon helper wiring one session
+async fn create_session(
+    session_id: &str,
+    base_system_prompt: &str,
+    project: Option<&ActiveProject>,
+    tools: Arc<ToolRegistry>,
+    provider: Arc<dyn LlmProvider>,
+    think: bool,
+    no_cache: bool,
+    runtime: &AgentRuntime,
+    event_tx: &broadcast::Sender<ServerEvent>,
+    session_storage: &SessionStorage,
+) -> anyhow::Result<AgentHandle> {
+    let mut system_prompt = base_system_prompt.to_string();
+    if let Some(active) = project {
+        system_prompt.push_str(&project_system_context(active));
+    }
+
+    let mut agent_session = AgentSession::new_with_storage(
+        session_id,
+        "omega",
+        "omega-tui",
+        "A coding agent",
+        &system_prompt,
+        session_storage.clone(),
+    )?;
+
+    if let Some(active) = project {
+        save_active_to_metadata(&mut agent_session.metadata, active);
+        session_storage.save_metadata(&agent_session.metadata)?;
+    }
+
+    let mut agent_cfg = AgentConfig::new()
+        .with_tools(tools.clone())
+        .with_prompt_caching(!no_cache);
+    if think {
+        agent_cfg = agent_cfg.with_thinking(16000);
+    }
+    let agent = StandardAgent::new(agent_cfg, provider);
+
+    let handle = runtime
+        .spawn(agent_session, |internals| agent.run(internals))
+        .await?;
+
+    let mut output_rx = handle.subscribe();
+    let ev_tx = event_tx.clone();
+    let sid = session_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match output_rx.recv().await {
+                Ok(chunk) => {
+                    let event = ServerEvent::Chunk {
+                        session_id: sid.clone(),
+                        chunk,
+                    };
+                    if ev_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(%sid, "output forwarder lagged by {n}");
+                }
+            }
+        }
+    });
+
+    Ok(handle)
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
@@ -297,6 +486,7 @@ async fn handle_connection(
     session_storage: Arc<crate::session::SessionStorage>,
     tools: Arc<ToolRegistry>,
     runtime: AgentRuntime,
+    projects: Arc<ProjectManager>,
 ) {
     let (reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
@@ -307,6 +497,12 @@ async fn handle_connection(
 
     // Sessions created on THIS connection (session_id → handle).
     let sessions: Arc<Mutex<HashMap<String, AgentHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Active project per session on this connection (session_id → worktree).
+    // The persisted session metadata is the source of truth across restarts;
+    // this map mirrors it for the live connection.
+    let session_projects: Arc<Mutex<HashMap<String, ActiveProject>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // --- writer task (sole writer to the socket) -------------------------
     let writer_handle = {
@@ -381,6 +577,22 @@ async fn handle_connection(
             continue;
         }
 
+        // list_projects doesn't need a session_id either.
+        if req.msg_type == "list_projects" {
+            match projects.list().await {
+                Ok(projects) => {
+                    let _ = event_tx.send(ServerEvent::ProjectList { projects });
+                }
+                Err(e) => {
+                    tracing::warn!("list_projects error: {e}");
+                    let _ = event_tx.send(ServerEvent::ProjectList {
+                        projects: Vec::new(),
+                    });
+                }
+            }
+            continue;
+        }
+
         let session_id = match req.session_id {
             Some(ref s) if !s.is_empty() => s.clone(),
             _ => {
@@ -392,9 +604,74 @@ async fn handle_connection(
         match req.msg_type.as_str() {
             "run" | "message" => {
                 let mut sessions_lock = sessions.lock().await;
-                let is_new = !sessions_lock.contains_key(&session_id);
+                let mut session_projects_lock = session_projects.lock().await;
 
-                if is_new {
+                let is_new = !sessions_lock.contains_key(&session_id);
+                let current_project = session_projects_lock.get(&session_id).cloned();
+
+                // Resolve the project this session should be bound to,
+                // re-creating a missing worktree on the fly:
+                // - the request carries one → use it (switch if different),
+                // - no request project but the session is already bound →
+                //   keep the existing binding (a plain message must never
+                //   silently drop a session's project),
+                // - otherwise no project.
+                let desired_project: Option<ActiveProject> = match (&req.project, &current_project)
+                {
+                    (Some(requested), _) => {
+                        match resolve_project_context(&projects, &session_id, Some(requested), None)
+                            .await
+                        {
+                            Some(active) => Some(active),
+                            None => {
+                                let _ = event_tx.send(ServerEvent::SystemMsg {
+                                    message: format!(
+                                        "Cannot use project '{}': worktree unavailable",
+                                        requested.project.name
+                                    ),
+                                });
+                                None
+                            }
+                        }
+                    }
+                    (None, Some(existing)) => {
+                        resolve_project_context(&projects, &session_id, None, Some(existing)).await
+                    }
+                    (None, None) => None,
+                };
+
+                // Switching projects on an existing session (or a run that
+                // carries a project for a session created without one)
+                // requires re-creating the session with new tools.
+                let project_changed = !is_new
+                    && desired_project.as_ref().map(|p| p.project.name.clone())
+                        != current_project.as_ref().map(|p| p.project.name.clone());
+
+                if is_new || project_changed {
+                    if !is_new {
+                        // Tear down the old handle before re-creating.
+                        if let Some(handle) = sessions_lock.remove(&session_id) {
+                            let _ = handle.shutdown().await;
+                        }
+                        session_projects_lock.remove(&session_id);
+                        if let Some(old) = current_project {
+                            if Some(old.project.name.as_str())
+                                != desired_project.as_ref().map(|p| p.project.name.as_str())
+                            {
+                                // This session's old worktree only — other
+                                // sessions' worktrees are never touched.
+                                if let Err(e) = projects.remove_worktree(&old).await {
+                                    tracing::warn!(
+                                        %session_id,
+                                        project = %old.project.name,
+                                        error = %e,
+                                        "remove old worktree"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     let config = req.config.unwrap_or_default();
 
                     // Apply model from request if provided (on session creation only)
@@ -415,70 +692,46 @@ async fn handle_connection(
                         });
                     }
 
-                    // --- create session ----------------------------------
-                    let storage = SessionStorage::with_dir("./sessions");
                     // Read system prompt from OMEGA_SYSTEM_PROMPT_PATH file, or empty
                     let system_prompt = env::var("OMEGA_SYSTEM_PROMPT_PATH")
                         .ok()
                         .and_then(|p| std::fs::read_to_string(p).ok())
                         .unwrap_or_default();
 
-                    let agent_session = match AgentSession::new_with_storage(
+                    let session_tools =
+                        tools_for_session(&tools, desired_project.as_ref(), &session_id);
+                    let provider = current_provider.read().unwrap().clone();
+
+                    let handle = match create_session(
                         &session_id,
-                        "omega",
-                        "omega-tui",
-                        "A coding agent",
                         &system_prompt,
-                        storage,
-                    ) {
-                        Ok(s) => s,
+                        desired_project.as_ref(),
+                        session_tools,
+                        provider,
+                        config.think,
+                        config.no_cache,
+                        &runtime,
+                        &event_tx,
+                        &session_storage,
+                    )
+                    .await
+                    {
+                        Ok(h) => h,
                         Err(e) => {
                             tracing::error!(%session_id, "create session: {e}");
                             continue;
                         }
                     };
 
-                    // --- build agent config -------------------------------
-                    let mut agent_cfg = AgentConfig::new()
-                        .with_tools(tools.clone())
-                        .with_prompt_caching(!config.no_cache);
-
-                    if config.think {
-                        agent_cfg = agent_cfg.with_thinking(16000);
+                    if let Some(active) = &desired_project {
+                        session_projects_lock.insert(session_id.clone(), active.clone());
+                        tracing::info!(
+                            %session_id,
+                            project = %active.project.name,
+                            worktree = %active.worktree_path,
+                            "session bound to project worktree"
+                        );
                     }
-
-                    let agent =
-                        StandardAgent::new(agent_cfg, current_provider.read().unwrap().clone());
-
-                    // --- spawn agent task --------------------------------
-                    let handle = runtime
-                        .spawn(agent_session, |internals| agent.run(internals))
-                        .await
-                        .unwrap();
-
-                    // --- forward output chunks to the event channel -------
-                    let mut output_rx = handle.subscribe();
-                    let ev_tx = event_tx.clone();
-                    let sid = session_id.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            match output_rx.recv().await {
-                                Ok(chunk) => {
-                                    let event = ServerEvent::Chunk {
-                                        session_id: sid.clone(),
-                                        chunk,
-                                    };
-                                    if ev_tx.send(event).is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Closed) => break,
-                                Err(broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!(%sid, "output forwarder lagged by {n}");
-                                }
-                            }
-                        }
-                    });
 
                     // --- announce the new session -------------------------
                     let _ = event_tx.send(ServerEvent::Created {
@@ -501,6 +754,110 @@ async fn handle_connection(
                         }
                     }
                 }
+            }
+
+            "activate_project" => {
+                let Some(spec) = req.spec.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                else {
+                    let _ = event_tx.send(ServerEvent::SystemMsg {
+                        message: "Usage: /project <project-name|git-url>".to_string(),
+                    });
+                    continue;
+                };
+
+                let mut session_projects_lock = session_projects.lock().await;
+                let existing = session_projects_lock.get(&session_id).cloned();
+
+                let active = match projects
+                    .activate(spec, &session_id, existing.as_ref())
+                    .await
+                {
+                    Ok(active) => active,
+                    Err(e) => {
+                        tracing::warn!(%session_id, spec = %spec, error = %e, "activate_project failed");
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: format!("Cannot activate project '{spec}': {e}"),
+                        });
+                        continue;
+                    }
+                };
+
+                // The session now works inside the project's worktree. If a
+                // live session exists for a *different* project, recreate it
+                // so its tools point at the new worktree; if the session
+                // doesn't exist yet, create it now so the next run just
+                // forwards input.
+                let mut sessions_lock = sessions.lock().await;
+                let current = session_projects_lock.get(&session_id).cloned();
+                let needs_recreate = match sessions_lock.get(&session_id) {
+                    None => true,
+                    Some(_) => {
+                        current.as_ref().map(|c| c.project.name.as_str())
+                            != Some(active.project.name.as_str())
+                    }
+                };
+                if needs_recreate {
+                    if let Some(handle) = sessions_lock.remove(&session_id) {
+                        let _ = handle.shutdown().await;
+                    }
+                    if let Some(old) = current {
+                        if old.project.name != active.project.name {
+                            if let Err(e) = projects.remove_worktree(&old).await {
+                                tracing::warn!(
+                                    %session_id,
+                                    project = %old.project.name,
+                                    error = %e,
+                                    "remove old worktree on switch"
+                                );
+                            }
+                        }
+                    }
+
+                    let system_prompt = env::var("OMEGA_SYSTEM_PROMPT_PATH")
+                        .ok()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .unwrap_or_default();
+                    let session_tools = tools_for_session(&tools, Some(&active), &session_id);
+                    let provider = current_provider.read().unwrap().clone();
+
+                    match create_session(
+                        &session_id,
+                        &system_prompt,
+                        Some(&active),
+                        session_tools,
+                        provider,
+                        false,
+                        false,
+                        &runtime,
+                        &event_tx,
+                        &session_storage,
+                    )
+                    .await
+                    {
+                        Ok(handle) => {
+                            sessions_lock.insert(session_id.clone(), handle);
+                        }
+                        Err(e) => {
+                            tracing::error!(%session_id, "activate_project create session: {e}");
+                        }
+                    }
+                }
+                drop(sessions_lock);
+
+                session_projects_lock.insert(session_id.clone(), active.clone());
+
+                let _ = event_tx.send(ServerEvent::ProjectActive {
+                    project: active.project.clone(),
+                    worktree_path: active.worktree_path.clone(),
+                    branch: active.branch.clone(),
+                });
+                tracing::info!(
+                    %session_id,
+                    project = %active.project.name,
+                    worktree = %active.worktree_path,
+                    branch = %active.branch,
+                    "project activated"
+                );
             }
 
             "new_session" | "new" => {
@@ -528,7 +885,7 @@ async fn handle_connection(
                         // Load existing session from disk
                         let agent_session = match crate::session::AgentSession::load_with_storage(
                             &session_id,
-                            crate::session::SessionStorage::with_dir("./sessions"),
+                            SessionStorage::with_dir("./sessions"),
                         ) {
                             Ok(s) => s,
                             Err(e) => {
@@ -540,8 +897,27 @@ async fn handle_connection(
                             }
                         };
 
+                        // Restore the project binding from metadata so the
+                        // resumed session keeps working in its worktree.
+                        let persisted = active_from_metadata(&agent_session.metadata);
+                        let active = resolve_project_context(
+                            &projects,
+                            &session_id,
+                            None,
+                            persisted.as_ref(),
+                        )
+                        .await;
+                        if let Some(active) = &active {
+                            let mut meta = agent_session.metadata.clone();
+                            save_active_to_metadata(&mut meta, active);
+                            if let Err(e) = session_storage.save_metadata(&meta) {
+                                tracing::warn!(%session_id, "resume save project metadata: {e}");
+                            }
+                        }
+
                         let prov = current_provider.read().unwrap().clone();
-                        let agent_cfg = AgentConfig::new().with_tools(tools.clone());
+                        let session_tools = tools_for_session(&tools, active.as_ref(), &session_id);
+                        let agent_cfg = AgentConfig::new().with_tools(session_tools);
                         let agent = StandardAgent::new(agent_cfg, prov);
 
                         let handle = runtime
@@ -572,6 +948,12 @@ async fn handle_connection(
                             }
                         });
 
+                        if let Some(active) = &active {
+                            session_projects
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), active.clone());
+                        }
                         sessions_lock.insert(session_id.clone(), handle);
                     }
 
@@ -579,6 +961,16 @@ async fn handle_connection(
                         session_id: session_id.clone(),
                         session_name: session_id.clone(),
                     });
+
+                    // Re-announce the project binding so the client's status
+                    // line reflects the resumed session's worktree.
+                    if let Some(active) = session_projects.lock().await.get(&session_id).cloned() {
+                        let _ = event_tx.send(ServerEvent::ProjectActive {
+                            project: active.project.clone(),
+                            worktree_path: active.worktree_path.clone(),
+                            branch: active.branch.clone(),
+                        });
+                    }
 
                     // Load message history and replay it to the client,
                     // rendered exactly like a live conversation (no empty
@@ -624,11 +1016,29 @@ async fn handle_connection(
                 // Reload session from disk and re-spawn so the channel is fresh
                 match crate::session::AgentSession::load_with_storage(
                     &session_id,
-                    crate::session::SessionStorage::with_dir("./sessions"),
+                    SessionStorage::with_dir("./sessions"),
                 ) {
                     Ok(agent_session) => {
+                        // Keep the project binding across the compact.
+                        let persisted = active_from_metadata(&agent_session.metadata);
+                        let active = resolve_project_context(
+                            &projects,
+                            &session_id,
+                            None,
+                            persisted.as_ref(),
+                        )
+                        .await;
+                        if let Some(active) = &active {
+                            let mut meta = agent_session.metadata.clone();
+                            save_active_to_metadata(&mut meta, active);
+                            if let Err(e) = session_storage.save_metadata(&meta) {
+                                tracing::warn!(%session_id, "compact save project metadata: {e}");
+                            }
+                        }
+
                         let prov = current_provider.read().unwrap().clone();
-                        let agent_cfg = AgentConfig::new().with_tools(tools.clone());
+                        let session_tools = tools_for_session(&tools, active.as_ref(), &session_id);
+                        let agent_cfg = AgentConfig::new().with_tools(session_tools);
                         let agent = StandardAgent::new(agent_cfg, prov);
 
                         let handle = runtime
@@ -660,6 +1070,12 @@ async fn handle_connection(
                             }
                         });
 
+                        if let Some(active) = &active {
+                            session_projects
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), active.clone());
+                        }
                         sessions_lock.insert(session_id.clone(), handle);
 
                         let _ = event_tx.send(ServerEvent::SessionCompacted {
@@ -717,6 +1133,10 @@ async fn main() -> Result<()> {
     // Global shared SessionStorage for listing/resuming sessions.
     let session_storage = Arc::new(crate::session::SessionStorage::with_dir("./sessions"));
 
+    // Project store — registered repos + per-session git worktrees.
+    let projects = Arc::new(ProjectManager::new());
+    let projects_root = projects.root().display().to_string();
+
     let socket_path =
         env::var("OMEGA_LOOP_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
 
@@ -729,8 +1149,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "?".to_string());
     {
         let prov = current_provider.read().unwrap();
-        tracing::info!(socket = %socket_path, cwd = %cwd, model = %prov.model(), "omega-loop started");
-        eprintln!("omega-loop ({}) listening on {socket_path}", prov.model());
+        tracing::info!(socket = %socket_path, cwd = %cwd, projects = %projects_root, model = %prov.model(), "omega-loop started");
+        eprintln!(
+            "omega-loop ({}) listening on {socket_path} (projects: {projects_root})",
+            prov.model()
+        );
     }
 
     loop {
@@ -741,12 +1164,14 @@ async fn main() -> Result<()> {
                 let session_storage = session_storage.clone();
                 let tools = tools.clone();
                 let runtime = runtime.clone();
+                let projects = projects.clone();
                 tokio::spawn(handle_connection(
                     stream,
                     current_provider,
                     session_storage,
                     tools,
                     runtime,
+                    projects,
                 ));
             }
             Err(e) => {
@@ -761,6 +1186,161 @@ mod tests {
     use super::*;
     use omega_llm::{ContentBlock, Message};
     use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // Project helpers — system context + metadata round-trip + worktree
+    // re-creation
+    // -----------------------------------------------------------------------
+
+    fn sample_active(name: &str, worktree: &str) -> ActiveProject {
+        ActiveProject {
+            project: ProjectInfo {
+                name: name.to_string(),
+                url: format!("https://example.com/{name}.git"),
+                default_branch: Some("main".to_string()),
+                created_at: Default::default(),
+            },
+            worktree_path: worktree.to_string(),
+            branch: "omega/sess-abc123".to_string(),
+        }
+    }
+
+    #[test]
+    fn project_system_context_includes_repo_and_worktree() {
+        let active = sample_active("omega", "/tmp/wt/omega/sess-1");
+        let ctx = project_system_context(&active);
+        assert!(ctx.contains("omega"), "context mentions project name");
+        assert!(ctx.contains("https://example.com/omega.git"));
+        assert!(ctx.contains("/tmp/wt/omega/sess-1"));
+        assert!(ctx.contains("omega/sess-abc123"));
+        assert!(ctx.contains("git worktree"));
+    }
+
+    #[test]
+    fn active_project_metadata_round_trips() {
+        let active = sample_active("omega", "/tmp/wt/omega/sess-1");
+        let mut meta =
+            crate::session::metadata::SessionMetadata::new("sess-1", "omega", "omega-tui", "d");
+        save_active_to_metadata(&mut meta, &active);
+        let loaded = active_from_metadata(&meta).expect("should deserialize");
+        assert_eq!(loaded.project.name, "omega");
+        assert_eq!(loaded.worktree_path, "/tmp/wt/omega/sess-1");
+        assert_eq!(loaded.branch, "omega/sess-abc123");
+    }
+
+    #[test]
+    fn active_project_metadata_none_when_unset() {
+        let meta =
+            crate::session::metadata::SessionMetadata::new("sess-1", "omega", "omega-tui", "d");
+        assert!(active_from_metadata(&meta).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_project_context_prefers_requested_over_persisted() {
+        let (projects, remote_a, remote_b) = projects_fixture().await;
+        let requested = projects.activate(&remote_a, "sess-1", None).await.unwrap();
+        let persisted = projects.activate(&remote_b, "sess-1", None).await.unwrap();
+
+        let resolved =
+            resolve_project_context(&projects, "sess-1", Some(&requested), Some(&persisted))
+                .await
+                .expect("requested worktree exists");
+        assert_eq!(resolved.project.name, requested.project.name);
+    }
+
+    #[tokio::test]
+    async fn resolve_project_context_falls_back_to_persisted() {
+        let (projects, remote_a, _) = projects_fixture().await;
+        let persisted = projects.activate(&remote_a, "sess-1", None).await.unwrap();
+
+        let resolved = resolve_project_context(&projects, "sess-1", None, Some(&persisted))
+            .await
+            .expect("persisted worktree exists");
+        assert_eq!(resolved.project.name, persisted.project.name);
+    }
+
+    /// Two throwaway git remotes (with one commit each) + a throwaway store.
+    async fn projects_fixture() -> (ProjectManager, String, String) {
+        let store = TempDir::new().unwrap();
+        let projects = ProjectManager::with_root(store.path());
+        let a = init_remote_repo().await;
+        let b = init_remote_repo().await;
+        (projects, a, b)
+    }
+
+    /// A temp-dir git repo with one committed file, as a local "remote".
+    /// The temp dir is intentionally leaked (not cleaned up) so the repo
+    /// outlives this helper — tests run fast and the OS reclaims it.
+    async fn init_remote_repo() -> String {
+        let dir = TempDir::new().unwrap().keep();
+        tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "omega-test@example.com"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Omega Test"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("README.md"), "# Dummy\n")
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        dir.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn resolve_project_context_recreates_missing_worktree() {
+        let (projects, remote, _) = projects_fixture().await;
+        let first = projects.activate(&remote, "sess-1", None).await.unwrap();
+
+        // Simulate a worktree that vanished (daemon restart / manual rm).
+        let missing = ActiveProject {
+            project: first.project.clone(),
+            worktree_path: "/nonexistent/vanished-worktree".to_string(),
+            branch: first.branch.clone(),
+        };
+
+        let resolved = resolve_project_context(&projects, "sess-1", None, Some(&missing))
+            .await
+            .expect("should re-create a missing worktree");
+        assert_eq!(resolved.project.name, first.project.name);
+        assert!(
+            std::path::Path::new(&resolved.worktree_path).is_dir(),
+            "worktree must exist on disk: {}",
+            resolved.worktree_path
+        );
+        assert_ne!(resolved.worktree_path, missing.worktree_path);
+    }
+
+    #[tokio::test]
+    async fn resolve_project_context_none_without_project() {
+        let store = TempDir::new().unwrap();
+        let projects = ProjectManager::with_root(store.path());
+        assert!(resolve_project_context(&projects, "sess-1", None, None)
+            .await
+            .is_none());
+    }
 
     // -----------------------------------------------------------------------
     // history_to_replay — resume replay normalization
@@ -884,7 +1464,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = SessionStorage::with_dir(temp.path());
         for (id, conv) in names {
-            let mut meta = crate::session::metadata::SessionMetadata::new(*id, "omega", "omega-tui", "d");
+            let mut meta =
+                crate::session::metadata::SessionMetadata::new(*id, "omega", "omega-tui", "d");
             if !conv.is_empty() {
                 meta.set_conversation_name(*conv);
             }
@@ -904,12 +1485,8 @@ mod tests {
     fn list_sessions_excludes_empty_sessions() {
         let (storage, _t) = storage_with_sessions(&[("real", "Real chat")]);
         // A session with metadata only (no messages at all).
-        let mut empty_meta = crate::session::metadata::SessionMetadata::new(
-            "empty",
-            "omega",
-            "omega-tui",
-            "d",
-        );
+        let mut empty_meta =
+            crate::session::metadata::SessionMetadata::new("empty", "omega", "omega-tui", "d");
         empty_meta.set_conversation_name("Empty chat");
         storage.save_metadata(&empty_meta).unwrap();
         // A session with only an assistant message (no user prompt).
@@ -950,10 +1527,8 @@ mod tests {
 
     #[test]
     fn list_sessions_query_filters() {
-        let (storage, _t) = storage_with_sessions(&[
-            ("sess-fix", "Fix the build"),
-            ("sess-tui", "TUI tests"),
-        ]);
+        let (storage, _t) =
+            storage_with_sessions(&[("sess-fix", "Fix the build"), ("sess-tui", "TUI tests")]);
         let list = list_sessions_filtered(&storage, Some("build"));
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_id, "sess-fix");
@@ -983,12 +1558,7 @@ mod tests {
     fn list_sessions_excludes_subagents() {
         let (storage, _t) = storage_with_sessions(&[("parent", "Parent")]);
         let sub = crate::session::metadata::SessionMetadata::new_subagent(
-            "child",
-            "helper",
-            "Child",
-            "d",
-            "parent",
-            "tool_1",
+            "child", "helper", "Child", "d", "parent", "tool_1",
         );
         storage.save_metadata(&sub).unwrap();
         let list = list_sessions_filtered(&storage, None);
@@ -1000,7 +1570,9 @@ mod tests {
     fn session_info_last_message_truncated() {
         let (storage, _t) = storage_with_sessions(&[("sess", "")]);
         let long = "x".repeat(200);
-        storage.append_message("sess", &Message::user(&long)).unwrap();
+        storage
+            .append_message("sess", &Message::user(&long))
+            .unwrap();
         let meta = storage.load_metadata("sess").unwrap();
         let (info, blob) = build_session_info(&storage, "sess", &meta);
         let preview = info.last_message.unwrap();
@@ -1034,10 +1606,18 @@ mod tests {
     #[test]
     fn list_sessions_query_matches_earlier_message() {
         let (storage, _t) = storage_with_sessions(&[("sess-a", ""), ("sess-b", "")]);
-        storage.append_message("sess-a", &Message::user("lets discuss interrupt steering")).unwrap();
-        storage.append_message("sess-a", &Message::assistant("sure")).unwrap();
-        storage.append_message("sess-b", &Message::user("unrelated")).unwrap();
-        storage.append_message("sess-b", &Message::assistant("ok")).unwrap();
+        storage
+            .append_message("sess-a", &Message::user("lets discuss interrupt steering"))
+            .unwrap();
+        storage
+            .append_message("sess-a", &Message::assistant("sure"))
+            .unwrap();
+        storage
+            .append_message("sess-b", &Message::user("unrelated"))
+            .unwrap();
+        storage
+            .append_message("sess-b", &Message::assistant("ok"))
+            .unwrap();
 
         let list = list_sessions_filtered(&storage, Some("steering"));
         assert_eq!(list.len(), 1);

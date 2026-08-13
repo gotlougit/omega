@@ -16,7 +16,8 @@ use cli::{BlockId, Color, Event, Span, Style, StyledBlock, StyledText, Term, Ter
 use crossterm::event::KeyCode;
 use omega_core::core::SessionInfo;
 use omega_loop_client::{
-    connect, DaemonReader, DaemonWriter, OutputChunk, ServerEvent, SessionConfig,
+    connect, ActiveProject, DaemonReader, DaemonWriter, OutputChunk, ProjectInfo, ServerEvent,
+    SessionConfig,
 };
 
 mod markdown;
@@ -80,48 +81,95 @@ fn default_prompt() -> StyledText {
     StyledText::from(Span::new("▸ ", Style::default().fg(Color::DarkYellow)))
 }
 
-/// Prompt replacement shown while the `/sessions` picker is active: a hint
-/// line instead of an editable input. j/k and the arrow keys move the
-/// selection, Enter resumes, Esc cancels.
+/// Prompt replacement shown while a picker is active: a hint line instead of
+/// an editable input. j/k and the arrow keys move the selection, Enter
+/// selects, Esc cancels.
 fn picker_prompt() -> StyledText {
     StyledText::from(Span::new(
-        "  j/k or ↑/↓ move · PgUp/PgDn page · Enter resume · Esc cancel",
+        "  j/k or ↑/↓ move · PgUp/PgDn page · Enter select · Esc cancel",
         Style::default().fg(Color::DarkGrey),
     ))
 }
 
-/// How many sessions the `/sessions` picker shows at once. Each entry is a
-/// single line (the first user prompt, truncated), so the window is small by
-/// design — you scan a handful of recent chats and jump in with Enter.
+/// How many entries the pickers (`/sessions`, `/project`) show at once. Each
+/// entry is a single line, so the window is small by design — you scan a
+/// handful of recent chats/projects and jump in with Enter.
 const PICKER_WINDOW: usize = 5;
 
-/// Render the interactive `/sessions` window: at most [`PICKER_WINDOW`]
-/// sessions, one line each, scrolling as the selection moves. The line shows
-/// the session's first user prompt (truncated to fit); the raw session id is
-/// deliberately hidden — the number is only meaningful within this list.
+/// What the picker is currently listing.
+enum PickerKind {
+    Sessions(Vec<SessionInfo>),
+    Projects(Vec<ProjectInfo>),
+}
+
+impl PickerKind {
+    fn len(&self) -> usize {
+        match self {
+            PickerKind::Sessions(s) => s.len(),
+            PickerKind::Projects(p) => p.len(),
+        }
+    }
+
+    fn title(&self) -> String {
+        match self {
+            PickerKind::Sessions(s) => format!("Sessions ({}, newest first):", s.len()),
+            PickerKind::Projects(p) => format!("Projects ({}):", p.len()),
+        }
+    }
+
+    fn footer(&self) -> &'static str {
+        match self {
+            PickerKind::Sessions(_) => {
+                "j/k or ↑/↓ move · PgUp/PgDn page · Enter resume · Esc cancel"
+            }
+            PickerKind::Projects(_) => {
+                "j/k or ↑/↓ move · PgUp/PgDn page · Enter activate · Esc cancel"
+            }
+        }
+    }
+
+    fn fetching_label(&self) -> &'static str {
+        match self {
+            PickerKind::Sessions(_) => "Fetching sessions…",
+            PickerKind::Projects(_) => "Fetching projects…",
+        }
+    }
+
+    fn empty_label(&self) -> &'static str {
+        match self {
+            PickerKind::Sessions(_) => "(no saved sessions)",
+            PickerKind::Projects(_) => "(no registered projects)",
+        }
+    }
+}
+
+/// Render the interactive picker window: at most [`PICKER_WINDOW`] entries,
+/// one line each, scrolling as the selection moves. For sessions the line
+/// shows the first user prompt (truncated to fit; raw session ids are
+/// hidden); for projects it shows the project name plus its URL.
 /// Replaces the previous picker block in place so navigation never appends
 /// new blocks.
-fn render_session_picker(app: &mut AppState, handle: &TermHandle) {
+fn render_picker(app: &mut AppState, handle: &TermHandle) {
     let Some(picker) = app.picker.as_mut() else {
         return;
     };
     let (term_w, _) = handle.size();
-    let n = picker.sessions.len();
+    let n = picker.kind.len();
     // "▸ 12. " = marker (1) + right-aligned index (2) + ". " (2) columns
     // before the prompt text begins.
     let text_w = term_w.saturating_sub(5).max(8);
 
     let mut st = StyledText::new();
     if !picker.loaded && n == 0 {
-        st.push(Span::new("Fetching sessions…", s_system()));
+        st.push(Span::new(picker.kind.fetching_label(), s_system()));
     } else if n == 0 {
-        st.push(Span::new("(no saved sessions)", s_system()));
+        st.push(Span::new(picker.kind.empty_label(), s_system()));
         st.push(Span::new("\n", Style::default()));
         st.push(Span::new("  Esc to return", s_system()));
     } else {
         picker.selected = picker.selected.min(n - 1);
         let win = PICKER_WINDOW.min(n);
-        // Keep the selection inside the window, scrolling one session at a
+        // Keep the selection inside the window, scrolling one entry at a
         // time when it would leave.
         if picker.first > n.saturating_sub(win) {
             picker.first = n.saturating_sub(win);
@@ -136,32 +184,37 @@ fn render_session_picker(app: &mut AppState, handle: &TermHandle) {
         let sel = picker.selected;
         let end = (first + win).min(n);
 
-        st.push(Span::new(
-            format!("Sessions ({n}, newest first):\n"),
-            s_system(),
-        ));
+        st.push(Span::new(picker.kind.title() + "\n", s_system()));
         for i in first..end {
-            let s = &picker.sessions[i];
             let idx = i + 1;
             let is_sel = i == sel;
             let marker = if is_sel { "▸" } else { " " };
             let style = if is_sel { s_highlight() } else { s_assistant() };
-            // First user prompt, truncated to a single line; fall back to
-            // the conversation name, then a generic label — never the raw
-            // session id.
-            let text = s
-                .first_user_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .or_else(|| {
-                    s.conversation_name
+            let line = match &picker.kind {
+                PickerKind::Sessions(sessions) => {
+                    let s = &sessions[i];
+                    // First user prompt, truncated to a single line; fall
+                    // back to the conversation name, then a generic label —
+                    // never the raw session id.
+                    let text = s
+                        .first_user_message
                         .as_deref()
                         .map(str::trim)
                         .filter(|t| !t.is_empty())
-                })
-                .unwrap_or("(no messages)");
-            let line = cli::truncate_to_width(text, text_w);
+                        .or_else(|| {
+                            s.conversation_name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|t| !t.is_empty())
+                        })
+                        .unwrap_or("(no messages)");
+                    cli::truncate_to_width(text, text_w)
+                }
+                PickerKind::Projects(projects) => {
+                    let p = &projects[i];
+                    cli::truncate_to_width(&format!("{} — {}", p.name, p.url), text_w)
+                }
+            };
             st.push(Span::new(format!("{marker}{idx:>2}. {line}\n"), style));
         }
         // Footer: scroll indicators + key hints.
@@ -172,7 +225,7 @@ fn render_session_picker(app: &mut AppState, handle: &TermHandle) {
         if end < n {
             footer.push_str(&format!("↓ {} more · ", n - end));
         }
-        footer.push_str("j/k or ↑/↓ move · PgUp/PgDn page · Enter resume · Esc cancel");
+        footer.push_str(picker.kind.footer());
         st.push(Span::new(footer, s_system()));
     }
 
@@ -183,12 +236,12 @@ fn render_session_picker(app: &mut AppState, handle: &TermHandle) {
     }
 }
 
-/// Enter `/sessions` picker mode: swap the editable prompt for a hint,
-/// forward navigation keys to the app, and show a (possibly empty) list
-/// window. The daemon's reply arrives asynchronously and fills the window.
-fn enter_picker(app: &mut AppState, handle: &TermHandle) {
-    app.picker = Some(SessionPicker {
-        sessions: Vec::new(),
+/// Enter picker mode for the given kind: swap the editable prompt for a
+/// hint, forward navigation keys to the app, and show a (possibly empty)
+/// list window. The daemon's reply arrives asynchronously and fills it.
+fn enter_picker(app: &mut AppState, handle: &TermHandle, kind: PickerKind) {
+    app.picker = Some(Picker {
+        kind,
         selected: 0,
         first: 0,
         block_id: None,
@@ -198,11 +251,11 @@ fn enter_picker(app: &mut AppState, handle: &TermHandle) {
     handle.set_left_prompt(picker_prompt());
     handle.clear_status_line();
     handle.set_picker(true);
-    render_session_picker(app, handle);
+    render_picker(app, handle);
 }
 
-/// Leave `/sessions` picker mode: restore the editable prompt and remove the
-/// live list block (the transcript behind it stays untouched).
+/// Leave picker mode: restore the editable prompt and remove the live list
+/// block (the transcript behind it stays untouched).
 fn exit_picker(app: &mut AppState, handle: &TermHandle) {
     if let Some(picker) = app.picker.take() {
         if let Some(id) = picker.block_id {
@@ -217,26 +270,56 @@ fn exit_picker(app: &mut AppState, handle: &TermHandle) {
 /// Enter in picker mode: resume the highlighted session (like `/resume <n>`)
 /// and leave picker mode.
 fn picker_select(app: &mut AppState, handle: &TermHandle, cmd_tx: &Sender<DaemonCmd>) {
-    let name = {
+    let selection = {
         let Some(picker) = app.picker.as_ref() else {
             return;
         };
-        let Some(info) = picker.sessions.get(picker.selected) else {
-            return;
-        };
-        info.session_id.clone()
+        match &picker.kind {
+            PickerKind::Sessions(sessions) => {
+                let Some(info) = sessions.get(picker.selected) else {
+                    return;
+                };
+                PickerSelection::Session(info.session_id.clone())
+            }
+            PickerKind::Projects(projects) => {
+                let Some(info) = projects.get(picker.selected) else {
+                    return;
+                };
+                PickerSelection::Project(info.name.clone())
+            }
+        }
     };
-    app.session_id = name.clone();
-    handle.clear_output();
-    let _ = cmd_tx.send(DaemonCmd::Resume(name.clone()));
-    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-        format!("Resuming: {name}"),
-        s_system(),
-    ))));
+    match selection {
+        PickerSelection::Session(name) => {
+            app.session_id = name.clone();
+            handle.clear_output();
+            let _ = cmd_tx.send(DaemonCmd::Resume(name.clone()));
+            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                format!("Resuming: {name}"),
+                s_system(),
+            ))));
+        }
+        PickerSelection::Project(name) => {
+            let _ = cmd_tx.send(DaemonCmd::ActivateProject {
+                session_id: app.session_id.clone(),
+                spec: name,
+            });
+            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                "Activating project…",
+                s_system(),
+            ))));
+        }
+    }
     exit_picker(app, handle);
 }
 
-/// Handle a navigation key while the `/sessions` picker is active.
+/// What the user picked when pressing Enter in a picker.
+enum PickerSelection {
+    Session(String),
+    Project(String),
+}
+
+/// Handle a navigation key while a picker is active.
 fn handle_picker_key(
     app: &mut AppState,
     handle: &TermHandle,
@@ -260,7 +343,7 @@ fn handle_picker_key(
             }
         }
         KeyCode::Down => {
-            if !picker.sessions.is_empty() && picker.selected + 1 < picker.sessions.len() {
+            if picker.kind.len() > 0 && picker.selected + 1 < picker.kind.len() {
                 picker.selected += 1;
             }
         }
@@ -268,16 +351,15 @@ fn handle_picker_key(
             picker.selected = picker.selected.saturating_sub(PICKER_WINDOW);
         }
         KeyCode::PageDown => {
-            if !picker.sessions.is_empty() {
-                picker.selected =
-                    (picker.selected + PICKER_WINDOW).min(picker.sessions.len() - 1);
+            if picker.kind.len() > 0 {
+                picker.selected = (picker.selected + PICKER_WINDOW).min(picker.kind.len() - 1);
             }
         }
         KeyCode::Home => picker.selected = 0,
-        KeyCode::End => picker.selected = picker.sessions.len().saturating_sub(1),
+        KeyCode::End => picker.selected = picker.kind.len().saturating_sub(1),
         _ => return,
     }
-    render_session_picker(app, handle);
+    render_picker(app, handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +370,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Change model   (/model <name>)"),
     ("/models", "List available models"),
     ("/sessions", "List & resume sessions, newest first   (/sessions [search])"),
+    ("/project", "Work on a project   (/project [name|git-url])"),
     ("/new", "Create a new session   (/new [id])"),
     ("/compact", "Compact session history"),
     ("/interrupt", "Interrupt the agent"),
@@ -311,6 +394,7 @@ enum DaemonCmd {
         session_id: String,
         content: String,
         model: Option<String>,
+        project: Option<ActiveProject>,
     },
     SetModel {
         session_id: String,
@@ -319,6 +403,13 @@ enum DaemonCmd {
     ListModels,
     /// Fetch the session list, optionally filtered by a search query.
     ListSessions(Option<String>),
+    /// Fetch the registered project list.
+    ListProjects,
+    /// Activate a project (name or git URL) for a session.
+    ActivateProject {
+        session_id: String,
+        spec: String,
+    },
     Resume(String),
     Compact(String),
     Interrupt(String),
@@ -369,6 +460,7 @@ async fn daemon_loop(
                     session_id,
                     content,
                     model,
+                    project,
                 }) => {
                     if let Err(e) = writer
                         .send_run(
@@ -376,6 +468,7 @@ async fn daemon_loop(
                             &content,
                             &SessionConfig::default(),
                             model.as_deref(),
+                            project.as_ref(),
                         )
                         .await
                     {
@@ -398,6 +491,18 @@ async fn daemon_loop(
                 Ok(DaemonCmd::ListSessions(query)) => {
                     if let Err(e) = writer.send_list_sessions(query.as_deref()).await {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "send_list_sessions failed");
+                        let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                    }
+                }
+                Ok(DaemonCmd::ListProjects) => {
+                    if let Err(e) = writer.send_list_projects().await {
+                        tracing::error!(target: "omega_tui::daemon", error = %e, "send_list_projects failed");
+                        let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                    }
+                }
+                Ok(DaemonCmd::ActivateProject { session_id, spec }) => {
+                    if let Err(e) = writer.send_activate_project(&session_id, &spec).await {
+                        tracing::error!(target: "omega_tui::daemon", error = %e, "send_activate_project failed");
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                     }
                 }
@@ -821,10 +926,57 @@ fn handle_daemon_event(
             // Only `/sessions` requests the list, and it always opens the
             // picker — so there is nothing to render without one.
             if let Some(picker) = app.picker.as_mut() {
-                picker.sessions = sessions;
-                picker.loaded = true;
-                render_session_picker(app, handle);
+                if let PickerKind::Sessions(s) = &mut picker.kind {
+                    *s = sessions;
+                    picker.loaded = true;
+                    render_picker(app, handle);
+                }
             }
+        }
+        ServerEvent::ProjectList { projects } => {
+            // Only bare `/project` requests the list, and it always opens
+            // the picker.
+            if let Some(picker) = app.picker.as_mut() {
+                if let PickerKind::Projects(p) = &mut picker.kind {
+                    *p = projects;
+                    picker.loaded = true;
+                    render_picker(app, handle);
+                }
+            }
+        }
+        ServerEvent::ProjectActive {
+            project,
+            worktree_path,
+            branch,
+        } => {
+            // The daemon sends this in response to the client's own
+            // activate_project request (or on resume of a project-bound
+            // session), so it always belongs to the current session.
+            app.project = Some(ActiveProject {
+                project,
+                worktree_path,
+                branch,
+            });
+            let name = app
+                .project
+                .as_ref()
+                .map(|p| p.project.name.as_str())
+                .unwrap_or("?");
+            let wt = app
+                .project
+                .as_ref()
+                .map(|p| p.worktree_path.as_str())
+                .unwrap_or("?");
+            let br = app
+                .project
+                .as_ref()
+                .map(|p| p.branch.as_str())
+                .unwrap_or("?");
+            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                format!("Project active: {name} — worktree: {wt} (branch {br})"),
+                s_highlight(),
+            ))));
+            refresh_cache_status(handle, app);
         }
         ServerEvent::SessionResumed {
             session_id,
@@ -995,26 +1147,31 @@ struct AppState {
     /// (via `ModelChanged` on session creation, or from `OPENAI_MODEL` env).
     model: Option<String>,
     cache: CacheStats,
-    /// Active `/sessions` picker, if the user is currently navigating the
-    /// session list interactively (j/k or arrows, Enter to resume).
-    picker: Option<SessionPicker>,
+    /// Active `/sessions` or `/project` picker, if the user is currently
+    /// navigating a list interactively (j/k or arrows, Enter to select).
+    picker: Option<Picker>,
+    /// Active project bound to the current session (git worktree), if any.
+    /// Sent with every `Run` so the daemon keeps the session's tools rooted
+    /// in the worktree.
+    project: Option<ActiveProject>,
 }
 
-/// Interactive `/sessions` navigation state.
+/// Interactive picker navigation state (shared by `/sessions` and
+/// `/project`).
 ///
 /// The list is rendered as a single live block showing only a limited
 /// number of rows (the terminal-height-sized window) at a time; the window
-/// scrolls to keep the highlighted session visible.
-struct SessionPicker {
-    sessions: Vec<SessionInfo>,
-    /// Index of the highlighted session.
+/// scrolls to keep the highlighted entry visible.
+struct Picker {
+    kind: PickerKind,
+    /// Index of the highlighted entry.
     selected: usize,
-    /// First session visible in the window.
+    /// First entry visible in the window.
     first: usize,
     /// Block id of the live list block (replaced on every move).
     block_id: Option<BlockId>,
-    /// True once a `SessionList` has arrived — distinguishes "fetching…"
-    /// from a genuinely empty list.
+    /// True once the list has arrived (SessionList / ProjectList) —
+    /// distinguishes "fetching…" from a genuinely empty list.
     loaded: bool,
 }
 
@@ -1042,6 +1199,7 @@ fn process_line(
             session_id: app.session_id.clone(),
             content: line.to_string(),
             model: app.model.clone(),
+            project: app.project.clone(),
         });
         return LineOutcome::Continue;
     }
@@ -1058,6 +1216,7 @@ fn process_line(
         "/clear",
         "/models",
         "/sessions",
+        "/project",
         "/interrupt",
         "/compact",
         "/model",
@@ -1073,6 +1232,7 @@ fn process_line(
             session_id: app.session_id.clone(),
             content: line.to_string(),
             model: app.model.clone(),
+            project: app.project.clone(),
         });
         return LineOutcome::Continue;
     }
@@ -1110,7 +1270,28 @@ fn process_line(
             let _ = cmd_tx.send(DaemonCmd::ListSessions(query));
             // Enter the interactive picker: the window shows "Fetching
             // sessions…" until the daemon's SessionList reply arrives.
-            enter_picker(app, handle);
+            enter_picker(app, handle, PickerKind::Sessions(Vec::new()));
+        }
+        "/project" => {
+            match parts.get(1) {
+                // `/project <name|url>` — activate directly.
+                Some(spec) => {
+                    let spec = spec.to_string();
+                    let _ = cmd_tx.send(DaemonCmd::ActivateProject {
+                        session_id: app.session_id.clone(),
+                        spec,
+                    });
+                    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                        "Activating project…",
+                        s_system(),
+                    ))));
+                }
+                // Bare `/project` — interactive picker of registered projects.
+                None => {
+                    let _ = cmd_tx.send(DaemonCmd::ListProjects);
+                    enter_picker(app, handle, PickerKind::Projects(Vec::new()));
+                }
+            }
         }
         "/interrupt" => {
             let _ = cmd_tx.send(DaemonCmd::Interrupt(app.session_id.clone()));
@@ -1152,6 +1333,7 @@ fn process_line(
                 session_id: name.clone(),
                 content: String::new(),
                 model: app.model.clone(),
+                project: app.project.clone(),
             });
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("New session: {name}"),
@@ -1245,9 +1427,14 @@ fn run_loop(
                 if status_pending.is_some() {
                     if let ServerEvent::ModelList { models } = &ev {
                         status_pending = None;
+                        let project_label = app
+                            .project
+                            .as_ref()
+                            .map(|p| format!(" | project: {}", p.project.name))
+                            .unwrap_or_default();
                         handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                             format!(
-                                "✓ omega-loop connection OK — session: {} | model: {} | {} model(s) available",
+                                "✓ omega-loop connection OK — session: {} | model: {}{project_label} | {} model(s) available",
                                 app.session_id,
                                 app.model.as_deref().unwrap_or("?"),
                                 models.len(),
@@ -1423,6 +1610,7 @@ fn main() -> Result<()> {
             session_id: session_id.clone(),
             content: String::new(),
             model: env_model.clone(),
+            project: None,
         })
         .ok();
 
@@ -1432,6 +1620,7 @@ fn main() -> Result<()> {
         model: env_model,
         cache: CacheStats::default(),
         picker: None,
+        project: None,
     };
 
     // ── Welcome (printed immediately — no daemon round-trip) ───────────
@@ -1509,6 +1698,7 @@ mod tests {
                 model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
                 picker: None,
+                project: None,
             },
             streaming: Streaming {
                 block_id: None,
@@ -1959,6 +2149,7 @@ mod tests {
                 model: Some("gpt-a".to_string()),
                 cache: CacheStats::default(),
                 picker: None,
+                project: None,
             },
             app_tx,
             app_rx,
@@ -5543,7 +5734,6 @@ mod tests {
         fx.shutdown();
     }
 
-    #[test]
     /// After setting a status line (e.g. cache info) the cursor should be at the
     /// correct visual row — in the prompt area, not overlapping the status line.
     #[test]
@@ -6423,6 +6613,251 @@ mod tests {
         assert!(fx.app.picker.is_some());
         exit_picker(&mut fx.app, &fx.handle);
         assert!(fx.app.picker.is_none());
+    }
+
+    // =========================================================================
+    // /project — list registered projects, activate one, bind session
+    // =========================================================================
+
+    fn sample_project(name: &str, url: &str) -> ProjectInfo {
+        ProjectInfo {
+            name: name.to_string(),
+            url: url.to_string(),
+            default_branch: Some("main".to_string()),
+            created_at: Default::default(),
+        }
+    }
+
+    /// Bare `/project` opens the interactive project picker and asks the
+    /// daemon for the registered project list.
+    #[test]
+    fn project_command_enters_picker() {
+        let mut fx = fixture();
+        process_line("/project", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert!(fx.app.picker.is_some());
+        assert!(fx.handle.picker_active());
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ListProjects) => {}
+            other => panic!("expected ListProjects, got {other:?}"),
+        }
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Fetching projects"), 1);
+    }
+
+    /// `/project <name|url>` activates directly without the picker.
+    #[test]
+    fn project_command_with_spec_activates() {
+        let mut fx = fixture();
+        process_line("/project omega", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert!(fx.app.picker.is_none(), "no picker for direct activation");
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ActivateProject { session_id, spec }) => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(spec, "omega");
+            }
+            other => panic!("expected ActivateProject, got {other:?}"),
+        }
+    }
+
+    /// The project picker renders registered projects as name — URL rows
+    /// (truncated to fit the terminal width).
+    #[test]
+    fn project_picker_renders_projects() {
+        let mut fx = fixture();
+        process_line("/project", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectList {
+                projects: vec![
+                    sample_project("omega", "https://a.io/omega.git"),
+                    sample_project("other", "https://b.io/other.git"),
+                ],
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Projects (2):"), 1);
+        assert_eq!(count_rows_containing(&fx, "1. omega — https://a.io/omega.git"), 1);
+        assert_eq!(count_rows_containing(&fx, "2. other — https://b.io/other.git"), 1);
+        assert_eq!(count_rows_containing(&fx, "Enter"), 1, "footer mentions Enter");
+        assert_eq!(count_rows_containing(&fx, "activate"), 1, "footer mentions activate");
+    }
+
+    /// Empty project list keeps the picker open with a placeholder.
+    #[test]
+    fn project_picker_empty_shows_placeholder() {
+        let mut fx = fixture();
+        process_line("/project", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectList { projects: vec![] },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "(no registered projects)"), 1);
+        assert!(fx.app.picker.is_some());
+        exit_picker(&mut fx.app, &fx.handle);
+        assert!(fx.app.picker.is_none());
+    }
+
+    /// Enter in the project picker activates the highlighted project for
+    /// the current session and leaves picker mode.
+    #[test]
+    fn project_picker_enter_activates_selected() {
+        let mut fx = fixture();
+        process_line("/project", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectList {
+                projects: vec![
+                    sample_project("first", "https://example.com/first.git"),
+                    sample_project("second", "https://example.com/second.git"),
+                ],
+            },
+        );
+        // Move down to the second project, then select it.
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Down);
+        handle_picker_key(&mut fx.app, &fx.handle, &fx.cmd_tx, KeyCode::Enter);
+        assert!(fx.app.picker.is_none(), "picker closes after selecting");
+        assert!(!fx.handle.picker_active());
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ListProjects) => {}
+            other => panic!("expected ListProjects first, got {other:?}"),
+        }
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::ActivateProject { session_id, spec }) => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(spec, "second");
+            }
+            other => panic!("expected ActivateProject, got {other:?}"),
+        }
+    }
+
+    /// Esc in the project picker cancels without activating anything.
+    #[test]
+    fn project_picker_escape_cancels() {
+        let mut fx = fixture();
+        process_line("/project", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectList {
+                projects: vec![sample_project("omega", "https://example.com/omega.git")],
+            },
+        );
+        assert!(fx.handle.picker_active());
+        exit_picker(&mut fx.app, &fx.handle);
+        assert!(fx.app.picker.is_none());
+        assert!(!matches!(
+            fx.cmd_rx.try_recv(),
+            Ok(DaemonCmd::ActivateProject { .. })
+        ));
+        assert!(fx.app.project.is_none(), "no project bound on cancel");
+    }
+
+    /// A ProjectActive event from the daemon binds the project to the app
+    /// and renders the confirmation.
+    #[test]
+    fn project_active_event_binds_and_renders() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectActive {
+                project: sample_project("omega", "https://example.com/omega.git"),
+                worktree_path: "/tmp/wt/omega/sess-1-ab12cd".into(),
+                branch: "omega/sess-1-ab12cd".into(),
+            },
+        );
+        fx.handle.redraw_sync();
+        let project = fx.app.project.as_ref().expect("project bound");
+        assert_eq!(project.project.name, "omega");
+        assert_eq!(project.worktree_path, "/tmp/wt/omega/sess-1-ab12cd");
+        assert_eq!(project.branch, "omega/sess-1-ab12cd");
+        assert_eq!(count_rows_containing(&fx, "Project active: omega"), 1);
+        assert_eq!(count_rows_containing(&fx, "worktree:"), 1);
+        assert_eq!(count_rows_containing(&fx, "(branch omega/sess"), 1);
+    }
+
+    /// A bound project is attached to every Run command, so the daemon keeps
+    /// the session's tools rooted in the worktree.
+    #[test]
+    fn run_sends_bound_project() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectActive {
+                project: sample_project("omega", "https://example.com/omega.git"),
+                worktree_path: "/tmp/wt/omega/sess-1".into(),
+                branch: "omega/sess-1-abc".into(),
+            },
+        );
+        process_line("hello agent", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Run {
+                session_id,
+                content,
+                project,
+                ..
+            }) => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(content, "hello agent");
+                let project = project.expect("bound project must be sent");
+                assert_eq!(project.project.name, "omega");
+                assert_eq!(project.branch, "omega/sess-1-abc");
+            }
+            other => panic!("expected Run with project, got {other:?}"),
+        }
+    }
+
+    /// Sessions without a project send Run without one.
+    #[test]
+    fn run_without_project_sends_none() {
+        let mut fx = fixture();
+        process_line("hello", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Run { project, .. }) => assert!(project.is_none()),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// The active project survives a /new session switch (it is a property
+    /// of the TUI session context, re-sent with each Run).
+    #[test]
+    fn new_session_keeps_project_binding() {
+        let mut fx = fixture();
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectActive {
+                project: sample_project("omega", "https://example.com/omega.git"),
+                worktree_path: "/tmp/wt/omega/sess-1".into(),
+                branch: "omega/sess-1-abc".into(),
+            },
+        );
+        process_line("/new other-session", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        assert_eq!(fx.app.session_id, "other-session");
+        assert!(fx.app.project.is_some(), "project binding kept across /new");
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Run {
+                session_id,
+                project,
+                ..
+            }) => {
+                assert_eq!(session_id, "other-session");
+                assert!(project.is_some(), "new session run carries the project");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 
     // =========================================================================

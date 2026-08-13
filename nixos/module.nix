@@ -105,7 +105,7 @@ let
 
     Work is performed under the "${clankerUser}" user.
     Your home directory is ${clankerHome}.
-    You can create project directories under ${clankerHome}/projects/
+    You can create project directories under ${cfg.projectsDir}
     or clone repos there.
   '';
 
@@ -251,6 +251,18 @@ in
       defaultText = literalExpression ''"/persist/clanker/omega/sessions"'';
       description = "Directory where omega-loop stores session data.";
     };
+
+    projectsDir = mkOption {
+      type = types.path;
+      default = "${clankerHome}/projects";
+      defaultText = literalExpression ''"/persist/clanker/projects"'';
+      description = ''
+        Directory where omega-loop keeps the project store (registered repos
+        + per-session git worktrees).  Defaults to a directory inside the
+        configured home folder.  Exported to the daemon as
+        OMEGA_PROJECTS_DIR.
+      '';
+    };
   };
 
   # -----------------------------------------------------------------------
@@ -366,6 +378,7 @@ in
           "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
           "OMEGA_SOCKET_PATH=${omegaShSocket}"
           "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
+          "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
           "RUST_LOG=${cfg.logLevel}"
         ];
 
@@ -394,6 +407,7 @@ in
 
       preStart = ''
         mkdir -p '${cfg.sessionDir}'
+        mkdir -p '${cfg.projectsDir}'
         ln -sfT '${cfg.sessionDir}' "${omegaDir}/sessions" 2>/dev/null || true
       '';
     };
