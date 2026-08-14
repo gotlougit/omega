@@ -8,6 +8,12 @@
 #
 # The clanker user has git, nix, and ripgrep available so the agent can
 # clone repos, run nix flakes, etc., without ever needing sudo/wheel.
+#
+# Optionally, home-manager can be enabled for the clanker user
+# (services.omega.homeManager) so that user-scoped configuration — git
+# identity, ssh-agent, shell setup, etc. — can be written inline here and
+# injected into home-manager, keeping all the omega-related configuration
+# in one place.
 # ---------------------------------------------------------------------------
 
 {
@@ -15,13 +21,25 @@
   lib,
   pkgs,
   ...
-}:
+}@args:
 
 let
+  # The home-manager flake input.  The flake output `nixosModules.omega`
+  # calls this module with `args // { inherit home-manager; }`, so this is
+  # set when the module is used through the flake and null when it is
+  # imported directly (e.g. `import ./nixos/module.nix`).  Reading it from
+  # the raw call args (not from `config`) keeps it usable in `imports` —
+  # config-dependent imports would recurse.
+  home-manager = args.home-manager or null;
+
   inherit (lib)
     mkIf
     mkEnableOption
+    mkMerge
     mkOption
+    mkDefault
+    optional
+    optionalAttrs
     types
     literalExpression
     ;
@@ -268,162 +286,255 @@ in
         OMEGA_PROJECTS_DIR.
       '';
     };
+
+    homeManager = mkOption {
+      type = types.submodule {
+        options = {
+          enable = mkEnableOption "home-manager configuration for the clanker user";
+
+          config = mkOption {
+            type = types.attrs;
+            default = { };
+            example = literalExpression ''
+              {
+                programs.git = {
+                  enable = true;
+                  userName = "Clanker";
+                  userEmail = "clanker@example.com";
+                };
+                services.ssh-agent.enable = true;
+              }
+            '';
+            description = ''
+              Home-manager configuration for the clanker user, written as an
+              attribute set.  When `enable` is true, this is injected into
+              home-manager's `home-manager.users.${clankerUser}` module, so
+              user-scoped configuration (git identity, ssh-agent, shell
+              setup, ...) can be kept right here together with the rest of
+              the omega configuration.
+
+              Any home-manager option can be set here — the value is merged
+              with the module's built-in defaults (home directory, username,
+              state version).  Home-manager's NixOS module is imported
+              automatically, so no separate home-manager wiring is needed.
+            '';
+          };
+        };
+      };
+      default = { };
+      description = ''
+        Optional home-manager integration for the clanker user.
+
+        When enabled, home-manager's NixOS module is wired up for the
+        clanker user and `config` is injected as its home-manager
+        configuration.
+      '';
+    };
   };
 
   # -----------------------------------------------------------------------
   # Config
   # -----------------------------------------------------------------------
-  config = mkIf cfg.enable {
+  #
+  # Home-manager's NixOS module is imported unconditionally (when the
+  # home-manager input is available) so the `home-manager.users.<user>`
+  # option namespace exists; the actual per-user wiring below is gated on
+  # `cfg.homeManager.enable`.  Imports cannot depend on `config` (it would
+  # recurse), and even `mkIf false` definitions of undeclared options
+  # error, so this is the only safe structure.
+  imports = optional (home-manager != null) home-manager.nixosModules.home-manager;
 
-    # ----- users & groups ------------------------------------------------
-    users.groups.${clankerGroup} = {
-      members = cfg.humanUsers;
-    };
+  config = mkIf cfg.enable (
+    {
+      assertions = [
+        {
+          assertion = !cfg.homeManager.enable || home-manager != null;
+          message = ''
+            services.omega.homeManager.enable = true requires access to a
+            home-manager input, but this module was imported without one.
 
-    users.users.${clankerUser} = {
-      isNormalUser = true;
-      home = clankerHome;
-      group = clankerGroup;
-      extraGroups = cfg.extraGroups;
-      packages = cfg.packages;
-      createHome = true;
-      description = "Omega agent service user";
-    };
-
-    # ----- system prompt file --------------------------------------------
-    environment.etc."omega/system-prompt.md".text = systemPrompt;
-
-    # ----- tmpfiles: runtime directory with correct permissions ----------
-    systemd.tmpfiles.rules = [
-      "d /run/omega 0770 ${clankerUser} ${clankerGroup} -"
-      "d ${omegaDir} 0770 ${clankerUser} ${clankerGroup} -"
-    ];
-
-    # ----- systemd services ----------------------------------------------
-
-    # omega-sh — filesystem/shell tool daemon
-    systemd.services.omega-sh = {
-      description = "Omega-sh daemon (filesystem/shell tools)";
-      after = [ "network.target" ];
-      wantedBy = [ "multi-user.target" ];
-      # Always include bashInteractive and coreutils in the path so the
-      # shell tool (Command::new("bash")) and basic utilities are available,
-      # regardless of what the user puts in cfg.packages.
-      path =
-        with pkgs;
-        [
-          bashInteractive
-          coreutils
-        ]
-        ++ cfg.packages;
-
-      serviceConfig = {
-        User = clankerUser;
-        Group = clankerGroup;
-
-        Type = "simple";
-        ExecStart = "${cfg.package}/bin/omega-sh";
-        Restart = "on-failure";
-        RestartSec = "5s";
-
-        Environment = [
-          "OMEGA_SOCKET_PATH=${omegaShSocket}"
-          "RUST_LOG=${cfg.logLevel}"
-        ];
-
-        # 0007 umask → files/sockets created with 0660 (rw-rw----)
-        UMask = "0007";
-
-        # Security hardening
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "full";
-        ProtectHome = false; # needs access for project work
-        ReadWritePaths = [ clankerHome ];
-        RuntimeDirectory = "omega";
-        RuntimeDirectoryMode = "0770";
-      };
-    };
-
-    # omega-loop — agent runtime daemon (depends on omega-sh)
-    systemd.services.omega-loop = {
-      description = "Omega-loop daemon (agent runtime)";
-      after = [
-        "network.target"
-        "omega-sh.service"
+            Import the module through the pi-omega flake output
+            `nixosModules.omega` — it forwards its own home-manager input
+            automatically.  If you import `./nixos/module.nix` directly,
+            enable home-manager yourself (home-manager.nixosModules.home-manager)
+            and configure the clanker user there instead.
+          '';
+        }
       ];
-      requires = [ "omega-sh.service" ];
-      wantedBy = [ "multi-user.target" ];
-      # Always include bashInteractive and coreutils in the path so that
-      # the agent can execute shell commands via the omega-sh daemon.
-      path =
-        with pkgs;
-        [
-          bashInteractive
-          coreutils
-        ]
-        ++ cfg.packages;
 
-      serviceConfig = {
-        User = clankerUser;
-        Group = clankerGroup;
+      # ----- users & groups -------------------------------------------------
+      users.groups.${clankerGroup} = {
+        members = cfg.humanUsers;
+      };
 
-        Type = "simple";
-        ExecStart = "${cfg.package}/bin/omega-loop";
-        WorkingDirectory = omegaDir;
-        Restart = "on-failure";
-        RestartSec = "5s";
+      users.users.${clankerUser} = {
+        isNormalUser = true;
+        home = clankerHome;
+        group = clankerGroup;
+        extraGroups = cfg.extraGroups;
+        packages = cfg.packages;
+        createHome = true;
+        description = "Omega agent service user";
+      };
 
-        # 0007 umask → sockets created with 0770 (srw-rw----)
-        # Without this, the default umask (0022) gives 0755 which
-        # prevents other omega group members from connecting.
-        UMask = "0007";
+      # ----- system prompt file --------------------------------------------
+      environment.etc."omega/system-prompt.md".text = systemPrompt;
 
-        Environment = [
-          "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
-          "OMEGA_SOCKET_PATH=${omegaShSocket}"
-          "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
-          "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
-          "RUST_LOG=${cfg.logLevel}"
+      # ----- tmpfiles: runtime directory with correct permissions ----------
+      systemd.tmpfiles.rules = [
+        "d /run/omega 0770 ${clankerUser} ${clankerGroup} -"
+        "d ${omegaDir} 0770 ${clankerUser} ${clankerGroup} -"
+      ];
+
+      # ----- systemd services ----------------------------------------------
+
+      # omega-sh — filesystem/shell tool daemon
+      systemd.services.omega-sh = {
+        description = "Omega-sh daemon (filesystem/shell tools)";
+        after = [ "network.target" ];
+        wantedBy = [ "multi-user.target" ];
+        # Always include bashInteractive and coreutils in the path so the
+        # shell tool (Command::new("bash")) and basic utilities are available,
+        # regardless of what the user puts in cfg.packages.
+        path =
+          with pkgs;
+          [
+            bashInteractive
+            coreutils
+          ]
+          ++ cfg.packages;
+
+        serviceConfig = {
+          User = clankerUser;
+          Group = clankerGroup;
+
+          Type = "simple";
+          ExecStart = "${cfg.package}/bin/omega-sh";
+          Restart = "on-failure";
+          RestartSec = "5s";
+
+          Environment = [
+            "OMEGA_SOCKET_PATH=${omegaShSocket}"
+            "RUST_LOG=${cfg.logLevel}"
+          ];
+
+          # 0007 umask → files/sockets created with 0660 (rw-rw----)
+          UMask = "0007";
+
+          # Security hardening
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "full";
+          ProtectHome = false; # needs access for project work
+          ReadWritePaths = [ clankerHome ];
+          RuntimeDirectory = "omega";
+          RuntimeDirectoryMode = "0770";
+        };
+      };
+
+      # omega-loop — agent runtime daemon (depends on omega-sh)
+      systemd.services.omega-loop = {
+        description = "Omega-loop daemon (agent runtime)";
+        after = [
+          "network.target"
+          "omega-sh.service"
         ];
+        requires = [ "omega-sh.service" ];
+        wantedBy = [ "multi-user.target" ];
+        # Always include bashInteractive and coreutils in the path so that
+        # the agent can execute shell commands via the omega-sh daemon.
+        path =
+          with pkgs;
+          [
+            bashInteractive
+            coreutils
+          ]
+          ++ cfg.packages;
 
-        # Security hardening
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "full";
-        ProtectHome = false;
-        ReadWritePaths = [ clankerHome ];
+        serviceConfig = {
+          User = clankerUser;
+          Group = clankerGroup;
 
-        RuntimeDirectory = "omega";
-        RuntimeDirectoryMode = "0770";
+          Type = "simple";
+          ExecStart = "${cfg.package}/bin/omega-loop";
+          WorkingDirectory = omegaDir;
+          Restart = "on-failure";
+          RestartSec = "5s";
 
-        StateDirectory = "clanker/omega";
-        StateDirectoryMode = "0770";
+          # 0007 umask → sockets created with 0770 (srw-rw----)
+          # Without this, the default umask (0022) gives 0755 which
+          # prevents other omega group members from connecting.
+          UMask = "0007";
 
-      }
-      // (
-        if cfg.envFile != null then
+          Environment = [
+            "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
+            "OMEGA_SOCKET_PATH=${omegaShSocket}"
+            "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
+            "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
+            "RUST_LOG=${cfg.logLevel}"
+          ];
+
+          # Security hardening
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "full";
+          ProtectHome = false;
+          ReadWritePaths = [ clankerHome ];
+
+          RuntimeDirectory = "omega";
+          RuntimeDirectoryMode = "0770";
+
+          StateDirectory = "clanker/omega";
+          StateDirectoryMode = "0770";
+
+        }
+        // (
+          if cfg.envFile != null then
+            {
+              EnvironmentFile = cfg.envFile;
+            }
+          else
+            { }
+        );
+
+        preStart = ''
+          mkdir -p '${cfg.sessionDir}'
+          mkdir -p '${cfg.projectsDir}'
+          ln -sfT '${cfg.sessionDir}' "${omegaDir}/sessions" 2>/dev/null || true
+        '';
+      };
+
+      # ----- omega binaries on the system ---------------------------------
+      environment.systemPackages = [
+        cfg.package # omega-tui, omega-loop, omega-sh
+      ];
+
+      # ----- allow clanker to use nix build etc. ---------------------------
+      nix.settings.trusted-users = [ clankerUser ];
+
+    }
+    // optionalAttrs (home-manager != null) {
+      # ----- optional home-manager for the clanker user -------------------
+      home-manager = mkIf cfg.homeManager.enable {
+        # Use the system's pkgs so home-manager modules are built against
+        # the same nixpkgs as the rest of the configuration.
+        useGlobalPkgs = true;
+        # Install home.packages into the user's own profile instead of
+        # bloating the system closure.
+        useUserPackages = true;
+
+        users.${clankerUser} = mkMerge [
           {
-            EnvironmentFile = cfg.envFile;
+            home = {
+              username = clankerUser;
+              homeDirectory = clankerHome;
+              # Overridable; pick the release your nixpkgs matches.
+              stateVersion = mkDefault "26.05";
+            };
           }
-        else
-          { }
-      );
-
-      preStart = ''
-        mkdir -p '${cfg.sessionDir}'
-        mkdir -p '${cfg.projectsDir}'
-        ln -sfT '${cfg.sessionDir}' "${omegaDir}/sessions" 2>/dev/null || true
-      '';
-    };
-
-    # ----- omega binaries on the system ---------------------------------
-    environment.systemPackages = [
-      cfg.package # omega-tui, omega-loop, omega-sh
-    ];
-
-    # ----- allow clanker to use nix build etc. ---------------------------
-    nix.settings.trusted-users = [ clankerUser ];
-
-  };
+          cfg.homeManager.config
+        ];
+      };
+    }
+  );
 }

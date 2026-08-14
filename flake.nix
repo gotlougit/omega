@@ -1,10 +1,16 @@
 {
   description = "Omega — AI coding agent with persistent omega services";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, home-manager, ... }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -117,6 +123,14 @@
       # --------------------------------------------------------------------------
       # NixOS module
       # --------------------------------------------------------------------------
-      nixosModules.omega = import ./nixos/module.nix;
+      #
+      # The module is a function taking the standard module args so the
+      # module system can import it as `imports = [ pi-omega.nixosModules.omega ]`.
+      # The flake's home-manager input is closed over and forwarded to the
+      # module, which uses it to optionally wire up home-manager for the
+      # clanker user (services.omega.homeManager).
+      nixosModules.omega =
+        { config, lib, pkgs, ... }@args:
+        import ./nixos/module.nix (args // { inherit home-manager; });
     };
 }

@@ -45,3 +45,54 @@ An agent runtime and tool execution framework in Rust.
 - `omega-sh` — filesystem/shell tool daemon
 - `omega-tui` — TUI client for `omega-loop`
 - `clankersh` — REPL / one-shot client for `omega-sh`
+
+## NixOS module
+
+The flake provides a NixOS module (`nixosModules.omega`) that sets up
+`omega-sh` and `omega-loop` as systemd services for the `clanker` user,
+with sockets in `/run/omega/`. Enable it with:
+
+```nix
+{
+  imports = [ pi-omega.nixosModules.omega ];
+
+  services.omega.enable = true;
+  # Optional: expose the TUI to human users via the "omega" group.
+  services.omega.humanUsers = [ "alice" ];
+  # Optional: extra tools for the agent (added to the clanker user's PATH).
+  services.omega.packages = [ pkgs.ffmpeg ];
+}
+```
+
+### Home-manager for the clanker user
+
+The module can also wire up [home-manager](https://github.com/nix-community/home-manager)
+for the clanker user (disabled by default), so user-scoped configuration
+such as git identity, ssh-agent, or shell setup can be written inline and
+kept together with the rest of the omega configuration:
+
+```nix
+{
+  services.omega.homeManager = {
+    enable = true;
+    config = {
+      programs.git = {
+        enable = true;
+        userName = "Clanker";
+        userEmail = "clanker@example.com";
+      };
+      services.ssh-agent.enable = true;
+    };
+  };
+}
+```
+
+When enabled, home-manager's NixOS module is imported automatically (the
+flake's pinned `home-manager` input is used) and `config` is injected into
+`home-manager.users.<user>`, merged with sensible defaults (home directory,
+username, state version). `useGlobalPkgs` and `useUserPackages` are enabled.
+
+If you import `./nixos/module.nix` directly instead of using the flake
+output, `services.omega.homeManager` is unavailable (an assertion explains
+why) — configure the clanker user with your own home-manager setup in that
+case.
