@@ -1295,6 +1295,14 @@ mod tests {
             .output()
             .await
             .unwrap();
+        // Don't inherit the host's commit.gpgsign — signing would prompt/
+        // hang on a throwaway repo that has no signing key.
+        tokio::process::Command::new("git")
+            .args(["config", "commit.gpgsign", "false"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
         tokio::fs::write(dir.join("README.md"), "# Dummy\n")
             .await
             .unwrap();

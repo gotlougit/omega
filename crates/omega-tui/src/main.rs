@@ -231,7 +231,14 @@ fn render_picker(app: &mut AppState, handle: &TermHandle) {
 
     let block = StyledBlock::new(st);
     match picker.block_id {
-        Some(id) => handle.set_block(id, block),
+        Some(id) => {
+            handle.set_block(id, block);
+            // set_block alone doesn't repaint — without an explicit redraw
+            // the refreshed list (sessions or projects) stays invisible
+            // until the next keypress, so a fetched picker appears to hang
+            // on "Fetching …" even though the data has already arrived.
+            handle.redraw();
+        }
         None => picker.block_id = Some(handle.print_output(block)),
     }
 }
@@ -1759,6 +1766,22 @@ mod tests {
             .chain(em.history().iter())
             .filter(|l| l.contains(needle))
             .count()
+    }
+
+    /// Polls the captured output until `needle` appears (or `timeout`
+    /// elapses) without triggering any redraw of its own. Used to assert
+    /// that an event handler *itself* scheduled a repaint — the background
+    /// redraw thread writes asynchronously, so a plain read right after the
+    /// event can race it.
+    fn wait_for_rows_containing(fx: &Fixture, needle: &str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if count_rows_containing(fx, needle) > 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        count_rows_containing(fx, needle) > 0
     }
 
     // --- process_line: user input and slash commands ---------------------
@@ -6642,6 +6665,71 @@ mod tests {
         }
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "Fetching projects"), 1);
+    }
+
+    /// Regression test: the daemon's ProjectList reply must repaint the
+    /// picker immediately. The entries are already fetched — the user must
+    /// not stare at "Fetching projects…" until they happen to press a key.
+    /// (Previously render_picker updated the block with set_block, which
+    /// never triggers a redraw, so the fetched list stayed invisible.)
+    #[test]
+    fn project_list_arrival_renders_without_extra_input() {
+        let mut fx = fixture();
+        process_line("/project", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Fetching projects"), 1);
+
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ProjectList {
+                projects: vec![sample_project("omega", "https://a.io/omega.git")],
+            },
+        );
+
+        // No keypress, no manual redraw_sync: the handler itself must have
+        // scheduled the repaint.
+        assert!(
+            wait_for_rows_containing(&fx, "Projects (1):", Duration::from_secs(2)),
+            "project list must render as soon as the reply arrives, without a keypress"
+        );
+        assert_eq!(
+            count_rows_containing(&fx, "1. omega — https://a.io/omega.git"),
+            1
+        );
+        assert_eq!(count_rows_containing(&fx, "Fetching projects"), 0);
+    }
+
+    /// Same regression for the sessions picker: the SessionList reply must
+    /// render without waiting for a keypress.
+    #[test]
+    fn session_list_arrival_renders_without_extra_input() {
+        let mut fx = fixture();
+        process_line("/sessions", &mut fx.app, &fx.handle, &fx.cmd_tx);
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "Fetching sessions"), 1);
+
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::SessionList {
+                sessions: vec![sample_session(
+                    "sess-1",
+                    Some("Chat"),
+                    Some("First prompt"),
+                    None,
+                )],
+            },
+        );
+
+        assert!(
+            wait_for_rows_containing(&fx, "Sessions (1, newest first):", Duration::from_secs(2)),
+            "session list must render as soon as the reply arrives, without a keypress"
+        );
+        assert_eq!(count_rows_containing(&fx, "1. First prompt"), 1);
+        assert_eq!(count_rows_containing(&fx, "Fetching sessions"), 0);
     }
 
     /// `/project <name|url>` activates directly without the picker.

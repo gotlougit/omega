@@ -13,13 +13,20 @@ use tokio::process::{Child, Command};
 
 /// Spawn the actual `omega-loop` binary with isolated temp state.
 async fn spawn_daemon() -> (Child, TempWorkspace) {
+    let ws = TempWorkspace::new().await;
+    let child = spawn_daemon_in(&ws).await;
+    (child, ws)
+}
+
+/// Spawn `omega-loop` against an already-created workspace. Used to restart
+/// the daemon against the same on-disk state to prove persistence.
+async fn spawn_daemon_in(ws: &TempWorkspace) -> Child {
     let bin = env!("CARGO_BIN_EXE_omega-loop");
     eprintln!("DEBUG: omega-loop bin = {bin}");
     assert!(
         std::path::Path::new(bin).exists(),
         "omega-loop binary does not exist at {bin}"
     );
-    let ws = TempWorkspace::new().await;
     let child = Command::new(bin)
         .env("OMEGA_LOOP_SOCKET_PATH", &ws.socket_path)
         .env("OMEGA_PROJECTS_DIR", &ws.projects_dir)
@@ -30,7 +37,7 @@ async fn spawn_daemon() -> (Child, TempWorkspace) {
         .spawn()
         .expect("spawn omega-loop");
     wait_for_socket(&ws.socket_path).await;
-    (child, ws)
+    child
 }
 
 /// Poll until the daemon's Unix socket is connectable.
@@ -106,6 +113,9 @@ impl TempWorkspace {
         git(&remote_repo, &["init", "-b", "main"]).await;
         git(&remote_repo, &["config", "user.email", "e2e@test"]).await;
         git(&remote_repo, &["config", "user.name", "E2E"]).await;
+        // Don't inherit the host's commit.gpgsign — signing would prompt/
+        // hang on a throwaway repo that has no signing key.
+        git(&remote_repo, &["config", "commit.gpgsign", "false"]).await;
         tokio::fs::write(remote_repo.join("README.md"), "# Dummy repo\n")
             .await
             .unwrap();
@@ -242,6 +252,129 @@ async fn activate_project_end_to_end() {
     drop(writer);
     let _ = daemon.kill().await;
     let _ = daemon.wait().await;
+}
+
+/// The registered project list is persisted in `registry.json` under
+/// OMEGA_PROJECTS_DIR: after a full daemon restart against the same store,
+/// `list_projects` still returns the project.
+#[tokio::test]
+async fn project_list_survives_daemon_restart() {
+    let (mut daemon, ws) = spawn_daemon().await;
+    let (mut reader, mut writer) = connect_to(&ws.socket_path).await.unwrap();
+
+    writer
+        .send_activate_project("e2e-sess", &ws.remote_url())
+        .await
+        .unwrap();
+    wait_for_event(&mut reader, |e| project_active(e).is_some()).await;
+
+    // The registry must be written to disk on registration.
+    let registry = ws.projects_dir.join("registry.json");
+    assert!(
+        registry.is_file(),
+        "registry.json must exist: {}",
+        registry.display()
+    );
+    let json = tokio::fs::read_to_string(&registry).await.unwrap();
+    assert!(
+        json.contains("dummy-repo"),
+        "registry should contain the project: {json}"
+    );
+
+    drop(reader);
+    drop(writer);
+    let _ = daemon.kill().await;
+    let _ = daemon.wait().await;
+
+    // Restart against the same projects dir: the list must still be there.
+    let mut daemon2 = spawn_daemon_in(&ws).await;
+    let (mut reader2, mut writer2) = connect_to(&ws.socket_path).await.unwrap();
+    writer2.send_list_projects().await.unwrap();
+    match wait_for_event(&mut reader2, |e| {
+        matches!(e, ServerEvent::ProjectList { .. })
+    })
+    .await
+    {
+        ServerEvent::ProjectList { projects } => {
+            assert_eq!(
+                projects.len(),
+                1,
+                "project list must survive a daemon restart"
+            );
+            assert_eq!(projects[0].name, "dummy-repo");
+            assert_eq!(projects[0].url, ws.remote_url());
+        }
+        _ => unreachable!(),
+    }
+    drop(reader2);
+    drop(writer2);
+    let _ = daemon2.kill().await;
+    let _ = daemon2.wait().await;
+}
+
+/// The active-project binding is persisted in the session's metadata: after
+/// a daemon restart, resuming the session re-binds it to the same worktree
+/// and re-announces ProjectActive to the client.
+#[tokio::test]
+async fn active_project_binding_survives_daemon_restart() {
+    let (mut daemon, ws) = spawn_daemon().await;
+    let (mut reader, mut writer) = connect_to(&ws.socket_path).await.unwrap();
+
+    writer
+        .send_activate_project("e2e-sess", &ws.remote_url())
+        .await
+        .unwrap();
+    let (name, worktree_path, branch) =
+        wait_for_event(&mut reader, |e| project_active(e).is_some())
+            .await
+            .let_else_unwrap_project_active();
+    assert_eq!(name, "dummy-repo");
+
+    // The binding must be on disk in the session metadata.
+    let meta_path = ws
+        .work_dir
+        .join("sessions")
+        .join("e2e-sess")
+        .join("metadata.json");
+    assert!(
+        meta_path.is_file(),
+        "metadata must exist: {}",
+        meta_path.display()
+    );
+    let meta: serde_json::Value =
+        serde_json::from_str(&tokio::fs::read_to_string(&meta_path).await.unwrap()).unwrap();
+    let active = &meta["custom"]["active_project"];
+    assert!(
+        active.is_object(),
+        "active_project missing from metadata: {meta}"
+    );
+    assert_eq!(active["project"]["name"], "dummy-repo");
+    assert_eq!(active["worktree_path"], worktree_path);
+    assert_eq!(active["branch"], branch);
+
+    drop(reader);
+    drop(writer);
+    let _ = daemon.kill().await;
+    let _ = daemon.wait().await;
+
+    // Restart and resume: the session comes back bound to the project.
+    let mut daemon2 = spawn_daemon_in(&ws).await;
+    let (mut reader2, mut writer2) = connect_to(&ws.socket_path).await.unwrap();
+    writer2.send_resume_session("e2e-sess").await.unwrap();
+    let (rname, rpath, rbranch) = wait_for_event(&mut reader2, |e| project_active(e).is_some())
+        .await
+        .let_else_unwrap_project_active();
+    assert_eq!(rname, "dummy-repo");
+    assert_eq!(
+        rpath, worktree_path,
+        "resumed session must reuse the same worktree"
+    );
+    assert_eq!(rbranch, branch);
+
+    drop(reader2);
+    drop(writer2);
+    let _ = daemon2.kill().await;
+    let _ = daemon2.wait().await;
 }
 
 /// Activating a bogus URL fails with a SystemMsg and registers nothing.

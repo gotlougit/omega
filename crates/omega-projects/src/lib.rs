@@ -475,6 +475,11 @@ mod tests {
         git(dir, &["config", "user.name", "Omega Test"])
             .await
             .unwrap();
+        // Don't inherit the host's commit.gpgsign — signing would prompt/
+        // hang on a throwaway repo that has no signing key.
+        git(dir, &["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
         tokio::fs::write(dir.join("README.md"), "# Dummy project\n")
             .await
             .unwrap();
@@ -490,6 +495,11 @@ mod tests {
             .await
             .unwrap();
         git(&repo, &["config", "user.name", "Omega Test"])
+            .await
+            .unwrap();
+        // Worktree commits run against the shared config too — disable
+        // signing so the test never prompts/hangs on a missing key.
+        git(&repo, &["config", "commit.gpgsign", "false"])
             .await
             .unwrap();
     }
