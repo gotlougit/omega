@@ -1,0 +1,68 @@
+{% extends "layout.html" %}
+
+{% block title %}
+<title>{{ session.display_name }} - omega-git-host</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <h3>{{ session.display_name }}</h3>
+    {% if session.description %}<p class="text-muted">{{ session.description }}</p>{% endif %}
+    <dl>
+      <dt>session</dt>
+      <dd><code>{{ session.session_id }}</code></dd>
+      {% if session.agent %}
+      <dt>agent</dt>
+      <dd>{{ session.agent }}</dd>
+      {% endif %}
+      {% if session.model %}
+      <dt>model</dt>
+      <dd>{{ session.model }}</dd>
+      {% endif %}
+      {% if session.provider %}
+      <dt>provider</dt>
+      <dd>{{ session.provider }}</dd>
+      {% endif %}
+      <dt>created</dt>
+      <dd>{{ session.created_at | date }}</dd>
+      <dt>updated</dt>
+      <dd>{{ session.updated_at | date }}</dd>
+      {% if session.parent %}
+      <dt>parent</dt>
+      <dd><a href="/sessions/{{ session.parent }}">{{ session.parent }}</a></dd>
+      {% endif %}
+      {% if session.children %}
+      <dt>subagents</dt>
+      {% for c in session.children %}
+      <dd><a href="/sessions/{{ c }}">{{ c }}</a></dd>
+      {% endfor %}
+      {% endif %}
+      {% if session.project %}
+      <dt>worktree</dt>
+      <dd>
+        <a href="/{{ session.project }}/tree/{{ session.branch }}">{{ session.project }} / {{ session.branch }}</a>
+        (<a href="/{{ session.project }}/log/{{ session.branch }}">log</a>)
+      </dd>
+      {% endif %}
+      <dt>system prompt</dt>
+      <dd><a href="/sessions/{{ session.session_id }}/system-prompt">view</a></dd>
+    </dl>
+
+    {% if truncated %}
+    <p class="text-muted">Showing the last {{ messages|length }} of {{ total }} messages.</p>
+    {% endif %}
+
+    {% for m in messages %}
+    <div class="session-message {{ m.role }}">
+      <div class="message-role">{{ m.role }}</div>
+      {{ m.html | safe }}
+    </div>
+    {% endfor %}
+
+    {% if not messages %}
+    <p class="text-muted">No messages yet.</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

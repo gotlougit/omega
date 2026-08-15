@@ -1,0 +1,117 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}} {{tag.name}} - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+{% block content %}
+<div class="container">
+  <h3>
+    {{tag.name}}
+    <small class="pull-right text-muted">
+      {{signature_time(tag.tagger) | date}}
+    </small>
+  </h3>
+  <div class="row">
+    <div class="col-md-4">
+      <div class="form-group">
+        {% set tagname = tag.name %}
+        <a
+          class="btn btn-primary btn-block"
+          href="{{url_for("repo.archive",
+            owner=repo.owner.canonical_name,
+            repo=repo.name, ref=tagname, fmt=signature or "tar.gz")}}"
+        >.{{ signature or "tar.gz" }} {{icon("caret-right")}}</a>
+        {% if signature %}
+        <a
+          class="btn btn-default btn-block"
+          href="{{url_for("repo.archivesig",
+            owner=repo.owner.canonical_name,
+            repo=repo.name, ref=tagname, fmt=signature)}}"
+        >.{{ signature }}.asc {{icon("caret-right")}}</a>
+        {% else %}
+        <a
+          class="btn btn-default btn-block"
+          href="{{url_for("repo.archive",
+            owner=repo.owner.canonical_name,
+            repo=repo.name, ref=tagname, fmt="zip")}}"
+        >.zip {{icon("caret-right")}}</a>
+        {% endif %}
+        <a
+          class="btn btn-default btn-block"
+          rel="nofollow"
+          href="{{url_for("repo.tree",
+            owner=repo.owner.canonical_name,
+            repo=repo.name, ref=tagname)}}"
+        >browse {{icon("caret-right")}}</a>
+      </div>
+      {% if object_storage_enabled %}
+      {% if any(artifacts) %}
+      <div class="event-list">
+        {% for artifact in artifacts %}
+        <form
+          class="event"
+          method="POST"
+          action="{{url_for("artifacts.ref_delete",
+            owner=repo.owner.username,
+            repo=repo.name, ref=tagname,
+            filename=artifact.filename)}}"
+        >
+          <a
+            href="{{url_for("artifacts.ref_download",
+              owner=repo.owner.canonical_name,
+              repo=repo.name, ref=tagname,
+              filename=artifact.filename)}}"
+            rel="nofollow"
+          >{{ artifact.filename }} {{icon('caret-right')}}</a><br />
+          <span
+            class="text-muted"
+            title="{{artifact.checksum}}"
+          >{{artifact.checksum}}</span>
+          {% if repo.owner == current_user %}
+          {{csrf_token()}}
+          <button
+            type="submit"
+            class="btn btn-danger btn-sm pull-right"
+          >Delete this file {{icon('caret-right')}}</button>
+          {% endif %}
+        </form>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if repo.owner == current_user %}
+      <form
+        method="POST"
+        action="{{url_for('artifacts.ref_upload',
+          owner=repo.owner.canonical_name, repo=repo.name, ref=tagname)}}"
+        enctype="multipart/form-data"
+      >
+        {{csrf_token()}}
+        <div class="form-group">
+          <label for="file">Attach file to this ref</label>
+          <input
+            type="file"
+            name="file"
+            id="file"
+            multiple
+            class="form-control {{valid.cls("file")}}" />
+          {{valid.summary("file")}}
+        </div>
+        <button type="submit" class="btn btn-default pull-right">
+          Upload file {{icon('caret-right')}}
+        </button>
+      </form>
+      {% endif %}
+      {% endif %}
+    </div>
+    <div class="col-md-8">
+      <div class="event-list">
+        <div class="event">
+          {% if tag.message %}
+          <pre class="pb-0">{{strip_pgp_signature(tag.message)}}</pre>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

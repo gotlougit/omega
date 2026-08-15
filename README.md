@@ -33,6 +33,7 @@ An agent runtime and tool execution framework in Rust.
 | **omega-loop** | Agent daemon — `StandardAgent`, `AgentRuntime`, `AgentSession`, helpers, everything else |
 | **omega-loop-client** | Client library for the `omega-loop` daemon protocol |
 | **omega-projects** | Project store: register git repos (bare clone once) and create per-session git worktrees |
+| **omega-git-host** | Read-only self-hosted git forge over the project store: smart-HTTP remotes + a sourcehut-style web UI (repo pages, worktrees-as-branches, session transcripts) |
 | **omega-sh** | Unix-socket daemon for filesystem/shell tool execution |
 | **omega-sh-client** | Client library for `omega-sh` + proxy tools |
 | **cli** | Minimal TUI primitives (screen, style, terminal) |
@@ -44,7 +45,54 @@ An agent runtime and tool execution framework in Rust.
 - `omega-loop` — core agent daemon (LLM + tool orchestration)
 - `omega-sh` — filesystem/shell tool daemon
 - `omega-tui` — TUI client for `omega-loop`
+- `omega-git-host` — read-only git forge over the project store (smart HTTP + web UI)
 - `clankersh` — REPL / one-shot client for `omega-sh`
+
+## omega-git-host
+
+A read-only, self-hosted git forge over the project store (full plan in
+`SELFGIT.md`). Every registered project is served as a fetchable smart-HTTP
+remote; every session worktree is exposed as a branch; and the web UI — in
+sourcehut's minimal, no-JS styling — lets you browse repos and read the chat
+transcripts behind each worktree.
+
+Run it directly:
+
+```
+OMEGA_PROJECTS_DIR=/persist/clanker/projects \
+OMEGA_SESSION_DIR=/persist/clanker/omega/sessions \
+OMEGA_GIT_HOST_LISTEN=127.0.0.1 \
+OMEGA_GIT_HOST_PORT=8080 \
+omega-git-host
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OMEGA_PROJECTS_DIR` | `./projects` | Project store (registered repos + worktrees) |
+| `OMEGA_SESSION_DIR` | `./sessions` | Session store (`metadata.json`, `history.jsonl`) |
+| `OMEGA_GIT_HOST_LISTEN` | `127.0.0.1` | Bind address — loopback on purpose, see below |
+| `OMEGA_GIT_HOST_PORT` | `8080` | TCP port |
+
+Clone, browse, read chats:
+
+```
+git clone http://127.0.0.1:8080/pi-omega.git
+git checkout omega/<session>   # every session worktree is served as a branch
+# http://127.0.0.1:8080/ → project list → refs → session transcripts
+```
+
+The forge is read-only (no push) and by default binds to loopback because it
+serves full session transcripts, which may contain sensitive tool output.
+Expose it deliberately (SSH tunnel, reverse proxy, tailscale) if you want it
+reachable.
+
+On NixOS, enable it through the module instead of running it by hand:
+
+```nix
+services.omega.gitHost.enable = true;
+services.omega.gitHost.port = 8080;                  # default
+services.omega.gitHost.listenAddress = "127.0.0.1";  # default
+```
 
 ## NixOS module
 

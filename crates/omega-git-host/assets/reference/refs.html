@@ -1,0 +1,140 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}} refs - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+
+{% block repohead %}
+  <link rel="alternate"
+    title="{{ repo.owner.canonical_name }}/{{ repo.name }} refs"
+    type="application/rss+xml"
+    href="{{ root }}{{ repo|refs_rss_url }}">
+{% endblock %}
+
+{% block tabs_extra %}
+  {% if not repo.indexed or not cfg('git.sr.ht', 'repos-index') or not current_user %}
+  <li class="flex-grow-1 d-none d-sm-block"></li>
+  {% endif %}
+  <li class="nav-item d-none d-sm-block">
+    <a class="nav-link active" href="{{ repo|refs_rss_url }}">
+      {{ icon('rss', cls='sm') }} RSS
+    </a>
+  </li>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-8">
+      <div class="event-list">
+        {% for t in tags %}
+        {% set ref = t[0].decode("utf-8", "replace") %}
+        {% set tag = t[1] %}
+        {% set sig_fmt = t[2] %}
+        {% if isinstance(tag, pygit2.Commit) %}
+        {% set commit = tag %}
+        {% else %}
+        {% set commit = git_repo.get(tag.target) %}
+        {% endif %}
+        <div class="event">
+          <h4 class="mb-2">
+            {% if isinstance(tag, pygit2.Commit) %}
+            {% set refname = str(commit.id) %}
+            {% set author = commit.author %}
+            {{ref[len("refs/tags/"):]}}
+            {% else %}
+            {% set refname = tag.raw_name.decode("utf-8", "replace") %}
+            {% set author = tag.tagger %}
+            <a href="{{url_for("repo.ref",
+                owner=repo.owner.canonical_name,
+                repo=repo.name,
+                ref=refname)}}">
+              {{refname}}
+            </a>
+            {% endif %}
+            <small class="pull-right text-muted">
+              {{signature_time(author) | date}}
+              <a
+                class="ml-2"
+                href="{{url_for("repo.archive",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=refname, fmt=sig_fmt or "tar.gz")}}"
+                rel="nofollow"
+              >.{{ sig_fmt or "tar.gz" }} {{icon("caret-right")}}</a>
+              {% if sig_fmt %}
+              <a
+                class="ml-2"
+                href="{{url_for("repo.archivesig",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=refname, fmt=sig_fmt)}}"
+                rel="nofollow"
+                title="This release is cryptographically signed, click here to download the signature"
+              >.asc {{icon("caret-right")}}</a>
+              {% else %}
+              <a
+                class="ml-2"
+                href="{{url_for("repo.archive",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=refname, fmt="zip")}}"
+                rel="nofollow"
+              >.zip {{icon("caret-right")}}</a>
+              {% endif %}
+              <a
+                class="ml-2"
+                href="{{url_for("repo.tree",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=refname)}}"
+              >browse {{icon("caret-right")}}</a>
+              <a
+                class="ml-2"
+                href="{{url_for("repo.log",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=refname)}}"
+              >log {{icon("caret-right")}}</a>
+            </small>
+          </h4>
+          {% if tag.message %}
+          <pre class="pb-0">{{strip_pgp_signature(tag.message)}}</pre>
+          {% endif %}
+        </div>
+        {% endfor %}
+        {{ pagination() }}
+      </div>
+    </div>
+    <div class="col-md-4">
+      <h3>Branches</h3>
+      <div class="event-list">
+        {% for branch in branches %}
+        {% set name = branch[0].decode("utf-8", "replace") %}
+        {% set commit = branch[2] %}
+        {% set branch = branch[1] %}
+        <div class="event">
+          {{name}}
+          {{ utils.commit_event(repo, commit, skip_body=True, mailmap=mailmap) }}
+          <div class="row mt-2">
+            <div class="col">
+              <a
+                href="{{url_for("repo.tree",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=name)}}"
+                class="btn btn-block {{ "btn-primary"
+                  if branch.raw_name == default_branch.raw_name
+                  else "btn-default" }}"
+              >browse {{icon("caret-right")}}</a>
+            </div>
+            <div class="col">
+              <a
+                href="{{url_for("repo.log",
+                  owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=name)}}"
+                class="btn btn-block btn-default"
+              >log {{icon("caret-right")}}</a>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

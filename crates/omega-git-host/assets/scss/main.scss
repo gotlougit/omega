@@ -1,0 +1,59 @@
+// Combined entry: core.sr.ht shared UI styles (BSD-3) + git.sr.ht
+// forge styles (AGPL-3.0). See assets/NOTICE.md.
+@import "core/base";
+@import "git-sr-ht";
+
+// ---------------------------------------------------------------------------
+// omega-git-host additions: session transcript
+// ---------------------------------------------------------------------------
+.session-message {
+  border-left: 0.25rem solid #ddd;
+  padding: 0.5rem 1rem;
+  margin-bottom: 1rem;
+
+  .message-role {
+    font-size: 0.75rem;
+    font-weight: bold;
+    text-transform: uppercase;
+    color: $gray-700;
+    margin-bottom: 0.25rem;
+  }
+
+  .message-text {
+    white-space: pre-wrap;
+  }
+
+  details {
+    margin-top: 0.25rem;
+  }
+
+  pre {
+    margin-bottom: 0;
+  }
+
+  &.user {
+    border-left-color: $gray-600;
+  }
+
+  &.assistant {
+    border-left-color: $info;
+  }
+
+  &.system {
+    border-left-color: $gray-400;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .session-message {
+    border-left-color: #343a40;
+
+    &.user {
+      border-left-color: #495057;
+    }
+
+    &.system {
+      border-left-color: #343a40;
+    }
+  }
+}

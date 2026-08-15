@@ -1,0 +1,511 @@
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.filter-repos {
+  .btn {
+    height: 1.9rem;
+  }
+}
+
+.repo-nav {
+  margin-left: 1rem;
+}
+
+pre.commit {
+  padding-left: 0;
+  padding-right: 0;
+  background: transparent;
+}
+
+dt {
+  overflow-wrap: break-word;
+}
+
+.licenses {
+  text-align: right;
+  a {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+.license-footer {
+  display: none;
+  margin-bottom: -1rem;
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+  background: #ddd;
+}
+
+@media(prefers-color-scheme: dark) {
+  .license-footer {
+    background: darken($gray-900, 6);
+  }
+}
+
+@include media-breakpoint-down(sm) {
+  .licenses {
+    display: none;
+  }
+  .license-footer {
+    display: block;
+  }
+}
+
+.license-list {
+  h2 {
+    font-size: 1.1rem;
+  }
+}
+
+.tree-list {
+  display: grid;
+  // mode name
+  grid-template-columns: auto 1fr fit-content(40em) auto auto;
+  font-family: $font-family-monospace;
+
+  svg {
+    color: #777;
+  }
+
+  .size {
+    text-align: right;
+  }
+
+  .name.blob a {
+    color: $gray-900;
+  }
+
+  .mode, .commit, .commit a, .date, .size {
+    color: $gray-700;
+  }
+
+  @media(prefers-color-scheme: dark) {
+    .name.blob a {
+      color: inherit;
+    }
+
+    .mode, .commit, .commit a, .date, .size {
+      color: inherit;
+    }
+  }
+
+  .name.blob {
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .commit {
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  & > div {
+    padding: 0.1rem 0.5rem;
+    background: transparent;
+
+    &.id {
+      text-align: right;
+    }
+
+    &.comments {
+      text-align: center;
+    }
+
+    @for $i from 1 through 5 {
+      &:nth-child(5n+#{$i}) {
+        grid-column-start: $i;
+      }
+
+      // Striped rows
+      &:nth-child(10n+#{$i}) {
+        background: rgba(0,0,0,.05);
+
+        @media(prefers-color-scheme: dark) {
+          background: lighten($gray-900, 5);
+        }
+      }
+    }
+  }
+}
+
+.code-view {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr;
+  grid-template-rows: auto;
+
+  .blame-user {
+    grid-column-start: 1;
+    grid-row-start: 1;
+    background: #ddd;
+    @media(prefers-color-scheme: dark) {
+      background: $gray-900;
+    }
+
+    .hunk {
+      padding-left: 0.5rem;
+    }
+  }
+
+  .blame-time {
+    grid-column-start: 2;
+    grid-row-start: 1;
+    background: #ddd;
+    border-right: 1px solid #444;
+    text-align: right;
+    @media(prefers-color-scheme: dark) {
+      background: $gray-900;
+    }
+
+    .hunk {
+      padding-right: 0.5rem;
+    }
+  }
+
+  .hunk:nth-child(2n) {
+    background: #eee;
+    @media(prefers-color-scheme: dark) {
+      background: lighten($gray-900, 5);
+    }
+  }
+
+  .lines {
+    grid-column-start: 3;
+    grid-row-start: 1;
+    text-align: right;
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+
+    background: #eee;
+    border-right: 1px solid #444;
+    @media(prefers-color-scheme: dark) {
+      background: lighten($gray-900, 5);
+    }
+
+    a:target::before, a.selected::before {
+      display: block;
+      content: "";
+      // +6px to connect multiple selected lines
+      height: calc(1rem + 6px);
+      width: 100%;
+      z-index: -1;
+      position: absolute;
+      left: 0;
+      background: lighten($blue, 35);
+      @media(prefers-color-scheme: dark) {
+        background: $black;
+      }
+    }
+  }
+
+  .highlight {
+    grid-column-start: 4;
+    grid-row-start: 1;
+    padding-left: 1rem;
+    background: transparent;
+    overflow-x: hidden;
+
+    pre {
+      background: transparent;
+    }
+  }
+
+  .ruler {
+    background: transparent;
+    grid-column-start: 4;
+    grid-row-start: 1;
+    display: block;
+    padding-left: calc(1rem + 4px);
+    height: 100%;
+    pointer-events: none;
+    overflow-x: hidden;
+
+    pre {
+      background: transparent;
+    }
+
+    & > span {
+      height: 100%;
+      display: inline-block;
+      border-right: 1px solid $gray-200;
+      @media(prefers-color-scheme: dark) {
+        border-right: 1px solid #343a40;
+      }
+    }
+  }
+}
+
+.ref {
+  border-width: 1px;
+  border-style: solid;
+  padding: 0.1rem 0.2rem;
+
+  &.branch {
+    border-color: darken($info, 20);
+    background: $info;
+    color: $white !important;
+  }
+
+  &.tag {
+    border-color: darken($primary, 20);
+    background: $primary;
+    color: $white;
+  }
+
+  &.tag.annotated {
+    border-color: darken($success, 20);
+    background: $success;
+    color: $white;
+  }
+}
+
+.diff {
+  .lineno {
+    text-decoration: none;
+  }
+
+  .text-success {
+    color: color_adjust_contrast_AERT(darken($success, 10), white) !important;
+  }
+
+  .text-danger {
+    color: color_adjust_contrast_AERT(darken($danger, 10), white) !important;
+  }
+
+  pre {
+    background: transparent;
+  }
+
+  @media(prefers-color-scheme: dark) {
+    $success-dark: #2bb34b;
+    $danger-dark: #ff3e3e;
+
+    .text-success {
+      color: $success-dark !important;
+    }
+
+    .text-danger {
+      color: $danger-dark !important;
+    }
+  }
+}
+
+img {
+  max-width: 100%;
+}
+
+.prepare-patchset {
+  legend {
+    font-weight: bold;
+  }
+
+  label {
+    margin-right: 1rem;
+    cursor: pointer;
+  }
+
+  details {
+    display: inline;
+    color: $gray-600;
+
+    &[open] {
+      display: block;
+      color: $black;
+
+      summary {
+        color: $black;
+      }
+    }
+
+    ul {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    li {
+      margin-top: 1rem;
+    }
+
+    @media(prefers-color-scheme: dark) {
+      color: $gray-500;
+
+      &[open] {
+        color: $gray-100;
+
+        summary {
+          color: $gray-100;
+        }
+      }
+    }
+  }
+
+  .event-list {
+    display: flex;
+    flex-direction: column;
+
+    &.reverse {
+      flex-direction: column-reverse;
+    }
+
+    input[type="radio"] {
+      display: none;
+    }
+
+    & > .commit-diff {
+      margin-top: 1rem;
+      order: -2;
+    }
+
+    & > .form-controls {
+      order: -1;
+      margin-top: 1rem;
+      align-self: flex-end;
+
+      &.last {
+        order: -3;
+      }
+    }
+
+    & > details {
+      order: 0;
+    }
+
+    & > .event {
+      order: 1;
+      display: block;
+      margin: 0.25rem 0;
+
+      // Because the order is reversed
+      &:last-child {
+        margin: 0.25rem 0;
+      }
+
+      &:first-child {
+        margin: 0;
+      }
+    }
+
+    input[type="radio"]:checked ~ .event {
+      background: lighten($info, 50) !important;
+    }
+
+    input[type="radio"]:checked + .event {
+      background: lighten($info, 45) !important;
+    }
+
+    @media(prefers-color-scheme: dark) {
+      input[type="radio"]:checked ~ .event {
+        background: #131a3c !important;
+      }
+
+      input[type="radio"]:checked + .event {
+        background: #003038 !important;
+      }
+    }
+  }
+}
+
+.markdown-nav {
+  padding-left: 0;
+  padding-right: 0;
+
+  .nav-tabs {
+    padding-left: 0;
+    margin-bottom: 0;
+    border-left: 1rem #ddd solid;
+  }
+}
+
+.tree-header {
+  display: flex;
+
+  .breadcrumb {
+    flex-grow: 1;
+    width: 100%;
+  }
+
+  .commit-info {
+    margin-left: 1rem;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    min-width: 0;
+  }
+}
+
+dl {
+  dd {
+    text-overflow: ellipsis;
+    overflow-x: hidden;
+  }
+}
+
+@include media-breakpoint-up(md) {
+  .blob {
+    .commit {
+      float: right;
+    }
+  }
+}
+
+.code-viewport {
+  display: flex;
+  flex: 1 0 auto;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+input[type="text"].nav-search {
+  padding: 0.05rem 1rem;
+  border: none;
+  background: transparent;
+  transition: padding .15s ease-in-out;
+
+  &:hover {
+    background: #ddd;
+    @media(prefers-color-scheme: dark) {
+      background: darken($gray-900, 6);
+    }
+  }
+  &:focus {
+    padding: 0.25rem 1rem;
+    background: #ddd;
+    box-shadow: none;
+
+    @media(prefers-color-scheme: dark) {
+      background: darken($gray-900, 6);
+    }
+
+    &::placeholder {
+      color: dimgray;
+      @media(prefers-color-scheme: dark) {
+        color: $gray-600;
+      }
+    }
+  }
+  &::placeholder {
+    @media(prefers-color-scheme: dark) {
+      color: $gray-400;
+    }
+  }
+}
+
+.code-search {
+  position: relative;
+
+  .event {
+    background: transparent;
+  }
+
+  .lines {
+    background: transparent;
+  }
+}

@@ -1,0 +1,43 @@
+{% extends "layout.html" %}
+
+{% block title %}
+<title>omega-git-host — projects</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <h3>Projects</h3>
+    {% if projects %}
+    <div class="event-list">
+      {% for p in projects %}
+      <div class="event">
+        <h4>
+          <a href="/{{ p.name }}/">{{ p.name }}</a>
+          <small class="text-muted">{{ p.default_branch or "no default branch" }}</small>
+        </h4>
+        {% if p.url %}
+        <p>
+          origin: <a href="{{ p.url }}">{{ p.url }}</a>
+        </p>
+        {% endif %}
+        <p>
+          clone: <code>git clone {{ p.clone_url }}</code>
+        </p>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-muted">No projects registered yet.</p>
+    {% endif %}
+  </div>
+  <div class="col-md-4">
+    <h3>About</h3>
+    <p>
+      Read-only git hosting for everything omega works on. Every session's
+      worktree is served as a branch of the project it was created in —
+      <code>git clone</code> a repo, then <code>git checkout omega/&lt;session&gt;</code>.
+    </p>
+  </div>
+</div>
+{% endblock %}

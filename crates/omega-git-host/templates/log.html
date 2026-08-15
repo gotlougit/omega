@@ -1,0 +1,41 @@
+{% extends "repo.html" %}
+
+{% block title %}
+<title>{{ name }} log ({{ ref }}) - omega-git-host git</title>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-8">
+      <h3>log: {{ ref }}</h3>
+      <div class="event-list">
+        {% for c in commits %}
+        <div class="event">
+          <a href="/{{ name }}/commit/{{ c.sha }}">{{ c.short }}</a> &mdash;
+          {{ c.author }}
+          <small class="pull-right">{{ c.date | date }}</small>
+          <br />
+          {{ c.subject }}
+        </div>
+        {% else %}
+        <p class="text-muted">No commits.</p>
+        {% endfor %}
+      </div>
+      {% if page > 1 or has_more %}
+      <nav class="mt-3">
+        {% if page > 1 %}
+        <a href="/{{ name }}/log/{{ ref }}?page={{ page - 1 }}">&laquo; prev</a>
+        {% endif %}
+        {% if has_more %}
+        <a href="/{{ name }}/log/{{ ref }}?page={{ page + 1 }}">next &raquo;</a>
+        {% endif %}
+        <span class="text-muted pull-right">
+          commits {{ (page - 1) * 25 + 1 }}&ndash;{{ ((page - 1) * 25) + commits|length }} of {{ total }}
+        </span>
+      </nav>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

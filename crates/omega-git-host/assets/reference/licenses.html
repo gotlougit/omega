@@ -1,0 +1,26 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}} licenses - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    {% if len(licenses) == 0 %}
+    <p>No licenses were found in {{repo.owner.canonical_name}}/{{repo.name}}.</p>
+    {% else %}
+    <p>The following licenses are used in {{repo.owner.canonical_name}}/{{repo.name}}:</p>
+    <div class="event-list license-list">
+      {% for l in licenses %}
+      <div class="event">
+        <h2>{{ l.name }} <small>({{ l.id }})</small></h2>
+        <a href="https://spdx.org/licenses/{{ l.id }}.html">
+          Full license text&nbsp;{{icon("caret-right")}}
+        </a>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

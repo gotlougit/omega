@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% block title %}
+    <title>{{domain}}</title>
+    {% endblock %}
+    {% block favicon %}
+    <link rel="icon" type="image/svg+xml" href="/static/logo.svg" />
+    <link rel="icon" type="image/png" href="/static/logo.png" sizes="any" />
+    {% endblock favicon %}
+    <link rel="stylesheet" href="{{static_resource("main.css", minify=True)}}">
+    {% if page and page != 1 %}
+    <link rel="prev" href="?page={{ page - 1 }}{{ coalesce_search_terms() }}" />
+    {% endif %}
+    {% if page and page != total_pages %}
+    <link rel="next" href="?page={{ page + 1 }}{{ coalesce_search_terms() }}" />
+    {% endif %}
+    {% block head %}
+    {% endblock %}
+  </head>
+  <body>
+    {% block environment %}
+    {% if environment != "production" or
+      (current_user and current_user.user_type.value == 'ADMIN' )%}
+    <div style="
+        {% if environment == "production" %}
+        background: #cc0022;
+        {% else %}
+        background: #228800;
+        {% endif %}
+        color: white; font-weight: bold; width: 100%; text-align: center">
+      {{environment.upper()}} ENVIRONMENT
+    </div>
+    {% endif %}
+    {% endblock %}
+    {% block nav %}
+    <nav class="container navbar navbar-light navbar-expand-sm">
+      {% include 'nav.html' %}
+    </nav>
+    {% endblock %}
+    {% block body %}
+    <div class="container">
+      {% block content %}{% endblock %}
+    </div>
+    {% endblock %}
+    {% block modal %}{% endblock %}
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

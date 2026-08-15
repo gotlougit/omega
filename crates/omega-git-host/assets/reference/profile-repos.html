@@ -1,0 +1,66 @@
+{% extends "profile.html" %}
+
+{% block title %}
+<title>{{user.canonical_name}}'s git repositories</title>
+{% endblock %}
+
+{% block sidebar %}
+{% if user.id == current_user.id %}
+<a
+  href="{{url_for('manage.create_GET')}}"
+  class="btn btn-primary btn-block"
+>Create new repository {{icon("caret-right")}}</a>
+<a
+  href="{{url_for('manage.clone')}}"
+  class="btn btn-default btn-block"
+>Clone existing repository {{icon("caret-right")}}</a>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+{% if repos or search %}
+<form>
+  <input
+    name="search"
+    type="text"
+    placeholder="Search {{user.canonical_name}}'s git repos"
+    class="form-control{% if search_error %} is-invalid{% endif %}"
+    value="{{ search if search else "" }}" />
+  {% if search_error %}
+    <div class="invalid-feedback">{{ search_error }}</div>
+  {% endif %}
+</form>
+{% endif %}
+
+{% if search and not repos %}
+<div class="alert alert-warning">
+  No repositories found for "{{search}}".
+</div>
+{% elif not repos %}
+<div class="alert alert-info">
+  This user does not have any git repositories.
+</div>
+{% endif %}
+
+<div class="event-list">
+  {% for repo in repos %}
+  <div class="event">
+    <h4>
+      <a href="/~{{user.username}}/{{repo.name}}">
+        ~{{user.username}}/{{repo.name}}
+      </a>
+      {% if repo.visibility.value != 'PUBLIC' %}
+      <small class="pull-right">
+        {{ repo.visibility.value.lower() }}
+      </small>
+      {% endif %}
+    </h4>
+    {% if repo.description %}
+    <p>{{ repo.description }}</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+{{ pagination() }}
+{% endblock %}

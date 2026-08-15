@@ -1,0 +1,268 @@
+.navbar {
+  flex-wrap: wrap;
+
+  .navbar-nav {
+    flex-grow: 1;
+    flex-wrap: nowrap;
+
+    @include media-breakpoint-down(xs) {
+      flex-direction: row !important;
+
+      .nav-link {
+        padding: 0 0.5rem;
+
+        &:first-child {
+          padding-left: 0;
+        }
+      }
+    }
+  }
+
+  .nav-link:hover {
+    text-decoration: underline;
+  }
+
+  .navbar-text {
+    color: $black;
+
+    @include media-breakpoint-down(md) {
+      padding: 0;
+    }
+  }
+}
+
+.navbar-light .navbar-brand {
+  a {
+    text-decoration: none;
+    color: $black;
+
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  .icon {
+    position: relative;
+    top: 1px;
+  }
+}
+
+.nav-tabs {
+  padding-left: 1rem;
+  margin-bottom: 0.5rem;
+  border-bottom: 3px $nav-tabs-background solid;
+
+  .nav-link {
+    padding: 0 1rem;
+    border-radius: 0;
+    border: none;
+    color: color_adjust_contrast_AERT($gray-600, white);
+    cursor: pointer;
+
+    &.active, &.active:hover {
+      color: black;
+      background: $nav-tabs-background;
+    }
+
+    &[disabled], &[disabled]:hover {
+      color: $gray-800;
+      cursor: not-allowed;
+      background: transparent;
+    }
+  }
+}
+
+.header-tabbed {
+  border-bottom: 3px solid $nav-tabs-background;
+  margin-bottom: 1rem;
+
+  .container, .container-fluid {
+    display: flex;
+    flex-wrap: wrap;
+
+    @include media-breakpoint-down(sm) {
+      flex-direction: column;
+    }
+  }
+
+  &.vertical {
+    align-items: inherit;
+    flex-direction: column;
+  }
+
+  h2 {
+    display: inline;
+    margin: 0;
+    padding-right: 1rem;
+  }
+
+  .nav {
+    border: none;
+    margin: 0;
+    flex-grow: 1;
+    display: inline-flex;
+    flex-wrap: nowrap;
+    padding: 0;
+
+    li {
+      align-self: flex-end;
+    }
+
+    .nav-item {
+      margin-bottom: 0;
+    }
+
+    .nav-item:hover {
+      background: $nav-tabs-background;
+
+      a {
+        color: black;
+      }
+    }
+
+    .nav-text {
+      padding: 0 1rem;
+      margin-right: 1rem;
+
+      &.vis-private {
+        border-bottom: 3px solid $danger;
+        margin-bottom: -3px;
+      }
+
+      &.vis-unlisted {
+        border-bottom: 3px solid $info;
+        margin-bottom: -3px;
+      }
+
+      &:hover {
+        background: transparent;
+      }
+
+      @include media-breakpoint-down(sm) {
+        display: none;
+      }
+    }
+
+    @include media-breakpoint-down(sm) {
+      flex-wrap: wrap;
+
+      li {
+        align-self: flex-start;
+        margin: 0 -1rem;
+        width: 100vw;
+      }
+
+      .nav-item.back-button {
+        margin-left: -8px;
+      }
+    }
+  }
+
+  form {
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+
+  button.nav-link {
+    background: inherit;
+  }
+
+  @include media-breakpoint-down(xs) {
+    & .nav-tabs {
+      padding-left: 0;
+    }
+  }
+}
+
+.header-extension {
+  margin-top: -1rem;
+  margin-bottom: 1rem;
+  background: $nav-tabs-background;
+}
+
+.project-nav {
+  margin-bottom: 0;
+}
+
+.project-nav + .resource-nav {
+  background: $nav-tabs-background;
+  border-bottom: none;
+
+  .nav-item .active, .nav-item .nav-link:hover {
+    background: $white !important;
+  }
+
+  h3 {
+    border: none;
+    padding: 0;
+    margin: 0;
+    margin-right: 1rem;
+  }
+}
+
+.project-nav ~ .header-extension {
+  background: transparent;
+  border-bottom: 2px solid $nav-tabs-background;
+
+  .nav-item .nav-link {
+    border-top: 2px solid transparent;
+    margin-bottom: -2px;
+  }
+
+  .nav-item .active, .nav-item .nav-link:hover {
+    border-bottom: 2px solid $gray-600 !important;
+    margin-bottom: -2px;
+  }
+}
+
+@include media-breakpoint-down(md) {
+  .nav-project-back {
+    margin-left: -12px;
+  }
+}
+
+.subnav {
+  display: inline-block;
+  padding-left: 0;
+  padding-right: 0;
+
+  .nav-item:hover {
+    background: #fff;
+  }
+
+  @media(prefers-color-scheme: dark) {
+    .nav-item:hover {
+      background: inherit;
+    }
+  }
+
+  .nav-tabs {
+    padding: 0;
+    margin-bottom: -3px;
+    border-bottom: 3px transparent solid;
+
+    .nav-link {
+      padding: 0 1rem;
+
+      &:hover {
+        color: black;
+      }
+
+      &.active {
+        border-bottom: 3px #fff solid;
+        background: #fff;
+      }
+
+      @media(prefers-color-scheme: dark) {
+        color: $gray-400;
+
+        &.active,
+        &:hover {
+          border-bottom: 3px $gray-900 solid;
+          background: $gray-900;
+          color: $white;
+        }
+      }
+    }
+  }
+}

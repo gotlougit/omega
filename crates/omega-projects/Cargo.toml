@@ -2,6 +2,7 @@
 name = "omega-projects"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 description = "Git-worktree-based project store for omega agent sessions"
 
 [dependencies]

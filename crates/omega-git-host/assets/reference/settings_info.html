@@ -1,0 +1,109 @@
+{% extends "settings.html" %}
+
+{% block settings %}
+<div class="row">
+  <div class="col-md-8">
+    <form method="POST" action="{{url_for("manage.settings_info_POST",
+        owner_name=owner.canonical_name, repo_name=repo.name)}}">
+      {{csrf_token()}}
+      <div class="form-group">
+        <label for="name" class="d-block">
+          Repository name
+          <a
+            href="/{{ owner.canonical_name }}/{{ repo.name }}/settings/rename"
+            class="pull-right"
+          >Rename?</a>
+        </label>
+        <input
+          type="text"
+          class="form-control"
+          id="name"
+          value="{{repo.name}}"
+          readonly />
+      </div>
+      <div class="form-group">
+        <label for="description">
+          Description
+        </label>
+        <input
+          type="text"
+          class="form-control"
+          id="description"
+          name="description"
+          value="{{repo.description or ""}}" />
+      </div>
+      <fieldset class="form-group">
+        <div class="form-check form-check-inline">
+          <label
+            class="form-check-label"
+            title="Publically visible and listed on your profile"
+          >
+            <input
+              class="form-check-input"
+              type="radio"
+              name="visibility"
+              value="PUBLIC"
+              {{ "checked" if repo.visibility.value == "PUBLIC" else "" }}
+            > Public
+          </label>
+        </div>
+        <div class="form-check form-check-inline">
+          <label
+              class="form-check-label"
+              title="Visible to anyone with the link, but not shown on your profile"
+            >
+            <input
+              class="form-check-input"
+              type="radio"
+              name="visibility"
+              value="UNLISTED"
+              {{ "checked" if repo.visibility.value == "UNLISTED" else "" }}
+            > Unlisted
+          </label>
+        </div>
+        <div class="form-check form-check-inline">
+          <label
+            class="form-check-label"
+            title="Only visible to you and your collaborators"
+          >
+            <input
+              class="form-check-input"
+              type="radio"
+              name="visibility"
+              value="PRIVATE"
+              {{ "checked" if repo.visibility.value == "PRIVATE" else "" }}
+            > Private
+          </label>
+        </div>
+      </fieldset>
+      <div class="form-group">
+        <label for="HEAD">
+          Default branch
+        </label>
+        <select
+          class="form-control {{valid.cls('HEAD')}}"
+          id="HEAD"
+          name="HEAD"
+          {% if repo.git_repo.is_empty %}disabled{% endif %}
+        >
+          {% set default_branch_name = HEAD or repo.git_repo.default_branch_name() %}
+          {% for branch in repo.git_repo.raw_listall_branches() %}
+            {% set branch = branch.decode("utf-8", "replace") %}
+            <option
+              value="{{branch}}"
+              {% if branch == default_branch_name %}
+                selected
+              {% endif %}>{{branch}}</option>
+          {% else %}
+            <option>No branches</option>
+          {% endfor %}
+        </select>
+        {{valid.summary('HEAD')}}
+      </div>
+      <button type="submit" class="btn btn-primary pull-right">
+        Save {{icon("caret-right")}}
+      </button>
+    </form>
+  </div>
+</div>
+{% endblock %}

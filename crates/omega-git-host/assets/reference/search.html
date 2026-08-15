@@ -1,0 +1,85 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}} - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+
+{% block content %}
+<form class="container">
+  <div class="form-group">
+    <input
+      type="text"
+      class="form-control {% if error %}is-invalid{% endif %}"
+      name="q"
+      value="{{q}}"
+      placeholder="Search {{repo.name}}..." />
+    {% if error %}
+    <div class="invalid-feedback">
+      {{ error }}
+    </div>
+    {% endif %}
+    <p class="text-muted">
+      <span class="pull-right">
+        {{icon('question-circle')}}
+        <a href="https://man.sr.ht/git.sr.ht/code-search.md">Search syntax</a>
+      </span>
+      {% if not error %}
+      Search matched {{search.total_matches}} results in {{search.total_files}} files.
+      {% endif %}
+    </p>
+    <div class="event-list code-search" style="margin-top: 1rem">
+      {% for file in search.results %}
+      {% set url = url_for("repo.tree",
+        owner=owner.canonical_name,
+        repo=repo.name,
+        ref="HEAD",
+        path=file.name)
+      %}
+      <div class="event">
+        <h3>
+          <a href="{{url}}">
+            {{file.name}}
+          </a>
+          <small class="pull-right">{{file.lang}}</small>
+        </h3>
+        {% set lines = file.lines %}
+        {% set total_lines = len(file.lines) %}
+        {% if len(lines) > 5 %}
+        {% set lines = lines[:5] %}
+        {% endif %}
+        {% for line in lines %}
+
+        <div class="code-view">
+          {% set content = line.before + line.line + line.after %}
+          {% set offset = len(line.before.splitlines()) %}
+          {% set lines = content.splitlines()|length %}
+          {% autoescape off %}
+          <pre class="lines">{{ linecounter(lines,
+            line.line_no - offset,
+            url=url,
+            selected=line.line_no) }}</pre>
+          {% endautoescape %}
+          {{ highlight(file.name, content) }}
+        </div>
+
+        {% if not loop.last %}
+        <div class="text-center">…</div>
+        {% endif %}
+
+        {% endfor %}
+
+        {% if total_lines > len(lines) %}
+        {% set remain= total_lines - len(lines) %}
+        <p>
+          <a href="{{url}}">
+            Browse {{remain}} more result{%if remain > 1%}s{% endif %} in this
+            file {{icon('caret-right')}}
+          </a>
+        </p>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</form>
+{% endblock %}

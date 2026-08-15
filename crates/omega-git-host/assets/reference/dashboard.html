@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-4">
+      <p>
+        Welcome back, {{ current_user.username }}! This is your git hosting service.
+        Documentation for its use is
+        <a href="https://man.sr.ht/git.sr.ht">available here</a>.
+      </p>
+      <a
+        href="{{url_for('manage.create_GET')}}"
+        class="btn btn-primary btn-block"
+      >Create new repository {{icon("caret-right")}}</a>
+      <a
+        href="{{url_for('manage.clone')}}"
+        class="btn btn-default btn-block"
+      >Clone existing repository {{icon("caret-right")}}</a>
+    </div>
+    <div class="col-md-8">
+      <hr class="d-md-none" />
+      {% if repos and len(repos) %}
+      <div class="event-list">
+        {% for repo in repos %}
+        <div class="event">
+          <h4>
+            <a
+              href="{{url_for('repo.summary',
+                     owner=current_user.canonical_name,
+                     repo=repo.name)}}"
+            >~{{current_user.username}}/{{repo.name}}</a>
+            {% if repo.visibility.value != 'PUBLIC' %}
+            <small class="pull-right">
+              {{ repo.visibility.value.lower() }}
+            </small>
+            {% endif %}
+          </h4>
+          {% if repo.description %}
+          <p>{{ repo.description }}</p>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      <a
+        href="{{url_for('public.user_index',
+        username=current_user.username)}}"
+        class="btn btn-default pull-right"
+      >More on your profile {{icon("caret-right")}}</a>
+      {% else %}
+      <p class="text-muted">You don't have any repositories.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

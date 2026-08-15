@@ -1,0 +1,16 @@
+{% extends "repo.html" %}
+
+{% block content %}
+<div class="header-extension">
+  <div class="container">
+    <div class="subnav">
+      <ul class="nav nav-tabs">
+      {% include "settingstabs.html" %}
+      </ul>
+    </div>
+  </div>
+</div>
+<div class="container">
+  {% block settings %}{% endblock %}
+</div>
+{% endblock %}

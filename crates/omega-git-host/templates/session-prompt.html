@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+
+{% block title %}
+<title>system prompt {{ session_id }} - omega-git-host</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <h3>system prompt</h3>
+    <p><a href="/sessions/{{ session_id }}">&laquo; back to session</a></p>
+    <pre>{{ prompt }}</pre>
+  </div>
+</div>
+{% endblock %}

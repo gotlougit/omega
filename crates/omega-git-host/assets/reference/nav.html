@@ -1,0 +1,60 @@
+{% if "hub.sr.ht" in network %}
+<span class="navbar-brand">
+  {{icon('circle')}}
+  <a href="{{get_origin("hub.sr.ht", external=True)}}">
+    {{site_name}}
+  </a>
+</span>
+{% else %}
+<span class="navbar-brand">
+  {{icon('circle')}}
+  <a class="navbar-brand" href="/">
+    {{site_name}}
+    <span class="text-danger">{{site.split(".")[0]}}</span>
+  </a>
+</span>
+{% endif %}
+<ul class="navbar-nav">
+  {% if current_user %}
+  {% for _site in network %}
+
+  {% if _site != "hub.sr.ht" %}
+  <li class="nav-item {{'active' if _site == site else ''}}">
+    <a
+      class="nav-link"
+      href="{{get_origin(_site, external=True)}}"
+    >{{_site.split(".")[0]}}</a>
+  </li>
+  {% endif %}
+
+  {% endfor %}
+  {% endif %}
+</ul>
+<div class="login">
+  {% if current_user %}
+  <span class="navbar-text">
+    Logged in as
+    {% set hubsrht = get_origin("hub.sr.ht", external=True, default=None) %}
+    {% if hubsrht %}
+    <a href="{{hubsrht}}/~{{current_user.username}}/">
+    {% else %}
+    <a href="{{get_origin("meta.sr.ht", external=True)}}/profile">
+    {% endif %}
+      {{current_user.username}}</a>
+    &mdash;
+    <a href="{{logout_url}}">Log out</a>
+  </span>
+  {% else %}
+  <span class="navbar-text">
+    {% if site == 'meta.sr.ht' %}
+    <a href="/login">Log in</a>
+    &mdash;
+    <a href="/">Register</a>
+    {% else %}
+    <a href="{{ login_url }}" rel="nofollow">Log in</a>
+    &mdash;
+    <a href="{{get_origin("meta.sr.ht", external=True)}}">Register</a>
+    {% endif %}
+  </span>
+  {% endif %}
+</div>

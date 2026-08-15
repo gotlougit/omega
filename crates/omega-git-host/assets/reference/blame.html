@@ -1,0 +1,98 @@
+{% extends "repo-full.html" %}
+{% import "utils.html" as utils %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}} ({{ ref }}): {{path_join(*path)}} blame - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+{% block repohead %}
+<style>
+pre {
+  tab-size: {{editorconfig.tab_width()}}
+}
+pre, body {
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+</style>
+{% endblock %}
+{% block content %}
+<div class="header-extension mb-0">
+  <div class="blob container-fluid">
+    <span>
+      {{ utils.breadcrumb(ref, commit.id, repo, path, entry, view, path_join, stat, pygit2, humanize, current_user) }}
+    </span>
+    <div class="commit">
+      <a
+        href="{{url_for("repo.commit",
+          owner=repo.owner.canonical_name,
+          repo=repo.name,
+          ref=str(commit.id))}}"
+      >{{str(commit.id)[:8]}}</a> &mdash;
+      {% set author_user = lookup_user(commit.author.email) %}
+      {% if author_user %}
+      <a href="{{url_for("public.user_index",
+        username=author_user.username)}}">{{commit.author.name}}</a>
+      {% else %}
+      {{commit.author.name}}
+      {% endif %}
+      {{trim_commit(commit.message)}}
+      <span class="text-muted">
+        {{ commit_time(commit) | date }}
+      </span>
+    </div>
+    <div class="clearfix"></div>
+  </div>
+</div>
+<div class="container-fluid code-viewport">
+  {#
+    This row has some weird styles going on. This prevents the page from
+    scrolling horizontally
+  #}
+  <div class="row mr-0">
+    <div class="col-md-12 code-view">
+      <pre class="ruler"><span>{% for i in range(
+        editorconfig.max_line_length()) %} {% endfor %}</span></pre>
+      {% set lns = namespace(line_count=0) %}
+      <pre class="blame-user">
+        {%- for hunk in blame %}
+          {%- set lns.line_count = lns.line_count + hunk.lines_in_hunk -%}
+          {%- if hunk.final_committer -%}
+          {%- set final_user = lookup_user(hunk.final_committer.email) -%}
+          {%- else -%}
+          {%- set final_user = None -%}
+          {%- endif -%}
+          <div class="hunk">{#
+          #}<a href="{{url_for("repo.commit",
+              owner=repo.owner.canonical_name, repo=repo.name,
+              ref=str(hunk.final_commit_id))}}"
+            >{{str(hunk.final_commit_id)[:8]}}</a> {% if final_user -%}
+            <a href="{{url_for("public.user_index", username=final_user.username)}}">{{hunk.final_committer.name}}</a>{% else -%}
+            {{hunk.final_committer.name}}{% endif %} {{ "\n" * hunk.lines_in_hunk -}}
+          </div>
+        {%- endfor -%}
+      </pre>
+      <pre class="blame-time">
+        {%- for hunk in blame -%}
+          <div class="hunk">{#
+          #}<a
+              href="{{url_for("repo.blame", owner=repo.owner.canonical_name,
+                repo=repo.name, ref=hunk.final_commit_id,
+                path=path_join(*path))}}"
+            >{{ commit_time(repo.git_repo[hunk.final_commit_id]) | date }}</a>{{ "\n" * hunk.lines_in_hunk -}}
+          </div>
+        {%- endfor -%}
+      </pre>
+      <pre class="lines">{% for l in range(lns.line_count) %}<a
+        href="#L{{loop.index}}"
+        id="L{{loop.index}}"
+        >{{loop.index}}</a>
+{% endfor %}</pre>
+      {{ highlight_file(repo, ref, entry,
+        data, str(blob.id), str(commit.id)) }}
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/linelight.js"></script>
+{% endblock %}

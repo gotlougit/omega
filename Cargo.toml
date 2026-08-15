@@ -7,6 +7,7 @@ members = [
     "crates/omega-llm",
     "crates/omega-core",
     "crates/omega-loop",
+    "crates/omega-git-host",
     "crates/omega-tui",
     "crates/omega-sh-client",
     "crates/omega-tools",

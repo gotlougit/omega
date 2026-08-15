@@ -60,6 +60,8 @@ let
       "omega-sh"
       "-p"
       "omega-tui"
+      "-p"
+      "omega-git-host"
     ];
     nativeBuildInputs = with pkgs; [
       pkg-config
@@ -287,6 +289,44 @@ in
       '';
     };
 
+    # -------------------------------------------------------------------
+    # omega-git-host — read-only git forge + web UI over the project store
+    # -------------------------------------------------------------------
+    gitHost = mkOption {
+      type = types.submodule {
+        options = {
+          enable = mkEnableOption ''
+            omega-git-host, the read-only git forge + web UI over the
+            project store (git clone /{name}.git, repo pages, session
+            transcripts)
+          '';
+
+          port = mkOption {
+            type = types.port;
+            default = 8080;
+            description = "TCP port omega-git-host listens on.";
+          };
+
+          listenAddress = mkOption {
+            type = types.str;
+            default = "127.0.0.1";
+            description = ''
+              Address to bind.  Defaults to loopback on purpose: the forge
+              serves full session transcripts (possibly sensitive) and is
+              read-only — expose it deliberately (SSH tunnel, reverse
+              proxy, tailscale) rather than binding it openly.
+            '';
+          };
+        };
+      };
+      default = { };
+      description = ''
+        Read-only git hosting + web UI for everything omega works on
+        (SELFGIT.md).  Serves every registered project as a smart-HTTP
+        remote, session worktrees as branches, and session transcripts.
+      '';
+    };
+
     homeManager = mkOption {
       type = types.submodule {
         options = {
@@ -471,6 +511,7 @@ in
             "OMEGA_SOCKET_PATH=${omegaShSocket}"
             "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
             "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
+            "OMEGA_SESSION_DIR=${cfg.sessionDir}"
             "RUST_LOG=${cfg.logLevel}"
           ];
 
@@ -503,6 +544,48 @@ in
           ln -sfT '${cfg.sessionDir}' "${omegaDir}/sessions" 2>/dev/null || true
         '';
       };
+
+    # omega-git-host — read-only git forge + web UI (Phase 5: NixOS service)
+    systemd.services.omega-git-host = mkIf cfg.gitHost.enable {
+      description = "Omega-git-host (read-only git forge + web UI)";
+      after = [
+        "network.target"
+        "omega-loop.service"
+      ];
+      # `wants`, not `requires`: the forge is a read-only view over the store
+      # dirs and must keep serving even if the daemon is down or restarts.
+      wants = [ "omega-loop.service" ];
+      wantedBy = [ "multi-user.target" ];
+
+      serviceConfig = {
+        User = clankerUser;
+        Group = clankerGroup;
+
+        Type = "simple";
+        ExecStart = "${cfg.package}/bin/omega-git-host";
+        Restart = "on-failure";
+        RestartSec = "5s";
+
+        Environment = [
+          "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
+          "OMEGA_SESSION_DIR=${cfg.sessionDir}"
+          "OMEGA_GIT_HOST_LISTEN=${cfg.gitHost.listenAddress}"
+          "OMEGA_GIT_HOST_PORT=${toString cfg.gitHost.port}"
+          "RUST_LOG=${cfg.logLevel}"
+        ];
+
+        # Security hardening — the forge is read-only by design, so the whole
+        # home tree is mounted read-only.
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = false; # needs to read the project store + sessions
+        ReadOnlyPaths = [ clankerHome ];
+
+        RuntimeDirectory = "omega";
+        RuntimeDirectoryMode = "0770";
+      };
+    };
 
       # ----- omega binaries on the system ---------------------------------
       environment.systemPackages = [

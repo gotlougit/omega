@@ -1,0 +1,36 @@
+{% extends "layout.html" %}
+{% block body %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-8">
+      <p>
+        Welcome to <strong>{{domain}}</strong>! This is the git hosting service
+        for
+        <a href="{{cfg("sr.ht", "site-info")}}">
+          {{cfg("sr.ht", "site-name")}}</a>,
+        {{cfg("sr.ht", "site-blurb")}}.
+        {% if cfg("hg.sr.ht", "origin", default=None) %}
+        For Mercurial support, see our
+        <a href="{{cfg("hg.sr.ht", "origin")}}">
+          hg service</a>.
+        {% endif %}
+        Features of this service include:
+      </p>
+      <ul>
+        <li>Public, private, and "unlisted" repositories</li>
+        <li>Fine grained access control, including access for users without accounts</li>
+        <li>Software release management</li>
+      </ul>
+      <a
+        class="btn btn-primary"
+        href="{{get_origin("meta.sr.ht", external=True)}}/register"
+      >Register here {{icon('caret-right')}}</a>
+      or
+      <a href="{{login_url}}">
+        Log in {{icon('caret-right')}}
+      </a>
+      to get started.
+    </div>
+  </div>
+</div>
+{% endblock %}

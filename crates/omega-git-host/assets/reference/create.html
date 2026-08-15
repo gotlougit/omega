@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+  <div class="row">
+    <section class="col-md-6">
+      <h3 id="create">Create new repository</h3>
+      <form method="POST" action="/create">
+        {{csrf_token()}}
+        <div class="form-group">
+          <label for="name">Name</label>
+          <input
+            {% if another %}
+            autofocus
+            {% endif %}
+            type="text"
+            name="name"
+            id="name"
+            class="form-control {{valid.cls("name")}}"
+            value="{{ name or "" }}"
+            required />
+          {{valid.summary("name")}}
+        </div>
+        <div class="form-group">
+          <label for="description">Description</label>
+          <input
+            type="text"
+            name="description"
+            id="description"
+            class="form-control {{valid.cls("description")}}"
+            value="{{ description or "" }}" />
+          {{valid.summary("description")}}
+        </div>
+        <fieldset class="form-group">
+          <legend>Visibility</legend>
+          <div class="form-check form-check-inline">
+            <label
+              class="form-check-label"
+              title="Publically visible and listed on your profile"
+            >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="visibility"
+                value="PUBLIC"
+                {% if not visiblity or visibility == "PUBLIC" %}
+                checked
+                {% endif %}> Public
+            </label>
+          </div>
+          <div class="form-check form-check-inline">
+            <label
+                class="form-check-label"
+                title="Visible to anyone with the link, but not shown on your profile"
+              >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="visibility"
+                value="UNLISTED"
+                {% if visibility == "UNLISTED" %}
+                checked
+                {% endif %}> Unlisted
+            </label>
+          </div>
+          <div class="form-check form-check-inline">
+            <label
+              class="form-check-label"
+              title="Only visible to you and your collaborators"
+            >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="visibility"
+                value="PRIVATE"
+                {% if visibility == "PRIVATE" %}
+                checked
+                {% endif %}> Private
+            </label>
+          </div>
+        </fieldset>
+        <button type="submit" class="btn btn-primary">
+          Create {{icon("caret-right")}}
+        </button>
+        <label class="form-check-label" style="margin-left: 2rem">
+          <input
+            class="form-check-input"
+            type="checkbox"
+            name="another"
+            style="position: relative; top: 2px;"
+            {% if another %}
+            checked
+            {% endif %}> Create another?
+        </label>
+      </form>
+      {{valid.summary()}}
+    </section>
+    <section class="col-md-8">
+      <div class="alert alert-info">
+        <strong>Did you know?</strong> If you remember how our clone URLs are
+        written, you can push to repositories that don't exist &mdash; they'll
+        be automatically created for you.
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

@@ -82,6 +82,15 @@
               "omega-tui"
             ];
           };
+
+          omega-git-host = mkOmegaPkg {
+            inherit pkgs;
+            pname = "omega-git-host";
+            cargoBuildFlags = [
+              "-p"
+              "omega-git-host"
+            ];
+          };
         }
       );
 

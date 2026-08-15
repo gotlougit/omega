@@ -1,0 +1,34 @@
+{% extends "settings.html" %}
+
+{% block content %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-8">
+      <h3>Rename Repository</h3>
+      <form method="POST">
+        {{csrf_token()}}
+        <div class="form-group">
+          <label for="name" class="d-block">
+            New repository name:
+          </label>
+          <input
+            type="text"
+            class="form-control {{valid.cls('name')}}"
+            id="name"
+            name="name"
+            value="{{name or repo.name}}" />
+          {{valid.summary('name')}}
+        </div>
+        <p>
+          This will change the canonical URL of your repository. A redirect from
+          the old URL to the new one will be in place until you create another
+          repository with the same name.
+        </p>
+        <button type="submit" class="btn btn-primary pull-right">
+          Rename repository {{icon("caret-right")}}
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

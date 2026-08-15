@@ -1,0 +1,49 @@
+{% extends "repo.html" %}
+
+{% block title %}
+<title>{{ name }} ({{ ref }}){% if path %}: {{ path }}/{% endif %} - omega-git-host git</title>
+{% endblock %}
+
+{% block content %}
+<div class="header-extension">
+  <div class="container tree-header">
+    <div class="breadcrumb">
+      <a href="/{{ name }}/tree/{{ ref }}">{{ ref }}</a>
+      {% for crumb in crumbs %}
+      / <a href="/{{ name }}/tree/{{ ref }}/{{ crumb.path }}">{{ crumb.name }}</a>
+      {% endfor %}
+      {% if path %}/{% endif %}
+    </div>
+  </div>
+</div>
+<div class="container">
+  <div class="row mb-3">
+    <div class="col-md-12">
+      <div class="tree-list">
+        {% if path %}
+        <div class="mode"></div>
+        <div class="name tree">
+          <a href="/{{ name }}/tree/{{ ref }}{% if parent %}/{{ parent }}{% endif %}">..</a>
+        </div>
+        <div class="commit"></div>
+        <div class="date"></div>
+        <div class="size"></div>
+        {% endif %}
+        {% for e in entries %}
+        <div class="mode">{{ e.mode }}</div>
+        <div class="name {{ e.kind }}">
+          <a href="{{ e.href }}">{{ e.name }}</a>
+        </div>
+        <div class="commit">
+          {% if e.commit %}
+          <a href="/{{ name }}/commit/{{ e.commit.short }}">{{ e.commit.subject }}</a>
+          {% endif %}
+        </div>
+        <div class="date">{% if e.commit %}{{ e.commit.date | date }}{% endif %}</div>
+        <div class="size">{{ e.size }}</div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

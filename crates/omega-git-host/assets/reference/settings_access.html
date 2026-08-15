@@ -1,0 +1,196 @@
+{% extends "settings.html" %}
+
+{% block settings %}
+<div class="row">
+  <div class="col-md-12">
+    <section class="event">
+      <h3>Account permissions</h3>
+      {% if len(repo.acls.results) > 0 %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Granted</th>
+            <th>Access</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for grant in repo.acls.results %}
+          <tr>
+            <td>
+              <a href="/~{{ grant.entity.username }}">~{{grant.entity.username}}</a>
+            </td>
+            <td>{{ grant.created | date }}</td>
+            <td>{{ grant.mode.value }}</td>
+            <td style="width: 6rem">
+              <form
+                method="POST"
+                action="/~{{owner.username}}/{{
+                  repo.name
+                }}/settings/access/revoke/{{ grant.id }}"
+              >
+                {{csrf_token()}}
+                <button type="submit" class="btn btn-danger btn-fill">Revoke</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+      <form method="POST">
+        {{csrf_token()}}
+        <div class="form-group">
+          <label for="user">User:</label>
+          <input
+            type="text"
+            class="form-control {{valid.cls("user")}}"
+            id="user"
+            name="user"
+            placeholder="~{{ current_user.username }}"
+            value="{{user or ""}}"
+          />
+          {{valid.summary("user")}}
+        </div>
+        <fieldset class="form-group">
+          <legend>Access</legend>
+          <!-- This is in a weird spot cause it looks better over here -->
+          <button type="submit" class="btn btn-primary pull-right">
+            Grant access {{icon("caret-right")}}
+          </button>
+          <div class="form-check form-check-inline">
+            <label
+              class="form-check-label"
+              title="Can view on the web and clone the repository"
+            >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="access"
+                value="RO"
+                {{ "checked" if not access or access == "RO" else "" }}
+              > Read only
+            </label>
+          </div>
+          <div class="form-check form-check-inline">
+            <label
+                class="form-check-label"
+                title="Can push commits to the repository"
+              >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="access"
+                value="RW"
+                {{ "checked" if access and access == "RW" else "" }}
+              > Read/write
+            </label>
+          </div>
+        </fieldset>
+      </form>
+    </section>
+    <section class="event">
+      <h3>Deploy keys</h3>
+      {% if len(repo.deploy_keys.results) > 0 %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Fingerprint</th>
+            <th>Authorized</th>
+            <th>Last used</th>
+            <th>Access</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for key in repo.deploy_keys.results %}
+          <tr>
+            <td>{{key.comment or '(no name)'}}</td>
+            <td>{{key.fingerprint_sha_256}}</td>
+            <td>{{ key.created | date }}</td>
+            <td>{{ key.last_used | date }}</td>
+            <td>{{ key.access.value }}</td>
+            <td style="width: 6rem">
+              <form
+                method="POST"
+                action="/~{{owner.username}}/{{
+                  repo.name
+                }}/settings/access/revoke-key/{{ key.rid }}"
+              >
+                {{csrf_token()}}
+                <button type="submit" class="btn btn-danger btn-fill">Remove</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+      {% if deploy_keys_cursor %}
+      <a
+        href="?next_keys={{deploy_keys_cursor}}"
+        class="btn btn-default pull-right"
+      >Next {{icon('caret-right')}}</a>
+      {% endif %}
+      <form
+        method="POST"
+        action="/~{{owner.username}}/{{
+          repo.name
+        }}/settings/access/deploy-key"
+      >
+        {{csrf_token()}}
+        <div class="form-group">
+          <label for="deploy-key">SSH public key:</label>
+          <input
+            type="text"
+            class="form-control {{valid.cls("key")}}"
+            id="ssh-key"
+            name="key"
+            placeholder="ssh-ed25519 bWFyYmxlY2FrZQo= ..."
+	    value="{{ssh_key or ""}}"
+          />
+          {{valid.summary("key")}}
+          {{valid.summary()}}
+        </div>
+        <fieldset class="form-group">
+          <legend>Access</legend>
+          <!-- This is in a weird spot cause it looks better over here -->
+          <button type="submit" class="btn btn-primary pull-right">
+            Grant access {{icon("caret-right")}}
+          </button>
+          <div class="form-check form-check-inline">
+            <label
+              class="form-check-label"
+              title="Can clone and pull from the repository"
+            >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="keyaccess"
+                value="RO"
+                {{ "checked" if not keyaccess or keyaccess == "RO" else "" }}
+		> Read only
+            </label>
+          </div>
+          <div class="form-check form-check-inline">
+            <label
+                class="form-check-label"
+                title="Can push changes to the repository"
+              >
+              <input
+                class="form-check-input"
+                type="radio"
+                name="keyaccess"
+                value="RW"
+                {{ "checked" if keyaccess and keyaccess == "RW" else "" }}
+              > Read/write
+            </label>
+          </div>
+        </fieldset>
+      </form>
+    </section>
+  </div>
+</div>
+{% endblock %}

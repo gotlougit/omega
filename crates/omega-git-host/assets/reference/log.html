@@ -1,0 +1,66 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}}: {% if path != [''] %}{{path_join(*path)}} {% endif %}{{ ref }} - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+
+{% block repohead %}
+  <link rel="alternate"
+    title="{{ repo.owner.canonical_name }}/{{ repo.name }}: {{ ref }} log"
+    type="application/rss+xml"
+    href="{{ root }}{{ repo|log_rss_url(ref=ref) }}">
+<meta name="robots" content="nofollow">
+{% endblock %}
+
+{% block tabs_extra %}
+  {% if not repo.indexed or not cfg('git.sr.ht', 'repos-index') or not current_user %}
+  <li class="flex-grow-1 d-none d-sm-block"></li>
+  {% endif %}
+  <li class="nav-item d-none d-sm-block">
+    <a class="nav-link active" href="{{ repo|log_rss_url(ref=ref) }}">
+      {{ icon('rss', cls='sm') }} RSS
+    </a>
+  </li>
+{% endblock %}
+
+{% block content %}
+{% if path != [''] and len(commits) != 0 %}
+<div class="header-extension">
+  <div class="container">
+    <span class="pl-3">
+      {{ utils.breadcrumb(ref, commits[0].id, repo, path, entry, view, path_join, stat, pygit2, humanize, current_user) }}
+    </span>
+    <div class="clearfix"></div>
+  </div>
+</div>
+{% endif %}
+
+<div class="container">
+  <div class="row">
+    <div class="col-md-12">
+      <div class="event-list">
+        {% set full_path = path_join(*path) %}
+        {% for c in commits %}
+        <div class="event">
+          {{ utils.commit_event(repo, c, True, refs, path=full_path, lookup=authors.get, mailmap=mailmap) }}
+        </div>
+        {% else %}
+        <div class="event">
+          No commits{% if path != [''] %} for this path{% endif %}.
+        </div>
+        {% endfor %}
+      </div>
+      {% if next_commit %}
+      <a
+        class="pull-right btn btn-primary"
+        href="{{url_for("repo.log",
+          owner=owner.canonical_name,
+          repo=repo.name,
+          ref=ref,
+          path=full_path,
+        )}}?from={{next_commit.id}}"
+      >Next {{icon("caret-right")}}</a>
+      {% endif %}
+    </div>
+</div>
+{% endblock %}

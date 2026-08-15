@@ -1,0 +1,67 @@
+{% extends "repo.html" %}
+
+{% block title %}
+<title>{{ name }} refs - omega-git-host git</title>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-8">
+      {% if worktrees %}
+      <h3>session worktrees</h3>
+      <div class="event-list">
+        {% for w in worktrees %}
+        <div class="event">
+          <h4 class="mb-2">
+            {{ w.session.display_name if w.session else w.branch }}
+            <small class="pull-right text-muted">{% if w.session %}{{ w.session.updated | date }}{% endif %}</small>
+          </h4>
+          <p>
+            <a href="/{{ name }}/tree/{{ w.branch }}">{{ w.branch }}</a>
+            &mdash; <a href="/{{ name }}/commit/{{ w.short }}">{{ w.subject }}</a>
+            {% if w.session %}
+            <a class="ml-2" href="/sessions/{{ w.session.session_id }}">view chat</a>
+            {% endif %}
+          </p>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <h3>branches</h3>
+      <div class="event-list">
+        {% for b in branches %}
+        <div class="event">
+          <h4 class="mb-2">
+            {{ b.name }}
+            <small class="pull-right text-muted">{{ b.date | date }}</small>
+          </h4>
+          <p>
+            <a href="/{{ name }}/tree/{{ b.name }}">{{ b.short }}</a>
+            &mdash; {{ b.subject }}
+          </p>
+        </div>
+        {% else %}
+        <p class="text-muted">No branches.</p>
+        {% endfor %}
+      </div>
+
+      {% if tags %}
+      <h3>tags</h3>
+      <div class="event-list">
+        {% for t in tags %}
+        <div class="event">
+          <h4 class="mb-2">
+            {{ t.name }}
+            <small class="pull-right text-muted">{{ t.date | date }}</small>
+          </h4>
+          <p>{{ t.short }} &mdash; {{ t.subject }}</p>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

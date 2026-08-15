@@ -1,0 +1,24 @@
+{% extends "repo.html" %}
+
+{% block title %}
+<title>{{ name }} commit {{ c.short }} - omega-git-host git</title>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="event mb-3">
+    <a href="/{{ name }}/commit/{{ c.sha }}">{{ c.short }}</a> &mdash;
+    {{ c.author }} &lt;{{ c.email }}&gt;
+    <small class="pull-right">{{ c.date | date }}</small>
+    <h4 class="mt-2">{{ c.subject }}</h4>
+    {% if body %}
+    <pre>{{ body }}</pre>
+    {% endif %}
+  </div>
+  {% if diff %}
+  <pre class="diff">{{ diff | diff }}</pre>
+  {% else %}
+  <p class="text-muted">No changes.</p>
+  {% endif %}
+</div>
+{% endblock %}

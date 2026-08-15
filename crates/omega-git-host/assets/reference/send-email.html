@@ -1,0 +1,140 @@
+{% extends "layout.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>Preparing patchset for {{repo.owner.canonical_name}}/{{repo.name}} - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+{% block body %}
+<div class="header-tabbed">
+  <div class="container">
+    <ul class="nav nav-tabs">
+      <h2>
+        <a
+          href="/{{ owner.canonical_name }}"
+        >{{ owner.canonical_name }}</a>/<wbr>{{ repo.name }}
+      </h2>
+      <li class="nav-item">
+        <a class="nav-link" href="{{url_for("repo.summary",
+            owner=repo.owner.canonical_name, repo=repo.name)}}">
+          {{icon("caret-left")}} back
+        </a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link active" href="{{url_for("mail.send_email_start",
+            owner=repo.owner.canonical_name, repo=repo.name)}}">
+          prepare patchset
+        </a>
+      </li>
+    </ul>
+  </div>
+</div>
+<form
+  class="container prepare-patchset"
+  method="POST"
+  action="{{url_for('mail.send_email_end',
+    owner=repo.owner.canonical_name, repo=repo.name)}}"
+>
+  {{csrf_token()}}
+  <legend>Select a branch</legend>
+
+  {% for branch in branches[:2] %}
+  {%- set branch_hash = branch[0] | hash -%}
+  <input
+    type="radio"
+    name="branch"
+    value="{{branch[0]|url_quote}}"
+    id="branch-{{branch_hash}}"
+    {% if loop.first %}checked{% endif %}
+    />
+  <label for="branch-{{branch_hash}}">
+    {{branch[0].decode("utf-8", "replace")}}
+    <span class="text-muted">
+      (active {{ commit_time(branch[2]) | date }})
+    </span>
+  </label>
+  {{valid.summary("branch")}}
+  {% endfor %}
+
+  {% if any(branches[2:]) %}
+  <details>
+    <summary>More branches</summary>
+    <ul>
+      {% for branch in branches[2:] %}
+      <li>
+        {{branch[0].decode("utf-8", "replace")}}
+        <span class="text-muted">(active {{commit_time(branch[2]) | date}})</span>
+        <br />
+        <a href="?branch={{branch[0]|url_quote}}">
+          Select this branch {{icon('caret-right')}}
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+  </details>
+  {% endif %}
+
+  <legend>Select the first commit</legend>
+  <small class="event-list-help">
+    Choose the earliest commit which you want to include in the patchset.
+    You'll be able to trim commits off the top in the next step.
+  </small>
+  {% for branch in branches[:2] %}
+  {%- set branch_hash = branch[0] | hash -%}
+  {%- set branch_quoted = branch[0] | url_quote -%}
+  <div class="event-list commit-list reverse commits-{{branch_hash}}">
+    {% if commits[branch[0]][-1].parents %}
+    {% set show_commits = commits[branch[0]][:-1] %}
+    {% else %}
+    {% set show_commits = commits[branch[0]] %}
+    {% endif %}
+    {% for c in show_commits[::-1] %}
+    <input
+      type="radio"
+      name="commit-{{branch_quoted}}"
+      id="commit-{{branch_hash}}-{{str(c.id)}}"
+      value="{{str(c.id)}}"
+      {% if loop.last %}checked{% endif %} />
+    <label class="event" for="commit-{{branch_hash}}-{{str(c.id)}}">
+      {{ utils.commit_event(repo, c, False, target_blank=True) }}
+    </label>
+    {{valid.summary("branch-" + branch_quoted)}}
+    {% endfor %}
+  </div>
+  <div class="pull-right form-controls form-controls-{{branch_hash}}">
+    {% if commits[branch[0]][-1].parents and (len(commits[branch[0]])-1) < 32 %}
+    {# TODO: suggest request-pull for >32 commits (or less, tbh) #}
+    <a
+      class="btn btn-default"
+      {% if selected_branch %}
+      href="?commits={{(len(commits[branch[0]])-1) * 2}}&branch={{selected_branch}}"
+      {% else %}
+      href="?commits={{(len(commits[branch[0]])-1) * 2}}"
+      {% endif %}
+    >Add more commits {{icon("caret-right")}}</a>
+    {% endif %}
+    <button
+      class="btn btn-primary"
+    >Continue {{icon("caret-right")}}</a>
+  </div>
+  <div class="clearfix"></div>
+  {% endfor %}
+</form>
+{% endblock %}
+
+{% block repohead %}
+<style>
+  .event-list.commit-list, .form-controls {
+    display: none;
+  }
+
+  {% for branch in branches[:2] %}
+  {%- set branch_hash = branch[0] | hash -%}
+  #branch-{{branch_hash}}:checked ~ .commits-{{branch_hash}} {
+    display: flex;
+  }
+
+  #branch-{{branch_hash}}:checked ~ .form-controls-{{branch_hash}} {
+    display: block;
+  }
+  {% endfor %}
+</style>
+{% endblock %}

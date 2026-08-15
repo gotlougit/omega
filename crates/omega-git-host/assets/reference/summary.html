@@ -1,0 +1,198 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>
+{{repo.owner.canonical_name}}/{{repo.name}} -
+{% if repo.description %}
+{{repo.description}} -
+{% endif %}
+{{cfg("sr.ht", "site-name")}} git
+</title>
+{% endblock %}
+
+{% block content %}
+{% if repo.description or len(licenses) > 0 %}
+<div class="header-extension">
+  <div class="container">
+    <div class="row">
+      <div class="col-md-12">
+        {{ repo.description }}
+      </div>
+      <div class="col-md-6 licenses">
+      {% if len(licenses) > 0 %}
+      <a href="{{url_for("repo.licenses",
+        owner=repo.owner.canonical_name, repo=repo.name)}}">
+      Licensed under
+      {% for l in licenses %}
+      {{ l['id'] }}{% if loop.index != len(licenses) %}, {% endif %}
+      {% endfor %}
+      {% endif %}
+      </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endif %}
+<div class="container">
+  {% if message %}
+  <div class="alert alert-success">{{message}}</div>
+  {% endif %}
+  <div class="row mb-3">
+    <div class="col-md-6">
+      <div class="event-list mb-2">
+        {% for c in commits %}
+        <div class="event">
+          {{ utils.commit_event(repo, c, mailmap=mailmap) }}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="row">
+        <div class="col-md-4">
+          <h3>refs</h3>
+          <dl>
+            {% if default_branch %}
+            <dt>{{default_branch.raw_name.decode("utf-8", "replace")[len("refs/heads/"):]}}</dt>
+            <dd>
+              <a href="{{url_for("repo.tree",
+                  owner=repo.owner.canonical_name, repo=repo.name)}}"
+                 rel="nofollow"
+              >browse&nbsp;{{icon("caret-right")}}</a>
+              <a href="{{url_for("repo.log",
+                owner=repo.owner.canonical_name, repo=repo.name)}}"
+                rel="nofollow"
+              >log&nbsp;{{icon("caret-right")}}</a>
+            </dd>
+            {% endif %}
+            {% if latest_tag %}
+	    {% set tagname = latest_tag[0].decode("utf-8", "replace") %}
+            <dt>{{ tagname[len("refs/tags/"):] }}</dt>
+            <dd>
+              {% if is_annotated(latest_tag[1]) %}
+                <a href="{{url_for("repo.ref",
+                    owner=repo.owner.canonical_name,
+                    repo=repo.name, ref=tagname[len("refs/tags/"):])}}"
+                >release notes&nbsp;{{icon("caret-right")}}</a>
+              {% else %}
+                <a href="{{url_for("repo.tree", owner=repo.owner.canonical_name,
+                    repo=repo.name, ref=tagname[len("refs/tags/"):])}}"
+                   rel="nofollow"
+                >browse&nbsp;{{icon("caret-right")}}</a>
+                <a href="{{url_for("repo.archive", owner=repo.owner.canonical_name,
+                    repo=repo.name, ref=tagname[len("refs/tags/"):], fmt=signature or "tar.gz")}}"
+                   rel="nofollow"
+                >.{{ signature or "tar.gz" }}&nbsp;{{icon("caret-right")}}</a>
+                {% if signature %}
+                  <a href="{{url_for("repo.archivesig", owner=repo.owner.canonical_name,
+                      repo=repo.name, ref=tagname[len("refs/tags/"):], fmt=signature)}}"
+                     rel="nofollow"
+                  >.asc&nbsp;{{icon("caret-right")}}</a>
+                {% else %}
+                  <a href="{{url_for("repo.archive", owner=repo.owner.canonical_name,
+                      repo=repo.name, ref=tagname[len("refs/tags/"):], fmt="zip")}}"
+                     rel="nofollow"
+                  >.zip&nbsp;{{icon("caret-right")}}</a>
+                {% endif %}
+              {% endif %}
+            </dd>
+            {% endif %}
+          </dl>
+        </div>
+        <div class="col-md-8">
+          <h3>clone</h3>
+          {% with read_only, read_write = repo|clone_urls %}
+          <dl>
+            <dt>read-only</dt>
+            <dd><a href="{{read_only}}">{{read_only}}</a></dd>
+            <dt>read/write</dt>
+            <dd>{{read_write}}</dd>
+          </dl>
+          {% endwith %}
+        </div>
+      </div>
+      <div class="row">
+        <div class="col-md-8 offset-md-4">
+          {% if current_user == repo.owner %}
+          <a
+            href="{{ url_for('mail.send_email_start',
+              owner=repo.owner.canonical_name, repo=repo.name) }}"
+            class="btn btn-primary btn-block"
+          >Prepare a patchset {{icon('caret-right')}}</a>
+          <p class="text-muted text-centered">
+            <small>
+              Use this or <a href="https://git-send-email.io">git
+              send-email</a> to send changes upstream.
+            </small>
+          </p>
+          {% elif current_user != repo.owner %}
+          <form method="POST" action="{{url_for('manage.clone_POST')}}">
+            {{csrf_token()}}
+            <input type="hidden" name="cloneUrl" value="{{(repo|clone_urls)[0]}}" />
+            <input type="hidden" name="name" value="{{repo.name}}" />
+            <input type="hidden" name="description" value="Clone of {{(repo|clone_urls)[0]}}" />
+            <input type="hidden" name="visibility" value="{% if repo.visibility.value == 'PRIVATE' %}PRIVATE{% else %}UNLISTED{% endif %}" />
+            <button type="submit" class="btn btn-primary btn-block">
+              Clone repo to your account {{icon('caret-right')}}
+            </button>
+            <p class="text-muted text-centered">
+              <small>
+                You can also use your local clone with
+                <a href="https://git-send-email.io">git send-email</a>.
+              </small>
+            </p>
+          </form>
+          {% else %}
+          <p class="text-centered text-muted">
+            <small>
+              You can contribute to this project without a
+              {{cfg('sr.ht', 'site-name')}}
+              account with
+              <a href="https://git-send-email.io">git send-email</a>,
+              or you can <a
+                href="{{get_origin('meta.sr.ht', external=True)}}"
+              >sign up here</a>.
+            </small>
+          </p>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% if current_user == repo.owner and not license_exists
+    and repo.visibility.value == 'PUBLIC' %}
+  <div class="alert alert-danger">
+    <strong>Heads up!</strong> We couldn't find a license file for your
+    repository, which means that it may not be possible for others to use this
+    project. If you're unsure of how to choose a license, consult our wiki page,
+    <a
+      href="https://man.sr.ht/license.md" rel="noopener"
+    >choosing a software license</a>.
+  </div>
+  {% endif %}
+  {% if readme %}
+  <div class="row" id="readme">
+    <div class="col-md-10">
+      {{ readme }}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% if len(licenses) > 0 %}
+<div class="container license-footer">
+  <a href="{{url_for("repo.licenses",
+    owner=repo.owner.canonical_name, repo=repo.name)}}">
+  {{repo.owner.canonical_name}}/{{repo.name}} license{% if len(licenses) > 1 %}s{% endif %}:
+  {% for l in licenses %}
+  {{ l['id'] }}{% if loop.index != len(licenses) %}, {% endif %}
+  {% endfor %}
+  </a>
+</div>
+{% endif %}
+<footer class="container d-flex flex-grow-1 align-items-end justify-content-center">
+  <small class="text-muted" title="The resource ID for this repository, used to identify it in the GraphQL API.">
+    Repository RID: {{to_rid(repo.rid)}}
+  </small>
+</footer>
+{% endblock %}

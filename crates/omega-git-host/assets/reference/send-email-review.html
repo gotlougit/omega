@@ -1,0 +1,112 @@
+{% extends "layout.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>Review patchset for {{repo.owner.canonical_name}}/{{repo.name}} - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+{% block body %}
+<div class="header-tabbed">
+  <div class="container">
+    <ul class="nav nav-tabs">
+      <h2>
+        <a
+          href="/{{ owner.canonical_name }}"
+        >{{ owner.canonical_name }}</a>/<wbr>{{ repo.name }}
+      </h2>
+      <li class="nav-item">
+        <a class="nav-link" href="{{url_for("repo.summary",
+            owner=repo.owner.canonical_name, repo=repo.name)}}">
+          {{icon("caret-left")}} back
+        </a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link active" href="{{url_for("mail.send_email_start",
+            owner=repo.owner.canonical_name, repo=repo.name)}}">
+          prepare patchset
+        </a>
+      </li>
+    </ul>
+  </div>
+</div>
+<form
+  class="container prepare-patchset"
+  method="POST"
+  action="{{url_for('mail.send_email_send',
+    owner=repo.owner.canonical_name,
+    repo=repo.name)}}"
+>
+  <h3>Review your patchset</h3>
+  <p>
+    The following emails are going to be sent on your behalf. To whom should
+    they be sent?
+  </p>
+  {{csrf_token()}}
+  <input type="hidden" name="start_commit" value="{{str(start.id)}}" />
+  <input type="hidden" name="end_commit" value="{{str(end.id)}}" />
+  <input type="hidden" name="cover_letter_subject" value="{{cover_letter_subject}}" />
+  <input type="hidden" name="version" value="{{version}}" />
+  <div class="row">
+    <div class="col-md-10">
+      <div class="form-group">
+        <label for="patchset_to">To</label>
+        <input
+          type="text"
+          name="patchset_to"
+          id="patchset_to"
+          class="form-control {{valid.cls('patchset_to')}}"
+          placeholder="Joe Bloe <jbloe@example.org>, Jane Doe <jdoe@example.org>" />
+        {{valid.summary('patchset_to')}}
+        <small class="form-text text-muted">
+          This is usually a mailing list, or the project maintainer(s).
+          {% if readme %}
+          Check <a
+            href="{{url_for('repo.summary', owner=owner, repo=repo.name)}}#readme"
+            target="_blank"
+          >{{readme}}</a> for more info.
+          {% endif %}
+        </small>
+      </div>
+      <div class="form-group mb-0">
+        <label for="patchset_cc">Cc</label>
+        <input
+          type="text"
+          name="patchset_cc"
+          id="patchset_cc"
+          class="form-control {{valid.cls('patchset_cc')}}"
+          placeholder="Jane Doe <jdoe@example.org>, Joe Bloe <jbloe@example.org>" />
+        {{valid.summary('patchset_cc')}}
+      </div>
+    </div>
+    <div class="col-md-2 d-flex flex-column justify-content-end">
+      <div class="form-group mb-0">
+        <button class="btn btn-primary btn-block">
+          Send patchset {{icon('caret-right')}}
+        </button>
+      </div>
+    </div>
+  </div>
+</form>
+{# TODO: highlight the diff? #}
+<div class="container">
+  <div class="alert alert-info">
+    <p>
+      This is equivalent to the following
+      <a href="https://git-send-email.io">git send-email</a> command:
+    </p>
+    {# TODO: More concise send-email commands, e.g. use HEAD where appropriate #}
+    <pre
+      class="mb-0"
+    >git config format.subjectPrefix "PATCH {{repo.name}}" <span class="text-muted"># Only necessary once</span>
+git send-email {% if version != 1 %}-v{{version}} {% endif %}{% if cover_letter %}--cover-letter {% endif %}{% if start.parent_ids %}{{start.short_id}}^..{% else %}--root {% endif %}{{end.short_id}}</pre>
+  </div>
+  <div class="event-list">
+    {% for email in emails %}
+    <h3>{{email["Subject"]}}</h3>
+    <pre class="event"><span class="text-muted">
+{%- for key, value in email.items() -%}
+{{key}}: {{value}}
+{% endfor %}</span>
+{{email.get_payload(decode=True).decode(errors='ignore')}}</pre>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

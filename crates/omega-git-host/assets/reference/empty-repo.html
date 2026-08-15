@@ -1,0 +1,45 @@
+{% extends "repo.html" %}
+{% block repohead %}
+{% if repo.clone_status == 'IN_PROGRESS' %}
+<meta http-equiv="refresh" content="5">
+{% endif %}
+{% endblock %}
+
+{% block content %}
+{% if repo.description %}
+<div class="header-extension">
+  <div class="container">{{ repo.description }}</div>
+</div>
+{% endif %}
+<div class="container">
+  <div class="row mb-3">
+    <div class="col-md-4">
+      <h3>clone</h3>
+      <dl>
+        {% with read_only, read_write = repo|clone_urls %}
+        <dl>
+          <dt>read-only</dt>
+          <dd><a href="{{read_only}}">{{read_only}}</a></dd>
+          <dt>read/write</dt>
+          <dd>{{read_write}}</dd>
+        </dl>
+        {% endwith %}
+      </dl>
+    </div>
+    <div class="col-md-8">
+      {% if repo.clone_status == 'IN_PROGRESS' %}
+      <div class="alert alert-primary">
+        A clone operation is currently in progress.
+      </div>
+      {% elif repo.clone_status == 'ERROR' %}
+      <div class="alert alert-danger">
+        An error occured while cloning: {{repo.clone_error}}
+      </div>
+      {% endif %}
+      <p>
+        Nothing here yet!
+      </p>
+    </div>
+  </div>
+</div>
+{% endblock %}

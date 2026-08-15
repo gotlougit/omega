@@ -1,0 +1,14 @@
+<span class="navbar-brand">
+  <svg class="icon" viewBox="0 0 16 16" width="1em" height="1em" aria-hidden="true">
+    <circle cx="8" cy="8" r="6" fill="currentColor"/>
+  </svg>
+  <a class="navbar-brand" href="/">omega<span class="text-danger">git-host</span></a>
+</span>
+<ul class="navbar-nav">
+  <li class="nav-item {{ "active" if nav_projects_active else "" }}">
+    <a class="nav-link" href="/">projects</a>
+  </li>
+  <li class="nav-item {{ "active" if nav_sessions_active else "" }}">
+    <a class="nav-link" href="/sessions/">sessions</a>
+  </li>
+</ul>

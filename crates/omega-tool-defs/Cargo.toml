@@ -2,6 +2,7 @@
 name = "omega-tool-defs"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 description = "Canonical tool definitions (name, description, input schema) shared across omega-sh, omega-sh-client, and omega-tools"
 
 [dependencies]

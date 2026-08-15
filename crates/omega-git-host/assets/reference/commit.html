@@ -1,0 +1,63 @@
+{% extends "repo.html" %}
+{% import "utils.html" as utils with context %}
+{% block title %}
+<title>{{repo.owner.canonical_name}}/{{repo.name}}: {{trim_commit(commit.message)}} - {{cfg("sr.ht", "site-name")}} git</title>
+{% endblock %}
+{% block content %}
+<div class="container">
+  <div class="row">
+    <div class="col-md-10">
+      <div class="event-list">
+        <div class="event">
+          {{ utils.commit_event(repo, commit, full_body=True,
+            full_id=True, refs=refs, parents=True, mailmap=mailmap) }}
+        </div>
+      </div>
+    </div>
+    <div class="col-md-2">
+      <div class="mb-3">
+        <a
+          href="{{url_for("repo.patch",
+            owner=repo.owner.canonical_name,
+            repo=repo.name,
+            ref=str(commit.id))}}"
+          class="btn btn-primary btn-block"
+        >patch {{icon("caret-right")}}</a>
+        <a
+          href="{{url_for("repo.tree",
+            owner=repo.owner.canonical_name,
+            repo=repo.name,
+            ref=str(commit.id))}}"
+          class="btn btn-default btn-block"
+	  rel="nofollow"
+        >browse {{icon("caret-right")}}</a>
+        <a
+          href="{{url_for("repo.archive",
+            owner=repo.owner.canonical_name,
+            repo=repo.name,
+            ref=str(commit.id))}}"
+          class="btn btn-default btn-block"
+        >.tar.gz {{icon("caret-right")}}</a>
+        <a
+          href="{{url_for("repo.archive",
+            owner=repo.owner.canonical_name,
+            repo=repo.name,
+            ref=str(commit.id),
+            fmt="zip")}}"
+          class="btn btn-default btn-block"
+        >.zip {{icon("caret-right")}}</a>
+      </div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col-md-12">
+      <div class="event-list">
+        <div class="event diff">
+          <pre>{{diffstat(diff)}}</pre>
+        </div>
+        <div style="margin-bottom: 2rem"></div>
+        {{utils.commit_diff(repo, commit, diff)}}
+      </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,268 @@
+{% macro breadcrumb(ref, permaref, repo, path, entry, view, path_join, stat, pygit2, humanize, current_user) %}
+{% if ref != repo.git_repo.default_branch_name() %}
+<span class="mr-3">
+  <span class="text-muted">ref:</span> {{ ref }}
+</span>
+{% endif %}
+{% if path != [''] %}
+<a href="{{url_for("repo.tree",
+  owner=repo.owner.canonical_name, repo=repo.name, ref=ref)}}"
+  rel="nofollow"
+>{{repo.name}}</a>{% endif %}/{% for part in path%}{%
+  if loop.last %}{{part}}{% else %}<a
+    href="{{url_for("repo.tree", owner=repo.owner.canonical_name,
+      repo=repo.name, ref=ref,
+      path=path_join(*path[:loop.index]))}}"
+  >{{part}}</a>/{%
+endif %}{% endfor %}
+
+{% set is_blob = entry and entry.type == pygit2.GIT_OBJECT_BLOB %}
+{% if entry %}
+  {# Root tree has no filemode #}
+  {% set filemode = entry.filemode or stat.S_IFDIR %}
+  <span class="text-muted ml-3">
+    <span title="{{"{0:0o}".format(filemode)}}">
+      {{stat.filemode(filemode)}}
+    </span>
+  </span>
+
+  {% if is_blob %}
+    <span class="text-muted ml-3">
+      <span title="{{ entry.size }} bytes">
+        {{humanize.naturalsize(entry.size,
+          binary=True).replace("Byte", "byte")}}
+      </span>
+    </span>
+  {% endif %}
+{% endif %}
+
+{% set path = path_join(*path) %}
+<div class="subnav ml-3">
+  <ul class="nav nav-tabs">
+    <li class="nav-item">
+      <a class="nav-link {% if view in ["blob", "tree"] %}active{% endif %}"
+         href="{{url_for("repo.tree", owner=repo.owner.canonical_name,
+              repo=repo.name, ref=ref, path=path)}}" rel="nofollow">
+        {%- if is_blob %}View{% else %}Browse{% endif %}</a>
+    </li>
+
+    <li class="nav-item">
+      <a class="nav-link {% if view == "log" %}active{% endif %}"
+         href="{{url_for("repo.log", owner=repo.owner.canonical_name,
+              repo=repo.name, ref=ref, path=path)}}" rel="nofollow">Log</a>
+    </li>
+
+    {% if is_blob %}
+      {% if current_user and not entry.is_binary %}
+        <li class="nav-item">
+          <a class="nav-link {% if view == "blame" %}active{% endif %}"
+             href="{{url_for("repo.blame", owner=repo.owner.canonical_name,
+                  repo=repo.name, ref=ref, path=path)}}" rel="nofollow">Blame</a>
+        </li>
+      {% endif %}
+
+      <li class="nav-item">
+        <a class="nav-link" rel="noopener noreferrer nofollow"
+           href="{{url_for("repo.raw_blob", owner=repo.owner.canonical_name,
+                repo=repo.name, ref=ref, path=path)}}" rel="nofollow">View raw</a>
+      </li>
+    {% endif %}
+    <li class="nav-item">
+      <a class="nav-link"
+         {%- set args = request.view_args.copy() -%}
+         {%- do args.update(dict(ref=permaref)) -%}
+         href="{{url_for(request.endpoint, **args)}}" rel="nofollow">Permalink</a>
+    </li>
+  </ul>
+</div>
+{% endmacro %}
+
+{% macro commit_event(repo, c,
+  full_body=False, refs={}, full_id=False, diff=None, href=None,
+  parents=False, skip_body=False, target_blank=False, path=None,
+  lookup=lookup_user, mailmap=None) %}
+<div>
+  {% if full_id %}
+  {{str(c.id)}}
+  {% else %}
+  <a
+    {% if href %}
+    href="{{href}}"
+    {% else %}
+    href="{{url_for("repo.commit", owner=repo.owner.canonical_name,
+      repo=repo.name, ref=str(c.id))}}{% if path %}#{{path}}{% endif %}"
+    {% endif %}
+    title="{{str(c.id)}}"
+    {% if target_blank %}
+    target="_blank"
+    {% endif %}
+    rel="nofollow"
+  >{{str(c.id)[:8]}}</a>
+  {% endif %}
+  &mdash;
+  {% set author_user = lookup(c.author.email) %}
+  {% if mailmap and c.author.name and c.author.email %}
+  {% set author = mailmap.resolve_signature(c.author) %}
+  {% else %}
+  {% set author = c.author %}
+  {% endif %}
+
+  {% if author_user %}
+  <a href="{{url_for("public.user_index",
+    username=author_user.username)}}">{{author.name}}</a>
+  {% else %}
+  {{author.name}}
+  {% endif %}
+  <small class="pull-right">
+    <a
+      id="log-{{c.id}}"
+      href="{{url_for("repo.log", owner=repo.owner.canonical_name,
+        repo=repo.name)}}?from={{c.id}}#log-{{c.id}}"
+      rel="nofollow"
+    >{{ commit_time(c) | date }}</a>
+  </small>
+
+  {% if parents and any(c.parents) %}
+  <span class="ml-2">
+    {{icon('code-branch', cls="sm")}}
+    {% for parent in c.parents %}
+    <a href="{{url_for("repo.commit",
+      owner=repo.owner.canonical_name,
+      repo=repo.name,
+      ref=str(parent.id))}}"
+      rel="nofollow"
+    >{{parent.short_id}}</a>
+    {% if not loop.last %}
+    +
+    {% endif %}
+    {% endfor %}
+  </span>
+  {% endif %}
+
+  {% if str(c.id) in refs %}
+  <span class="ml-2">
+    {% for ref in refs[str(c.id)] %}
+    <a
+      class="ref {{ref.type}}
+        {{"annotated" if ref.type == "tag" and ref.tag.message else ""}}"
+      {% if ref.type == "branch" %}
+      href="{{url_for("repo.tree",
+        owner=repo.owner.canonical_name, repo=repo.name, ref=ref.name.decode('utf-8', 'replace'))}}"
+      {% elif ref.type == "tag" %}
+      href="{{url_for("repo.ref",
+          owner=repo.owner.canonical_name,
+          repo=repo.name,
+          ref=ref.name.decode('utf-8', 'replace'))}}"
+      {% endif %}
+      rel="nofollow"
+    >{{ref.name.decode("utf-8", "replace")}}</a>
+  </span>
+  {% endfor %}
+  {% endif %}
+</div>
+{% if not skip_body %}
+{% if full_body %}
+<pre class="commit">{{ c.message | commit_links(repo) | safe }}
+{%- if diff %}
+{{diffstat(diff, anchor=str(c.id) + "-")}}{% endif -%}
+</pre>
+{% else %}
+<pre class="commit">{{ trim_commit(c.message) }}</pre>
+{% endif %}
+{% endif %}
+{% endmacro %}
+
+{% macro commit_diff(repo, commit, diff, anchor="", target_blank=False) %}
+{# God, working with <pre> tags is such a fucking mess #}
+{% if diff.stats.insertions + diff.stats.deletions > 10000 %}
+<div class="alert alert-warning">
+This diff is too large to display. Try <a
+  href="{{url_for('repo.patch',
+    owner=repo.owner.canonical_name,
+    repo=repo.name,
+    ref=commit.id)}}"
+  rel="nofollow"
+>viewing the raw diff</a>
+instead.
+</div>
+{% else %}
+{% for patch in diff %}
+<pre class="mb-0 bg-transparent p-0"
+>{#
+  #}{{patch.delta.status_char()}} {% if parent %}<a
+   href="{{url_for("repo.tree",
+      owner=repo.owner.canonical_name,
+      repo=repo.name,
+      ref=str(parent.id),
+      path=patch.delta.old_file.raw_path.decode('utf-8', 'replace'))}}"
+   id="{{anchor}}{{patch.delta.old_file.raw_path.decode('utf-8', 'replace')}}"
+  {% if target_blank %}
+  target="_blank"
+  {% endif %}
+  rel="nofollow"
+ >{{patch.delta.old_file.raw_path.decode('utf-8', 'replace')}}</a>{#
+ #}{% endif %} =&gt; {#
+ #}<a
+   href="{{url_for("repo.tree",
+      owner=repo.owner.canonical_name,
+      repo=repo.name,
+      ref=str(commit.id),
+      path=patch.delta.new_file.raw_path.decode('utf-8', 'replace'))}}"
+   id="{{anchor}}{{patch.delta.new_file.raw_path.decode('utf-8', 'replace')}}"
+  {% if target_blank %}
+  target="_blank"
+  {% endif %}
+  rel="nofollow"
+ >{{patch.delta.new_file.raw_path.decode('utf-8', 'replace')}}</a>{#
+ #} <span class="pull-right"><span class="text-success">+{{patch.line_stats[1]}}</span>{#
+ #} <span class="text-danger">-{{patch.line_stats[2]}}</span></span>{%
+    if patch.delta.old_file.mode != patch.delta.new_file.mode %}{#
+  #}{#
+  #}{% endif %}</pre>
+{% if patch.hunks|length %}<div class="event diff">
+  <pre>{% for hunk in patch.hunks %}
+{% set hunk_index = loop.index %}<strong
+  class="text-info"
+>@@ {#
+#}{% if parent %}<a
+  style="text-decoration: underline"
+  href="{{url_for("repo.tree",
+    owner=repo.owner.canonical_name,
+    repo=repo.name,
+    ref=str(parent.id),
+    path=patch.delta.old_file.raw_path.decode('utf-8', 'replace'))}}#L{{hunk.old_start}}"
+  {% if target_blank %}
+  target="_blank"
+  {% endif %}
+  rel="nofollow"
+>{{hunk.old_start}}</a>,{{hunk.old_lines}} {#
+#}{% endif %}<a
+  style="text-decoration: underline"
+  href="{{url_for("repo.tree",
+    owner=repo.owner.canonical_name,
+    repo=repo.name,
+    ref=str(commit.id),
+    path=patch.delta.new_file.raw_path.decode('utf-8', 'replace'))}}#L{{hunk.new_start}}"
+  {% if target_blank %}
+  target="_blank"
+  {% endif %}
+  rel="nofollow"
+>{{hunk.new_start}}</a>,{{hunk.new_lines}} {#
+#}@@{{hunk.header.split('@@')[-1][:-1]}}</strong>
+{% for line in hunk.lines
+%}<span class="{{({
+  "+":"text-success",
+  "-":"text-danger",
+  }).get(line.origin) or ""}}"><a
+    href="#{{anchor}}{{patch.delta.old_file.raw_path.decode('utf-8', 'replace')}}-{{hunk_index}}-{{loop.index}}"
+    id="{{anchor}}{{patch.delta.old_file.raw_path.decode('utf-8', 'replace')}}-{{hunk_index}}-{{loop.index}}"
+    aria-hidden="true"
+    class="lineno"
+    style="color: inherit"
+>{{line.origin}}</a>{{line.content}}{#
+#}</span>{% endfor %}
+{% endfor %}</pre>
+</div>{% endif %}
+{% endfor %}
+{% endif %}
+{% endmacro %}

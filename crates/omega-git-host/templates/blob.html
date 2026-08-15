@@ -1,0 +1,27 @@
+{% extends "repo.html" %}
+
+{% block title %}
+<title>{{ name }} blob ({{ ref }}): {{ file }} - omega-git-host git</title>
+{% endblock %}
+
+{% block content %}
+<div class="header-extension">
+  <div class="container tree-header">
+    <div class="breadcrumb">
+      <a href="/{{ name }}/tree/{{ ref }}">{{ ref }}</a>
+      / {{ file }}
+    </div>
+  </div>
+</div>
+<div class="container">
+  {% if binary %}
+  <p class="text-muted">This file is binary ({{ size }} bytes).</p>
+  {% else %}
+  <div class="code-view">
+    <div class="lines"><pre>{% for n in line_numbers %}<a id="L{{ n }}" href="#L{{ n }}">{{ n }}</a>
+{% endfor %}</pre></div>
+    <div class="highlight"><pre>{{ content }}</pre></div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,128 @@
+{% extends "layout.html" %}
+{% import "partials/resourcenav.html" as rnav with context %}
+
+{% block head %}
+{% block repohead %}
+{% endblock %}
+{% if repo.visibility.value == 'UNLISTED' %}
+<meta name="robots" content="noindex">
+{% endif %}
+{# VCS meta tags #}
+<meta name="vcs" content="git">
+{% if default_branch %}
+{% set default_branch_name = default_branch.raw_name.decode("utf-8", "replace")[len("refs/heads/"):] %}
+<meta name="vcs:default-branch" content="{{default_branch_name}}">
+{% endif %}
+{# NOTE: unauthorized clone URLs should be listed first #}
+{% for clone_url in (repo | clone_urls) %}
+<meta name="vcs:clone" content="{{clone_url}}">
+{% endfor %}
+{# Forge meta tags #}
+{% set project_root = root + url_for("repo.summary", owner=repo.owner.canonical_name, repo=repo.name) %}
+<meta name="forge:summary" content="{{project_root}}">
+<meta name="forge:dir" content="{{project_root}}/tree/{ref}/{path}">
+<meta name="forge:file" content="{{project_root}}/tree/{ref}/{path}">
+<meta name="forge:rawfile" content="{{project_root}}/blob/{ref}/{path}">
+<meta name="forge:line" content="{{project_root}}/tree/{ref}/{path}#L{line}">
+{# Go meta tags #}
+<meta name="go-import" content="{{domain}}/{{owner.canonical_name}}/{{repo.name}} git {{(repo | clone_urls)[0]}}">
+{% endblock %}
+
+{% block body %}
+{% set fluid = view in ["blob", "blame"] %}
+{{ rnav.project_nav(repo, projects, fluid=fluid) }}
+<div class="header-tabbed resource-nav">
+  {% if fluid %}
+  <div class="container-fluid">
+  {% else %}
+  <div class="container">
+  {% endif %}
+    {% block tabs %}
+    {% macro link(path, title, alternates=[]) %}
+    <a
+      class="nav-link {% if view == title or view in alternates %}active{% endif %}"
+      href="{{ path }}">{{ title }}</a>
+    {% endmacro %}
+
+    {% if len(projects) == 1 and projects[0].name != repo.name %}
+    <h3>{{repo.name}}</h3>
+    {% endif %}
+
+    <ul class="nav nav-tabs">
+      {% if repo.visibility.value != "PUBLIC" %}
+      <li
+        class="nav-item nav-text vis-{{repo.visibility.value.lower()}}"
+        {% if repo.visibility.value == "UNLISTED" %}
+        title="This repository is only visible to those who know the URL."
+        {% elif repo.visibility.value == "PRIVATE" %}
+        title="This repository is only visible to those who were invited to view it."
+        {% endif %}
+      >
+        {% if repo.visibility.value == "UNLISTED" %}
+        Unlisted
+        {% elif repo.visibility.value == "PRIVATE" %}
+        Private
+        {% endif %}
+      </li>
+      {% endif %}
+      <li class="nav-item">
+        {{link(url_for("repo.summary",
+          owner=repo.owner.canonical_name,
+          repo=repo.name), "summary")}}
+      </li>
+      <li class="nav-item">
+        {{link(url_for("repo.tree",
+          owner=repo.owner.canonical_name,
+          repo=repo.name), "tree", ["blob", "blame"])}}
+      </li>
+      <li class="nav-item">
+        {{link(url_for("repo.log",
+          owner=repo.owner.canonical_name,
+          repo=repo.name), "log")}}
+      </li>
+      <li class="nav-item">
+        {{link(url_for("repo.refs",
+          owner=repo.owner.canonical_name,
+          repo=repo.name), "refs")}}
+      </li>
+      {% if len(licenses) > 0 %}
+      <li class="nav-item">
+        {{link(url_for("repo.licenses",
+          owner=repo.owner.canonical_name,
+          repo=repo.name), "licenses")}}
+      </li>
+      {% endif %}
+      {% if current_user.canonical_name == repo.owner.canonical_name %}
+      <li class="nav-item">
+        {{link(url_for("manage.settings_info",
+          owner_name=repo.owner.canonical_name,
+          repo_name=repo.name), "settings")}}
+      </li>
+      {% endif %}
+      {% if repo.indexed
+        and cfg('git.sr.ht', 'repos-index')
+        and current_user
+        and view != "settings" %}
+      <li class="flex-grow-1"></li>
+      <li class="nav-item">
+        <form
+          action="{{url_for("repo.search",
+            owner=repo.owner.canonical_name,
+            repo=repo.name)}}"
+        >
+          <input
+          type="text"
+          name="q"
+          class="form-control nav-search"
+          placeholder="Search in {{repo.name}}..."
+          value="{{q if q else ""}}" />
+        </form>
+      </li>
+      {% endif %}
+      {% block tabs_extra %}{% endblock %}
+    </ul>
+  </div>
+{% endblock %}
+</div>
+{% block content %}{% endblock %}
+{% endblock %}

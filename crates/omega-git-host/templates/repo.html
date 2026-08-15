@@ -1,0 +1,33 @@
+{% extends "layout.html" %}
+
+{% block title %}
+<title>{{ name }} - omega-git-host git</title>
+{% endblock %}
+
+{% block body %}
+<div class="header-tabbed resource-nav">
+  <div class="container">
+    {% block tabs %}
+    <h3><a href="/{{ name }}/">{{ name }}</a></h3>
+    <ul class="nav nav-tabs">
+      <li class="nav-item">
+        <a class="nav-link {{ "active" if view == "summary" else "" }}" href="/{{ name }}/">summary</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link {{ "active" if view == "tree" or view == "blob" else "" }}" href="/{{ name }}/tree/{{ default_branch }}">tree</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link {{ "active" if view == "log" else "" }}" href="/{{ name }}/log/{{ default_branch }}">log</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link {{ "active" if view == "refs" else "" }}" href="/{{ name }}/refs">refs</a>
+      </li>
+      <li class="nav-item">
+        <a class="nav-link {{ "active" if view == "clone" else "" }}" href="/{{ name }}/clone">clone</a>
+      </li>
+    </ul>
+    {% endblock %}
+  </div>
+</div>
+{% block content %}{% endblock %}
+{% endblock %}
