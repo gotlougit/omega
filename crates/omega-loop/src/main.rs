@@ -1137,6 +1137,17 @@ async fn main() -> Result<()> {
     // Global shared SessionStorage for listing/resuming sessions.
     let session_storage = Arc::new(crate::session::SessionStorage::with_dir("./sessions"));
 
+    // Empty sessions (metadata written, but the agent never produced a
+    // message — aborted creations) are useless to everyone: prune them so
+    // they never surface in the git-host web UI or session lists.
+    match session_storage.prune_empty_sessions() {
+        Ok(removed) if !removed.is_empty() => {
+            tracing::info!(count = removed.len(), "pruned empty sessions at startup");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "failed to prune empty sessions"),
+    }
+
     // Project store — registered repos + per-session git worktrees.
     let projects = Arc::new(ProjectManager::new());
     let projects_root = projects.root().display().to_string();

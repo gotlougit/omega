@@ -55,8 +55,44 @@
 
     {% for m in messages %}
     <div class="session-message {{ m.role }}">
-      <div class="message-role">{{ m.role }}</div>
-      {{ m.html | safe }}
+      <div class="message-role">{{ "assistant" if m.role == "assistant" else "user" }}</div>
+      {% if m.body %}
+      <div class="message-body markdown">{{ m.body | safe }}</div>
+      {% endif %}
+      {% if m.thinking %}
+      <details class="thinking">
+        <summary>thinking <small class="text-muted">({{ m.thinking | length }})</small></summary>
+        {% for t in m.thinking %}
+        <pre>{{ t }}</pre>
+        {% endfor %}
+      </details>
+      {% endif %}
+      {% if m.tools %}
+      <details class="tools">
+        <summary>tools <small class="text-muted">({{ m.tools | length }})</small></summary>
+        {% for t in m.tools %}
+        <details class="tool{% if t.is_error %} error{% endif %}">
+          <summary>
+            <code>{{ t.name }}</code>
+            {% if t.is_error %}<span class="badge badge-danger">error</span>{% endif %}
+            <span class="text-muted tool-preview">{{ t.preview }}</span>
+          </summary>
+          <div class="tool-pane">
+            {% if t.input %}
+            <div class="tool-label">input</div>
+            <pre class="tool-input">{{ t.input }}</pre>
+            {% endif %}
+            <div class="tool-label">result{% if t.is_error %} (error){% endif %}</div>
+            {% if t.result %}
+            <pre class="tool-result">{{ t.result }}</pre>
+            {% else %}
+            <p class="text-muted">(no output)</p>
+            {% endif %}
+          </div>
+        </details>
+        {% endfor %}
+      </details>
+      {% endif %}
     </div>
     {% endfor %}
 

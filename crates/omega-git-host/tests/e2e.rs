@@ -123,9 +123,11 @@ async fn seed_session(
     )
     .unwrap();
 
-    // A realistic transcript: plain text plus tool call/result blocks.
+    // A realistic transcript: markdown text plus thinking + tool call/result
+    // blocks. The tool result arrives as a separate user-role message, exactly
+    // like omega-loop writes it.
     let history = r#"{"role":"user","content":"please add a feature"}
-{"role":"assistant","content":[{"type":"text","text":"let me check"},{"type":"tool_use","id":"call_1","name":"Bash","input":{"command":"ls"}}]}
+{"role":"assistant","content":[{"type":"thinking","thinking":"hmm, let me look around","signature":"sig"},{"type":"text","text":"**let me check**"},{"type":"tool_use","id":"call_1","name":"Bash","input":{"command":"ls"}}]}
 {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"file1\nfile2"}]}
 "#;
     std::fs::write(dir.join("history.jsonl"), history).unwrap();
@@ -149,16 +151,37 @@ fn escaped_url(url: &str) -> String {
 }
 
 /// Minimal HTTP/1.1 GET returning the raw response. The Host header carries
-/// the port so handlers that build URLs from it see the real base.
+/// the port so handlers that build URLs from it see the real base. Retries
+/// briefly to absorb transient connection resets (the test server may still
+/// be draining the listener accept queue right after startup).
 async fn http_get(port: u16, path: &str) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf).to_string()
+    for attempt in 0..5 {
+        let mut stream = match TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => s,
+            Err(e) if attempt < 4 => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(e) => panic!("connect failed: {e}"),
+        };
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(req.as_bytes()).await.is_err() && attempt < 4 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        let mut buf = Vec::new();
+        match stream.read_to_end(&mut buf).await {
+            Ok(_) => return String::from_utf8_lossy(&buf).to_string(),
+            Err(_) if attempt < 4 => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+    unreachable!()
 }
 
 #[tokio::test]
@@ -347,15 +370,34 @@ async fn repo_pages_render_and_refs_link_worktrees_to_sessions() {
 
     let base = format!("http://127.0.0.1:{port}");
 
-    // Summary: repo chrome tabs + the commit feed.
+    // Summary: repo chrome tabs + the commit feed + session worktrees
+    // (each linking to its chat transcript).
     let body = http_get(port, &format!("/{project}/")).await;
     assert!(body.contains("200 OK"), "summary:\n{body}");
     assert!(body.contains(">summary<"), "summary:\n{body}");
     assert!(body.contains(">refs<"), "summary:\n{body}");
+    assert!(body.contains(">sessions<"), "summary:\n{body}");
     assert!(body.contains("initial commit"), "summary:\n{body}");
     assert!(
         body.contains(&escaped_url(&format!("{base}/{project}.git"))),
         "summary must show the clone URL:\n{body}"
+    );
+    // Sessions are directly reachable from the project's summary page.
+    assert!(body.contains("session worktrees"), "summary:\n{body}");
+    assert!(body.contains("Fix the thing"), "summary:\n{body}");
+    assert!(
+        body.contains("/sessions/sess-123"),
+        "summary must link session worktrees to their chats:\n{body}"
+    );
+
+    // The project's sessions tab lists the same sessions.
+    let body = http_get(port, &format!("/{project}/sessions")).await;
+    assert!(body.contains("200 OK"), "repo sessions:\n{body}");
+    assert!(body.contains("Fix the thing"), "repo sessions:\n{body}");
+    assert!(body.contains("/sessions/sess-123"), "repo sessions:\n{body}");
+    assert!(
+        body.contains(&escaped_url(&worktree_branch)),
+        "repo sessions:\n{body}"
     );
 
     // Refs: worktree branch grouped with its session + view-chat link.
@@ -438,17 +480,37 @@ async fn session_pages_render_transcripts_and_system_prompts() {
         "sessions index must link the worktree:\n{body}"
     );
 
-    // Transcript: header, user/assistant text, tool call + result, prompt link.
+    // Transcript: user text, markdown-rendered assistant body, thinking
+    // folded in (collapsed), tool call folded in with its result — not a
+    // raw user/assistant exchange.
     let body = http_get(port, "/sessions/sess-123").await;
     assert!(body.contains("200 OK"), "session page:\n{body}");
     assert!(body.contains("please add a feature"), "session page:\n{body}");
-    assert!(body.contains("let me check"), "session page:\n{body}");
-    assert!(body.contains("tool: <code>Bash</code>"), "session page:\n{body}");
-    assert!(body.contains("tool result"), "session page:\n{body}");
+    // Assistant body is markdown-rendered.
+    assert!(
+        body.contains("<strong>let me check</strong>"),
+        "markdown body:\n{body}"
+    );
+    // Thinking is part of the assistant message, hidden by default.
+    assert!(body.contains("class=\"thinking\""), "session page:\n{body}");
+    assert!(body.contains("hmm, let me look around"), "session page:\n{body}");
+    // Tool call + result are one collapsed unit inside the assistant message.
+    assert!(body.contains("class=\"tools\""), "session page:\n{body}");
+    assert!(body.contains("<code>Bash</code>"), "session page:\n{body}");
+    assert!(
+        body.contains("file1 file2"),
+        "tool preview in summary line:\n{body}"
+    );
     assert!(body.contains("system-prompt"), "session page:\n{body}");
     assert!(
         body.contains(&format!("/{project}/tree/{}", escaped_url(&worktree_branch))),
         "session page must link back to the worktree:\n{body}"
+    );
+
+    // The tool result must NOT appear as a separate user message.
+    assert!(
+        !body.contains("tool result"),
+        "tool results must not render as standalone messages:\n{body}"
     );
 
     // System prompt page.
@@ -462,6 +524,73 @@ async fn session_pages_render_transcripts_and_system_prompts() {
     // Unknown session → 404.
     let body = http_get(port, "/sessions/nope").await;
     assert!(body.contains("404 Not Found"), "unknown session:\n{body}");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn empty_sessions_are_not_listed_or_linked() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let (project, worktree_branch) = seed_store(store.path()).await;
+    // One real session (with a transcript)...
+    seed_session(
+        sessions.path(),
+        "sess-real",
+        &worktree_branch,
+        "Real session",
+    )
+    .await;
+    // ...and one that only ever wrote metadata (aborted creation). It must
+    // be invisible everywhere in the web UI.
+    let empty_dir = sessions.path().join("sess-empty");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let meta = serde_json::json!({
+        "session_id": "sess-empty",
+        "name": "Coder",
+        "conversation_name": "Empty session",
+        "custom": {
+            "active_project": {
+                "project": {
+                    "name": project,
+                    "url": "file:///tmp/origin",
+                    "default_branch": "main",
+                    "created_at": "2026-08-15T00:00:00Z",
+                },
+                "worktree_path": "/tmp/wt",
+                "branch": "omega/sess-empty-000000",
+            }
+        }
+    });
+    std::fs::write(
+        empty_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let port = free_port();
+    let server = spawn_server(store.path(), sessions.path(), port).await;
+    wait_for_server(port).await;
+
+    // Not in the global sessions index.
+    let body = http_get(port, "/sessions/").await;
+    assert!(body.contains("Real session"), "sessions index:\n{body}");
+    assert!(
+        !body.contains("Empty session"),
+        "empty session must not be listed:\n{body}"
+    );
+
+    // Not on the project's sessions tab or refs page.
+    let body = http_get(port, &format!("/{project}/sessions")).await;
+    assert!(
+        !body.contains("Empty session"),
+        "empty session must not appear on repo sessions:\n{body}"
+    );
+    let body = http_get(port, &format!("/{project}/refs")).await;
+    assert!(
+        !body.contains("sess-empty"),
+        "empty session must not be linked from refs:\n{body}"
+    );
 
     drop(server);
 }

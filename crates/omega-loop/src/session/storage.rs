@@ -260,6 +260,26 @@ impl SessionStorage {
         }
         Ok(())
     }
+
+    /// Delete sessions whose transcript is missing or empty (aborted session
+    /// creations: metadata written, but the agent never produced a message).
+    /// Returns the ids of the removed sessions. Harmless no-op when the store
+    /// is clean.
+    pub fn prune_empty_sessions(&self) -> FrameworkResult<Vec<String>> {
+        let mut removed = Vec::new();
+        for session_id in self.list_sessions()? {
+            let empty = match fs::read_to_string(self.history_path(&session_id)) {
+                Ok(raw) => raw.lines().all(|l| l.trim().is_empty()),
+                Err(_) => true,
+            };
+            if empty {
+                tracing::info!(%session_id, "pruning empty session");
+                self.delete_session(&session_id)?;
+                removed.push(session_id);
+            }
+        }
+        Ok(removed)
+    }
 }
 
 impl Default for SessionStorage {
@@ -350,6 +370,34 @@ mod tests {
 
         storage.delete_session("to_delete").unwrap();
         assert!(!storage.session_exists("to_delete"));
+    }
+
+    #[test]
+    fn test_prune_empty_sessions() {
+        let (storage, _temp) = create_test_storage();
+
+        // A session with metadata but no history → pruned.
+        storage
+            .save_metadata(&SessionMetadata::new("empty1", "coder", "E1", ""))
+            .unwrap();
+        // A session with a blank history file → pruned.
+        storage
+            .save_metadata(&SessionMetadata::new("empty2", "coder", "E2", ""))
+            .unwrap();
+        std::fs::write(storage.history_path("empty2"), "\n\n").unwrap();
+        // A session with real messages → kept.
+        storage
+            .save_metadata(&SessionMetadata::new("real", "coder", "R", ""))
+            .unwrap();
+        storage.append_message("real", &Message::user("hi")).unwrap();
+
+        let removed = storage.prune_empty_sessions().unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"empty1".to_string()));
+        assert!(removed.contains(&"empty2".to_string()));
+        assert!(!storage.session_exists("empty1"));
+        assert!(!storage.session_exists("empty2"));
+        assert!(storage.session_exists("real"));
     }
 
     #[test]

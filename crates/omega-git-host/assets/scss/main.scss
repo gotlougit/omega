@@ -19,16 +19,25 @@
     margin-bottom: 0.25rem;
   }
 
-  .message-text {
-    white-space: pre-wrap;
-  }
+  .message-body {
+    &.markdown {
+      p:last-child {
+        margin-bottom: 0;
+      }
 
-  details {
-    margin-top: 0.25rem;
+      pre {
+        max-height: 24rem;
+        overflow: auto;
+      }
+    }
   }
 
   pre {
     margin-bottom: 0;
+  }
+
+  details {
+    margin-top: 0.25rem;
   }
 
   &.user {
@@ -42,6 +51,89 @@
   &.system {
     border-left-color: $gray-400;
   }
+
+  // ---- thinking traces: collapsed by default ---------------------------
+  details.thinking {
+    summary {
+      cursor: pointer;
+      color: $gray-700;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    pre {
+      margin-top: 0.5rem;
+      padding: 0.5rem;
+      background: rgba(0, 0, 0, 0.03);
+      border-radius: 0.25rem;
+      font-style: italic;
+      color: $gray-700;
+      max-height: 20rem;
+      overflow: auto;
+    }
+  }
+
+  // ---- tool calls: one collapsed unit per call -------------------------
+  details.tools {
+    summary {
+      cursor: pointer;
+      color: $gray-700;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    > details.tool {
+      margin-top: 0.5rem;
+      border: 1px solid $gray-300;
+      border-radius: 0.25rem;
+      padding: 0.25rem 0.5rem;
+
+      > summary {
+        text-transform: none;
+        letter-spacing: 0;
+        cursor: pointer;
+        font-size: 0.85rem;
+
+        code {
+          font-weight: bold;
+        }
+
+        .tool-preview {
+          font-size: 0.8rem;
+        }
+      }
+
+      &.error {
+        border-color: $danger;
+
+        > summary code {
+          color: $danger;
+        }
+      }
+
+      .tool-pane {
+        margin-top: 0.5rem;
+
+        .tool-label {
+          font-size: 0.7rem;
+          text-transform: uppercase;
+          color: $gray-600;
+          margin: 0.5rem 0 0.15rem;
+        }
+
+        pre {
+          max-height: 24rem;
+          overflow: auto;
+          font-size: 0.8rem;
+          padding: 0.5rem;
+          background: rgba(0, 0, 0, 0.03);
+          border-radius: 0.25rem;
+        }
+      }
+    }
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -54,6 +146,15 @@
 
     &.system {
       border-left-color: #343a40;
+    }
+
+    details.thinking pre,
+    details.tools > details.tool .tool-pane pre {
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    details.tools > details.tool {
+      border-color: #495057;
     }
   }
 }

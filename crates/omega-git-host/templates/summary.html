@@ -25,6 +25,19 @@
         Every session worktree is served as a branch:
         <code>git checkout omega/&lt;session&gt;</code>
       </p>
+      {% if worktrees %}
+      <h3>session worktrees</h3>
+      <dl>
+        {% for w in worktrees %}
+        <dt><a href="/{{ name }}/tree/{{ w.branch }}">{{ w.branch }}</a></dt>
+        <dd>
+          <a href="/sessions/{{ w.session_id }}">{{ w.display_name }}</a>
+          {% if w.model %}<span class="text-muted">({{ w.model }})</span>{% endif %}
+          <small class="pull-right text-muted">{{ w.updated_at | date }}</small>
+        </dd>
+        {% endfor %}
+      </dl>
+      {% endif %}
       <h3>refs</h3>
       <dl>
         {% for b in branches %}

@@ -556,6 +556,11 @@ in
       # dirs and must keep serving even if the daemon is down or restarts.
       wants = [ "omega-loop.service" ];
       wantedBy = [ "multi-user.target" ];
+      # Unlike the NixOS systemd default PATH, make git (and the user's extra
+      # packages) available: every page and the smart-HTTP backend shells out
+      # to `git` — without this, log/refs/tree/blob/commit pages and `git
+      # clone` all fail in production.
+      path = with pkgs; [ git ] ++ cfg.packages;
 
       serviceConfig = {
         User = clankerUser;

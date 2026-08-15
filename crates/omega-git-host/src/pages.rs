@@ -129,11 +129,35 @@ pub async fn summary(
         .collect();
     let tags: Vec<&repo::RefInfo> = refs.iter().filter(|r| r.kind == RefKind::Tag).collect();
 
+    // Session worktrees for this project, each linking to its chat transcript
+    // — so a repo's sessions are reachable straight from the summary page.
+    let sessions = match SessionIndex::load(&state.session_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "session index unavailable");
+            SessionIndex::default()
+        }
+    };
+    let worktrees_json: Vec<Value> = sessions
+        .by_project(&name)
+        .iter()
+        .map(|s| {
+            json!({
+                "session_id": s.session_id,
+                "display_name": s.display_name,
+                "model": s.model,
+                "branch": s.branch,
+                "updated_at": s.updated_at.map(|d| d.to_rfc3339()),
+            })
+        })
+        .collect();
+
     let base = base_url(&headers);
     let mut ctx = base_ctx(&name, &project, &default, &base, "summary");
     ctx["commits"] = commits_json(&commits);
     ctx["branches"] = json!(branches);
     ctx["tags"] = json!(tags);
+    ctx["worktrees"] = json!(worktrees_json);
     render(state, "summary.html", ctx)
 }
 
@@ -443,6 +467,45 @@ pub async fn clone_page(
     render(state, "clone.html", ctx)
 }
 
+/// `/{name}/sessions/` — every omega session bound to this project (its
+/// worktree branch + the chat transcript behind it).
+pub async fn repo_sessions(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (project, repo) = match repo_for(&state.projects, &name).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let default = repo::default_branch(&repo, project.default_branch.as_deref()).await;
+
+    let sessions = match SessionIndex::load(&state.session_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "session index unavailable");
+            SessionIndex::default()
+        }
+    };
+    let sessions_json: Vec<Value> = sessions
+        .by_project(&name)
+        .iter()
+        .map(|s| {
+            json!({
+                "session_id": s.session_id,
+                "display_name": s.display_name,
+                "model": s.model,
+                "branch": s.branch,
+                "updated_at": s.updated_at.map(|d| d.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    let mut ctx = base_ctx(&name, &project, &default, &base_url(&headers), "sessions");
+    ctx["sessions"] = json!(sessions_json);
+    render(state, "repo-sessions.html", ctx)
+}
+
 /// `/sessions/` — top-level sessions, newest first.
 pub async fn sessions_index(State(state): State<AppState>) -> Response {
     let index = match SessionIndex::load(&state.session_dir) {
@@ -521,14 +584,30 @@ pub async fn session_page(State(state): State<AppState>, Path(id): Path<String>)
         .rev()
         .take(transcript::MAX_MESSAGES)
         .collect::<Vec<_>>();
-
-    let messages_json: Vec<Value> = shown
+    // Fold the raw stream into the display conversation (tool results and
+    // thinking attach to the assistant message that produced them).
+    let display_msgs: Vec<transcript::Message> = shown
         .iter()
         .rev()
+        .map(|m| (*m).clone())
+        .collect();
+    let display = transcript::assemble(&display_msgs);
+
+    let messages_json: Vec<Value> = display
+        .iter()
         .map(|m| {
             json!({
                 "role": m.role,
-                "html": transcript::render_content_html(m),
+                "body": m.body,
+                "thinking": m.thinking,
+                "tools": m.tools.iter().map(|t| json!({
+                    "name": t.name,
+                    "id": t.id,
+                    "input": t.input,
+                    "result": t.result,
+                    "is_error": t.is_error,
+                    "preview": t.preview,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();

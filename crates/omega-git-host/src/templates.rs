@@ -38,6 +38,8 @@ impl Templates {
             .context("register commit.html")?;
         env.add_template("refs.html", include_str!("../templates/refs.html"))
             .context("register refs.html")?;
+        env.add_template("repo-sessions.html", include_str!("../templates/repo-sessions.html"))
+            .context("register repo-sessions.html")?;
         env.add_template("clone.html", include_str!("../templates/clone.html"))
             .context("register clone.html")?;
         env.add_template("sessions.html", include_str!("../templates/sessions.html"))

@@ -125,6 +125,11 @@ impl SessionIndex {
                 }
             };
             let info = SessionInfo::from_meta(&meta);
+            // Sessions without any transcript are invisible (and get pruned by
+            // omega-loop itself) — never surface them in the web UI.
+            if !has_messages(&path.join("history.jsonl")) {
+                continue;
+            }
             if let Some(branch) = &info.branch {
                 index
                     .by_branch
@@ -136,11 +141,31 @@ impl SessionIndex {
         Ok(index)
     }
 
+    /// All sessions bound to `project` (by active_project metadata), newest
+    /// first; sessions without a timestamp sink to the bottom.
+    pub fn by_project(&self, project: &str) -> Vec<&SessionInfo> {
+        let mut v: Vec<&SessionInfo> = self
+            .all
+            .iter()
+            .filter(|s| s.project.as_deref() == Some(project))
+            .collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        v
+    }
+
     pub fn by_branch(&self, branch: &str) -> Option<&SessionInfo> {
         self.by_branch.get(branch)
     }
 
     pub fn all(&self) -> &[SessionInfo] {
         &self.all
+    }
+}
+
+/// True if `history.jsonl` exists and contains at least one non-blank line.
+fn has_messages(history_path: &Path) -> bool {
+    match std::fs::read_to_string(history_path) {
+        Ok(raw) => raw.lines().any(|l| !l.trim().is_empty()),
+        Err(_) => false,
     }
 }

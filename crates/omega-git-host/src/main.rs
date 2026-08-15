@@ -95,6 +95,8 @@ async fn main() -> Result<()> {
         .route("/{name}/", get(pages::summary))
         .route("/{name}/refs", get(pages::refs_page))
         .route("/{name}/refs/", get(pages::refs_page))
+        .route("/{name}/sessions", get(pages::repo_sessions))
+        .route("/{name}/sessions/", get(pages::repo_sessions))
         .route("/{name}/clone", get(pages::clone_page))
         .route("/{name}/clone/", get(pages::clone_page))
         .route("/{name}/log/{*path}", get(pages::log_page))
