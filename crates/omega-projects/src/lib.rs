@@ -338,6 +338,66 @@ impl ProjectManager {
         })
     }
 
+    /// Reconcile a session's worktree binding with reality on disk.
+    ///
+    /// Returns `Some(active)` when the worktree still exists — possibly with
+    /// a corrected path/branch if it was renamed or moved *outside* the
+    /// daemon (raw `git` commands). Resolves the worktree by:
+    ///
+    /// 1. the persisted path, when it still exists:
+    ///    - the persisted branch is checked out → binding is current;
+    ///    - otherwise → rebind to the branch actually checked out there;
+    /// 2. the persisted *branch*, when the path is gone but the branch still
+    ///    exists somewhere in the project (e.g. `git worktree move` kept the
+    ///    branch but changed the directory).
+    ///
+    /// Returns `None` when neither the path nor the branch can be found, so
+    /// the caller knows a fresh worktree must be created.
+    ///
+    /// This is what keeps the session metadata (and therefore the web UI's
+    /// session → worktree mapping) accurate after a rename.
+    pub async fn reconcile_worktree(&self, active: &ActiveProject) -> Option<ActiveProject> {
+        let repo = self.repo_dir(&active.project.name);
+
+        // Fast path: persisted binding is completely current.
+        if Path::new(&active.worktree_path).is_dir() && branch_exists(&repo, &active.branch).await {
+            return Some(active.clone());
+        }
+
+        // The directory survived → it owns the truth (branch may have been
+        // renamed in place; path may be stale/canonicalized differently).
+        let dir = Path::new(&active.worktree_path);
+        if dir.is_dir() {
+            let actual = git(dir, &["symbolic-ref", "--short", "HEAD"]).await.ok()?;
+            if actual.is_empty() || actual == "HEAD" {
+                return Some(active.clone());
+            }
+            return Some(ActiveProject {
+                project: active.project.clone(),
+                worktree_path: dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| dir.to_path_buf())
+                    .display()
+                    .to_string(),
+                branch: actual,
+            });
+        }
+
+        // The directory moved but its branch survived (e.g. `git worktree
+        // move`): find where the branch is checked out now.
+        if branch_exists(&repo, &active.branch).await {
+            if let Some(path) = worktree_path_for_branch(&repo, &active.branch).await {
+                return Some(ActiveProject {
+                    project: active.project.clone(),
+                    worktree_path: path,
+                    branch: active.branch.clone(),
+                });
+            }
+        }
+
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Low-level git operations
     // -----------------------------------------------------------------------
@@ -475,6 +535,38 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether a local branch exists in the bare clone.
+async fn branch_exists(repo: &Path, branch: &str) -> bool {
+    git(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .is_ok()
+}
+
+/// Find the worktree checkout directory where `branch` is currently checked
+/// out, if any. Parses `git worktree list --porcelain` — each entry starts
+/// with `worktree <path>` followed by a `branch refs/heads/...` line.
+async fn worktree_path_for_branch(repo: &Path, branch: &str) -> Option<String> {
+    let out = git(repo, &["worktree", "list", "--porcelain"]).await.ok()?;
+    let target = format!("branch refs/heads/{branch}");
+    let mut current_path: Option<String> = None;
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(path.to_string());
+        } else if line.trim() == target {
+            return current_path;
+        }
+    }
+    None
 }
 
 /// Derive a stable local project name from a git URL.
@@ -1037,6 +1129,155 @@ mod tests {
         assert_eq!(renamed.branch, active.branch);
         let list = git(&repo, &["worktree", "list"]).await.unwrap();
         assert_eq!(count_lines(&list), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Worktree binding reconciliation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reconcile_worktree_finds_moved_dir_by_branch() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+
+        // Directory moved, branch kept (what `git worktree move` does).
+        let old_dir = Path::new(&active.worktree_path);
+        let new_dir = old_dir.parent().unwrap().join("moved-elsewhere");
+        let repo = fx.manager.repo_dir(&active.project.name);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "move",
+                "--force",
+                &active.worktree_path,
+                &new_dir.display().to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(!old_dir.exists());
+
+        let reconciled = fx
+            .manager
+            .reconcile_worktree(&active)
+            .await
+            .expect("worktree found via its branch");
+        assert_eq!(reconciled.branch, active.branch);
+        assert_eq!(reconciled.worktree_path, new_dir.display().to_string());
+        assert!(Path::new(&reconciled.worktree_path).is_dir());
+    }
+
+    #[tokio::test]
+    async fn reconcile_worktree_returns_none_when_dir_and_branch_gone() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+
+        // Neither the persisted path nor the persisted branch exists — the
+        // binding is unrecoverable, so the caller must re-create a worktree.
+        let missing = ActiveProject {
+            project: active.project.clone(),
+            worktree_path: "/nonexistent/vanished".to_string(),
+            branch: "omega/never-existed".to_string(),
+        };
+        assert!(fx.manager.reconcile_worktree(&missing).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_worktree_is_noop_when_binding_is_current() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+
+        let reconciled = fx
+            .manager
+            .reconcile_worktree(&active)
+            .await
+            .expect("worktree exists");
+        assert_eq!(reconciled.worktree_path, active.worktree_path);
+        assert_eq!(reconciled.branch, active.branch);
+    }
+
+    #[tokio::test]
+    async fn reconcile_worktree_rebinds_after_external_branch_rename() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+
+        // Branch renamed in place, directory untouched (raw `git branch -m`
+        // run from inside the worktree). The persisted binding still names
+        // the old branch.
+        let repo = fx.manager.repo_dir(&active.project.name);
+        git(
+            &repo,
+            &["branch", "-m", &active.branch, "omega/renamed-in-place"],
+        )
+        .await
+        .unwrap();
+
+        let reconciled = fx
+            .manager
+            .reconcile_worktree(&active)
+            .await
+            .expect("worktree still exists at persisted path");
+        assert_eq!(reconciled.branch, "omega/renamed-in-place");
+        assert_eq!(reconciled.worktree_path, active.worktree_path);
+    }
+
+    #[tokio::test]
+    async fn reconcile_worktree_returns_none_when_full_rename_unrecoverable() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+
+        // Renamed *outside* the store with no trace left: directory moved AND
+        // branch renamed (raw `git branch -m` + `git worktree move`). Nothing
+        // links the persisted binding to the new checkout — the daemon must
+        // create a fresh worktree for the session.
+        let old_dir = Path::new(&active.worktree_path);
+        let new_dir = old_dir.parent().unwrap().join("renamed-outside");
+        let repo = fx.manager.repo_dir(&active.project.name);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "move",
+                "--force",
+                &active.worktree_path,
+                &new_dir.display().to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        git(
+            &repo,
+            &["branch", "-m", &active.branch, "omega/renamed-outside"],
+        )
+        .await
+        .unwrap();
+        assert!(!old_dir.exists());
+
+        assert!(
+            fx.manager.reconcile_worktree(&active).await.is_none(),
+            "no trace left to reconcile against"
+        );
     }
 
     // -----------------------------------------------------------------------

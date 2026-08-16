@@ -90,6 +90,19 @@ Because the session's file tools still point at the old directory after the
 rename, the agent is instructed not to run any more Bash/Read/Write/Edit
 calls afterwards.
 
+### Renames outside the daemon
+
+If a worktree is renamed (or moved) with raw `git` from outside omega — e.g.
+`git branch -m` from inside the checkout — the persisted session binding goes
+stale. The daemon reconciles it on the next interaction: when a session is
+resumed or a message is sent, the binding is checked against the live git
+state and re-pointed at the branch actually checked out (and the directory
+where that branch now lives), then persisted back to the session's metadata.
+The web UI's session index reads that metadata, so the sessions tab ends up
+mapping the renamed worktree to the original chat. When neither the path nor
+the branch can be found (a full external rename with no trace), a fresh
+worktree is created for the session instead.
+
 ## Tips
 
 - Committing from inside a worktree is a normal `git commit` on the session's

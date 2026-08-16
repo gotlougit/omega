@@ -479,11 +479,7 @@ impl Tool for RenameWorktreeTool {
             .lock()
             .await
             .insert(self.session_id.clone(), renamed.clone());
-
-        if let Ok(mut meta) = self.session_storage.load_metadata(&self.session_id) {
-            save_active_to_metadata(&mut meta, &renamed);
-            let _ = self.session_storage.save_metadata(&meta);
-        }
+        persist_active_project(&self.session_storage, &self.session_id, &renamed);
 
         let _ = self.event_tx.send(ServerEvent::ProjectActive {
             project: renamed.project.clone(),
@@ -535,6 +531,31 @@ fn save_active_to_metadata(
     }
 }
 
+/// Persist a session's project binding to its metadata file, so resume and
+/// the git-host session index see the current path/branch. Best-effort:
+/// failures are logged, never fatal for the request that triggered them.
+fn persist_active_project(
+    session_storage: &SessionStorage,
+    session_id: &str,
+    active: &ActiveProject,
+) {
+    match session_storage.load_metadata(session_id) {
+        Ok(mut meta) => {
+            save_active_to_metadata(&mut meta, active);
+            if let Err(e) = session_storage.save_metadata(&meta) {
+                tracing::warn!(%session_id, error = %e, "could not persist project binding");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "could not persist project binding: metadata unavailable"
+            );
+        }
+    }
+}
+
 fn active_from_metadata(meta: &crate::session::metadata::SessionMetadata) -> Option<ActiveProject> {
     meta.get_custom(META_ACTIVE_PROJECT)
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -542,7 +563,9 @@ fn active_from_metadata(meta: &crate::session::metadata::SessionMetadata) -> Opt
 
 /// Resolve the project context a session should use: the explicitly
 /// requested project (from a `run`) or the one persisted in metadata
-/// (resume/compact). If the worktree directory no longer exists it is
+/// (resume/compact). The persisted binding is reconciled against the live
+/// git state first — so a worktree renamed outside the daemon is re-bound to
+/// its actual path/branch — and if the worktree is gone entirely it is
 /// re-created, so a session always has a live checkout to operate in.
 async fn resolve_project_context(
     projects: &ProjectManager,
@@ -551,8 +574,8 @@ async fn resolve_project_context(
     persisted: Option<&ActiveProject>,
 ) -> Option<ActiveProject> {
     let candidate = requested.or(persisted)?;
-    if Path::new(&candidate.worktree_path).is_dir() {
-        return Some(candidate.clone());
+    if let Some(reconciled) = projects.reconcile_worktree(candidate).await {
+        return Some(reconciled);
     }
     match projects
         .activate(&candidate.project.name, session_id, None)
@@ -811,6 +834,28 @@ async fn handle_connection(
                     }
                     (None, None) => None,
                 };
+
+                // If reconciliation changed a *same-project* binding (e.g. the
+                // worktree was renamed outside the daemon so the persisted
+                // branch/path went stale), persist the corrected binding and
+                // refresh the live map + clients — otherwise the web UI keeps
+                // mapping the session to a branch that no longer exists.
+                if let (Some(desired), Some(current)) = (&desired_project, &current_project) {
+                    if desired.project.name == current.project.name
+                        && (desired.branch != current.branch
+                            || desired.worktree_path != current.worktree_path)
+                    {
+                        tracing::info!(
+                            %session_id,
+                            project = %desired.project.name,
+                            branch = %desired.branch,
+                            worktree = %desired.worktree_path,
+                            "reconciled project binding with live git state"
+                        );
+                        persist_active_project(&session_storage, &session_id, desired);
+                        session_projects_lock.insert(session_id.clone(), desired.clone());
+                    }
+                }
 
                 // Switching projects on an existing session (or a run that
                 // carries a project for a session created without one)
@@ -1563,18 +1608,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_project_context_recreates_missing_worktree() {
+    async fn resolve_project_context_finds_worktree_when_path_is_stale() {
         let (projects, remote, _) = projects_fixture().await;
         let first = projects.activate(&remote, "sess-1", None).await.unwrap();
 
-        // Simulate a worktree that vanished (daemon restart / manual rm).
-        let missing = ActiveProject {
+        // Persisted path is wrong/gone, but the branch lives on (e.g. the
+        // worktree directory moved). Reconcile must find the real checkout
+        // instead of needlessly re-creating one.
+        let wrong_path = ActiveProject {
             project: first.project.clone(),
             worktree_path: "/nonexistent/vanished-worktree".to_string(),
             branch: first.branch.clone(),
         };
 
-        let resolved = resolve_project_context(&projects, "sess-1", None, Some(&missing))
+        let resolved = resolve_project_context(&projects, "sess-1", None, Some(&wrong_path))
+            .await
+            .expect("should resolve via the live branch");
+        assert_eq!(resolved.project.name, first.project.name);
+        assert_eq!(resolved.branch, first.branch);
+        assert!(
+            std::path::Path::new(&resolved.worktree_path).is_dir(),
+            "worktree must exist on disk: {}",
+            resolved.worktree_path
+        );
+        assert_ne!(resolved.worktree_path, wrong_path.worktree_path);
+    }
+
+    #[tokio::test]
+    async fn resolve_project_context_recreates_worktree_when_unrecoverable() {
+        let (projects, remote, _) = projects_fixture().await;
+        let first = projects.activate(&remote, "sess-1", None).await.unwrap();
+
+        // Neither path nor branch can be found → a fresh worktree is created.
+        let gone = ActiveProject {
+            project: first.project.clone(),
+            worktree_path: "/nonexistent/vanished-worktree".to_string(),
+            branch: "omega/never-existed".to_string(),
+        };
+
+        let resolved = resolve_project_context(&projects, "sess-1", None, Some(&gone))
             .await
             .expect("should re-create a missing worktree");
         assert_eq!(resolved.project.name, first.project.name);
@@ -1583,7 +1655,46 @@ mod tests {
             "worktree must exist on disk: {}",
             resolved.worktree_path
         );
-        assert_ne!(resolved.worktree_path, missing.worktree_path);
+        assert_ne!(resolved.worktree_path, gone.worktree_path);
+        assert_ne!(resolved.branch, gone.branch);
+    }
+
+    #[tokio::test]
+    async fn resolve_project_context_self_heals_externally_renamed_binding() {
+        let (projects, remote, _) = projects_fixture().await;
+        let first = projects.activate(&remote, "sess-1", None).await.unwrap();
+
+        // Outside the daemon, someone renames the worktree's branch in place
+        // (raw `git branch -m` from inside the worktree). The persisted
+        // binding is now stale.
+        let repo = projects.repo_dir(&first.project.name);
+        let branch_cmd = tokio::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "branch",
+                "-m",
+                &first.branch,
+                "omega/renamed-in-place",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(branch_cmd.status.success());
+
+        let stale = ActiveProject {
+            project: first.project.clone(),
+            worktree_path: first.worktree_path.clone(),
+            branch: first.branch.clone(),
+        };
+        let resolved = resolve_project_context(&projects, "sess-1", None, Some(&stale))
+            .await
+            .expect("worktree still exists in place");
+        assert_eq!(
+            resolved.branch, "omega/renamed-in-place",
+            "resolved binding must reflect the actual branch"
+        );
+        assert_eq!(resolved.worktree_path, first.worktree_path);
     }
 
     #[tokio::test]
