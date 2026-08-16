@@ -579,6 +579,10 @@ struct Streaming {
     /// ThinkingComplete events are then ignored, and a fresh ThinkingDelta
     /// re-opens it for the next turn.
     thinking_done: bool,
+    /// Single live "… " line tracking the most recent tool progress output.
+    /// Kept to one block so a chatty tool (test suites, build logs) doesn't
+    /// flood the transcript; removed when the tool ends.
+    tool_progress: Option<(String, cli::BlockId)>,
 }
 
 impl Streaming {
@@ -591,6 +595,7 @@ impl Streaming {
         // After a turn ends, a stray ThinkingComplete is late — ignore it
         // until the next ThinkingDelta re-opens reasoning.
         self.thinking_done = true;
+        self.tool_progress = None;
     }
 }
 
@@ -598,9 +603,8 @@ impl Streaming {
 // Tool call rendering
 // ---------------------------------------------------------------------------
 
-/// Renders a tool call as `tool call {name}: {primary arg}` — no emoji, no
-/// JSON dump. The primary arg is the first present of well-known fields
-/// (`command`, `path`, …); anything else falls back to compact JSON.
+/// Renders a tool call as a compact one-liner — `⛭ Bash cargo test` — the
+/// primary argument (command/path/pattern/…) summarised, never a JSON dump.
 fn tool_call_line(name: &str, input: &serde_json::Value) -> String {
     const PRIMARY_KEYS: &[&str] = &["command", "path", "file_path", "pattern", "query", "url"];
     for key in PRIMARY_KEYS {
@@ -608,30 +612,29 @@ fn tool_call_line(name: &str, input: &serde_json::Value) -> String {
             // Collapse multi-line values (e.g. shell scripts) into one row.
             let one_line = value.trim().lines().collect::<Vec<_>>().join(" ; ");
             if !one_line.is_empty() {
-                return format!(
-                    "tool call {name}: {}",
-                    cli::truncate_to_width(&one_line, 120)
-                );
+                return format!("⛭ {name} {}", cli::truncate_to_width(&one_line, 60));
             }
         }
     }
-    let json = serde_json::to_string(input).unwrap_or_default();
-    // A payload that is empty, null, or only empty/whitespace strings carries
-    // nothing worth showing — just the tool name.
-    let trivial = json == "{}"
-        || json == "null"
-        || input
-            .as_object()
-            .map(|o| {
-                o.values()
-                    .all(|v| v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
-            })
-            .unwrap_or(false);
-    if trivial {
-        format!("tool call {name}")
-    } else {
-        format!("tool call {name}: {}", cli::truncate_to_width(&json, 120))
+    // Payloads that carry nothing worth showing (or unknown shapes) produce
+    // just the tool name — keep the transcript free of raw JSON.
+    format!("⛭ {name}")
+}
+
+/// Collapse a progress/log payload into one short line — the final line of
+/// the chunk, truncated — so long-running tools show a quiet trailing status.
+fn tool_progress_line(output: &str) -> String {
+    let last = output.lines().rev().find(|l| !l.trim().is_empty());
+    match last {
+        Some(line) => format!("  … {}", cli::truncate_to_width(line.trim(), 90)),
+        None => String::new(),
     }
+}
+
+/// A blank line between turns so the transcript reads as discrete
+/// exchanges instead of a continuous terminal log.
+fn turn_separator() -> StyledBlock {
+    StyledBlock::new(StyledText::from(Span::new("\n", Style::default())))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,26 +783,54 @@ fn handle_daemon_event(
                 }
                 streaming.thinking_done = true;
             }
-            OutputChunk::ToolStart { name, input, .. } => {
+            OutputChunk::ToolStart { id, name, input, .. } => {
+                // If a previous tool's progress line is still showing (e.g. a
+                // tool that ended without ToolEnd), retire it first.
+                if let Some((prev_id, block)) = streaming.tool_progress.take() {
+                    if prev_id != id {
+                        handle.remove_block(block);
+                    }
+                }
                 handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                     tool_call_line(&name, &input),
                     s_tool(),
                 ))));
             }
-            OutputChunk::ToolProgress { output, .. } => {
-                for line in output.lines() {
-                    handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        format!("  {line}"),
-                        s_tool(),
-                    ))));
+            OutputChunk::ToolProgress { id, output, .. } => {
+                let line = tool_progress_line(&output);
+                if line.is_empty() {
+                    return;
+                }
+                let block = StyledBlock::new(StyledText::from(Span::new(line, s_tool())));
+                match &streaming.tool_progress {
+                    Some((prev_id, prev_block)) if prev_id == &id => {
+                        handle.set_block(*prev_block, block);
+                        handle.redraw();
+                    }
+                    _ => {
+                        // New tool's progress without a matching ToolStart.
+                        if let Some((_, stale)) = streaming.tool_progress.take() {
+                            handle.remove_block(stale);
+                        }
+                        let block_id = handle.print_output(block);
+                        streaming.tool_progress = Some((id, block_id));
+                    }
                 }
             }
             OutputChunk::ToolEnd {
+                id,
                 name,
                 input,
                 result,
                 ..
             } => {
+                // The transient progress line is retired; only the compact
+                // start line and the result line remain in the transcript.
+                if let Some((prev_id, block)) = streaming.tool_progress.take() {
+                    if prev_id == id {
+                        handle.remove_block(block);
+                    }
+                }
                 // For Transfer tool, save the file content to the user's PWD
                 if name == "Transfer" && !result.is_error && !result.text.is_empty() {
                     let file_path = input
@@ -839,19 +870,19 @@ fn handle_daemon_event(
                         result.text.clone()
                     };
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        format!("  ✗ {text}"),
+                        format!("  ✗ {name} {text}"),
                         s_error(),
                     ))));
                 } else if !result.text.is_empty() {
                     let preview = cli::truncate_to_width(&result.text, 80);
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        format!("  ✓ {preview}"),
+                        format!("  ✓ {name} {preview}"),
                         s_tool_ok(),
                     ))));
                 } else {
                     // Tool succeeded with empty output — still acknowledge it.
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                        "  ✓ done",
+                        format!("  ✓ {name} done"),
                         s_tool_ok(),
                     ))));
                 }
@@ -1012,6 +1043,7 @@ fn handle_daemon_event(
             // (same styles as a new chat), never as a "[History]" dump.
             match role.as_str() {
                 "user" => {
+                    handle.print_output(turn_separator());
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                         format!("▸ {content}"),
                         s_user(),
@@ -1198,6 +1230,7 @@ fn process_line(
     }
 
     if !line.starts_with('/') {
+        handle.print_output(turn_separator());
         handle.print_output(StyledBlock::new(StyledText::from(Span::new(
             format!("▸ {line}"),
             s_user(),
@@ -1231,6 +1264,7 @@ fn process_line(
     ];
     if !known_commands.contains(&cmd) {
         // Unknown slash command — treat as user text, not an error.
+        handle.print_output(turn_separator());
         handle.print_output(StyledBlock::new(StyledText::from(Span::new(
             format!("▸ {line}"),
             s_user(),
@@ -1419,6 +1453,7 @@ fn run_loop(
         thinking_block_id: None,
         thinking_buf: String::new(),
         thinking_done: false,
+        tool_progress: None,
     };
     let mut history: Vec<String> = Vec::new();
     // Set while a `/status` ping is awaiting the daemon's ModelList reply.
@@ -1557,12 +1592,33 @@ fn run_loop(
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
+    // The TUI draws into the terminal directly and owns raw mode, so logs
+    // must never reach stdout *or* stderr — both are attached to the same
+    // pty and would land mid-frame, corrupting the chat screen. When
+    // RUST_LOG is set the diagnostics go to a log file instead; without it
+    // nothing is logged at all.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"));
+    let log_path = std::env::temp_dir().join("omega-tui.log");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(file)
+                .try_init();
+        }
+        Err(_) => {
+            // Never write to the tty — if no log file can be opened, silence
+            // logging rather than corrupt the UI.
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
+                .try_init();
+        }
+    }
 
     // ── Create terminal FIRST — no daemon dependency ────────────────────
     // The terminal appears instantly so the user sees something immediately.
@@ -1714,6 +1770,7 @@ mod tests {
                 thinking_block_id: None,
                 thinking_buf: String::new(),
                 thinking_done: false,
+                tool_progress: None,
             },
         }
     }
@@ -1954,10 +2011,10 @@ mod tests {
         );
         fx.handle.redraw_sync();
         assert_eq!(
-            count_rows_containing(&fx, "tool call read_file: src/main.rs"),
+            count_rows_containing(&fx, "⛭ read_file src/main.rs"),
             1
         );
-        assert_eq!(count_rows_containing(&fx, "✗ boom"), 1);
+        assert_eq!(count_rows_containing(&fx, "✗ read_file boom"), 1);
     }
 
     #[test]
@@ -1970,20 +2027,21 @@ mod tests {
                 "description": "Check current working directory",
             }),
         );
-        assert_eq!(line, "tool call Bash: pwd && ls -la");
+        assert_eq!(line, "⛭ Bash pwd && ls -la");
         assert!(!line.contains("description"));
 
         // Multi-line commands collapse into one row.
         let line = tool_call_line("Bash", &serde_json::json!({"command": "cd /tmp\nls"}));
-        assert_eq!(line, "tool call Bash: cd /tmp ; ls");
+        assert_eq!(line, "⛭ Bash cd /tmp ; ls");
 
         // Empty input: just the tool name.
         let line = tool_call_line("ls", &serde_json::json!({}));
-        assert_eq!(line, "tool call ls");
+        assert_eq!(line, "⛭ ls");
 
-        // Unknown shape: compact JSON fallback.
+        // Unknown shape: tool name only — raw JSON never hits the transcript.
         let line = tool_call_line("grep", &serde_json::json!({"foo": "bar"}));
-        assert_eq!(line, "tool call grep: {\"foo\":\"bar\"}");
+        assert_eq!(line, "⛭ grep");
+        assert!(!line.contains("foo"), "unknown shapes must not dump JSON");
     }
 
     #[test]
@@ -2534,7 +2592,7 @@ mod tests {
             }),
         );
         fx.handle.redraw_sync();
-        assert_eq!(count_rows_containing(&fx, "tool call Bash: ls"), 1);
+        assert_eq!(count_rows_containing(&fx, "⛭ Bash ls"), 1);
         assert_eq!(count_rows_containing(&fx, "done"), 1);
     }
 
@@ -3784,7 +3842,7 @@ mod tests {
         fx.handle.redraw_sync();
         // Verify ToolStart rendered.
         assert!(
-            count_rows_containing(&fx, "tool call run") > 0,
+            count_rows_containing(&fx, "⛭ run") > 0,
             "ToolStart text not found"
         );
         assert!(
@@ -4546,7 +4604,7 @@ mod tests {
         );
         fx.handle.redraw_sync();
         assert!(
-            transcript_contains(&fx, "tool call bash"),
+            transcript_contains(&fx, "⛭ bash echo hi"),
             "tool must render"
         );
         assert!(transcript_contains(&fx, "done"), "tool end must render");
@@ -7672,9 +7730,10 @@ mod tests {
         assert_eq!(count_rows_containing(&fx, "… final reasoning"), 1);
     }
 
-    /// Multi-line tool progress output renders one indented line per line.
+    /// Multi-line tool progress collapses to a single live line showing the
+    /// latest output — a chatty tool must not flood the transcript.
     #[test]
-    fn tool_progress_multiline_renders_each_line() {
+    fn tool_progress_multiline_collapses_to_latest_line() {
         let mut fx = fixture();
         handle_daemon_event(
             &fx.handle,
@@ -7686,9 +7745,44 @@ mod tests {
             }),
         );
         fx.handle.redraw_sync();
-        assert_eq!(count_rows_containing(&fx, "  line1"), 1);
-        assert_eq!(count_rows_containing(&fx, "  line2"), 1);
-        assert_eq!(count_rows_containing(&fx, "  line3"), 1);
+        // Only the last line is shown, as a quiet trailing "…" line.
+        assert_eq!(count_rows_containing(&fx, "  … line3"), 1);
+        assert_eq!(count_rows_containing(&fx, "line1"), 0);
+        assert_eq!(count_rows_containing(&fx, "line2"), 0);
+
+        // A new chunk replaces the line rather than appending.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolProgress {
+                id: "t1".into(),
+                output: "line4".into(),
+            }),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "  … line4"), 1);
+        assert_eq!(count_rows_containing(&fx, "line3"), 0);
+
+        // ToolEnd retires the transient progress line.
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            chunk(OutputChunk::ToolEnd {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "make"}),
+                result: ToolResultWire {
+                    text: "done".into(),
+                    is_error: false,
+                    content: None,
+                },
+            }),
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "… line4"), 0);
+        assert_eq!(count_rows_containing(&fx, "  ✓ Bash done"), 1);
     }
 
     /// Two complete turns with separate thinking traces must never merge their
@@ -8124,8 +8218,8 @@ mod tests {
             .chain(em.screen_lines())
             .collect();
         let pos = |needle: &str| all.iter().position(|l| l.contains(needle)).unwrap();
-        assert!(pos("… think") < pos("tool call Bash"), "{all:?}");
-        assert!(pos("tool call Bash") < pos("answer"), "{all:?}");
+        assert!(pos("… think") < pos("⛭ Bash"), "{all:?}");
+        assert!(pos("⛭ Bash") < pos("answer"), "{all:?}");
         assert!(pos("answer") < pos("done"), "{all:?}");
     }
 
@@ -8369,18 +8463,18 @@ mod tests {
     fn tool_call_line_null_input() {
         assert_eq!(
             tool_call_line("read_file", &serde_json::Value::Null),
-            "tool call read_file"
+            "⛭ read_file"
         );
     }
 
     #[test]
     fn tool_call_line_empty_primary_value_falls_back() {
         // A primary key that is present but empty must not produce a trailing
-        // colon line — fall back to the tool name.
+        // line — fall back to the tool name.
         let line = tool_call_line("Bash", &serde_json::json!({"command": "  "}));
-        assert_eq!(line, "tool call Bash");
+        assert_eq!(line, "⛭ Bash");
         let line = tool_call_line("Bash", &serde_json::json!({"command": ""}));
-        assert_eq!(line, "tool call Bash");
+        assert_eq!(line, "⛭ Bash");
     }
 
     #[test]
@@ -8998,12 +9092,13 @@ mod tests {
         fx.handle.redraw_sync();
         let em = emulator(&fx);
         let screen = em.screen_lines();
-        let tool_row = screen.iter().position(|l| l.contains("tool call Bash")).unwrap();
+        let tool_row = screen.iter().position(|l| l.contains("⛭ Bash ls")).unwrap();
         let prompt_row = screen.iter().position(|l| l.contains("ttt")).unwrap();
         assert!(tool_row < prompt_row, "tool output must be above the prompt");
         assert_eq!(screen.iter().filter(|l| l.contains("ttt")).count(), 2);
-        assert!(transcript_contains(&fx, "file.txt"));
-        assert!(transcript_contains(&fx, "other.txt"));
+        // Transient progress line is retired once the tool finishes.
+        assert!(!transcript_contains(&fx, "other.txt"));
+        assert!(!transcript_contains(&fx, "file.txt"));
     }
 
     /// Escape + cache telemetry + streaming together: all must render without
@@ -9181,8 +9276,8 @@ mod tests {
             .chain(em.screen_lines())
             .collect();
         assert!(
-            all.iter().any(|l| l.contains("✗ failed")),
-            "BUG: error ToolEnd with empty text must render '✗ failed', got: {all:?}"
+            all.iter().any(|l| l.contains("✗ Bash failed")),
+            "BUG: error ToolEnd with empty text must render '✗ <tool> failed', got: {all:?}"
         );
         assert!(
             !all.iter().any(|l| l.trim_end() == "✗" || l.trim() == "✗"),
@@ -9463,7 +9558,7 @@ mod tests {
     // =========================================================================
 
     /// CRLF tool progress must not leak carriage returns into the rendered
-    /// rows as replacement glyphs.
+    /// rows as replacement glyphs — and only the latest line is kept.
     #[test]
     fn tool_progress_crlf_renders_cleanly() {
         let mut fx = fixture();
@@ -9477,8 +9572,8 @@ mod tests {
             }),
         );
         fx.handle.redraw_sync();
-        assert_eq!(count_rows_containing(&fx, "  line1"), 1);
-        assert_eq!(count_rows_containing(&fx, "  line2"), 1);
+        assert_eq!(count_rows_containing(&fx, "  … line2"), 1);
+        assert_eq!(count_rows_containing(&fx, "line1"), 0);
         assert_eq!(
             count_rows_containing(&fx, "�"),
             0,

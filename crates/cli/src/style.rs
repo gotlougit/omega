@@ -519,6 +519,29 @@ pub fn layout_lines(
     result
 }
 
+/// Background colour to use for a row's padding, if any.
+///
+/// Rows whose content carries the *same* background on every cell (e.g.
+/// markdown code blocks) get that background extended across the full row
+/// width — a quiet band instead of a chip under the text. Rows mixing
+/// styled and unstyled cells (inline code inside prose) keep plain padding.
+/// A block-level `block_bg` always wins.
+fn row_padding_bg(line: &[Cell], block_bg: Option<Color>) -> Option<Color> {
+    if block_bg.is_some() {
+        return block_bg;
+    }
+    let mut bg = None;
+    for cell in line {
+        match (bg, cell.style.bg) {
+            (None, Some(b)) => bg = Some(b),
+            (Some(prev), Some(b)) if prev != b => return None,
+            (Some(_), None) => return None,
+            _ => {}
+        }
+    }
+    bg
+}
+
 /// Lays out a [`StyledBlock`] into physical terminal lines.
 pub fn layout_block(block: &StyledBlock, width: usize) -> Vec<Vec<Cell>> {
     let width = width.max(1);
@@ -541,17 +564,18 @@ pub fn layout_block(block: &StyledBlock, width: usize) -> Vec<Vec<Cell>> {
         }
     }
 
-    let fill_style = Style {
-        bg: block.bg,
-        ..Style::default()
-    };
-    let fill = Cell::new(' ', fill_style);
-
     content_lines
         .iter()
         .map(|line| {
+            let bg = row_padding_bg(line, block.bg);
+            let fill_style = Style {
+                bg,
+                ..Style::default()
+            };
+            let fill = Cell::new(' ', fill_style);
+
             let mut row = Vec::with_capacity(width);
-            row.extend(std::iter::repeat_n(Cell::plain(' '), ml));
+            row.extend(std::iter::repeat_n(fill, ml));
 
             let cw = cell_slice_cols(line);
             let padding = content_width.saturating_sub(cw);
@@ -569,7 +593,7 @@ pub fn layout_block(block: &StyledBlock, width: usize) -> Vec<Vec<Cell>> {
                 }
             }
 
-            row.extend(std::iter::repeat_n(Cell::plain(' '), mr));
+            row.extend(std::iter::repeat_n(fill, mr));
 
             if let Some(bg) = block.bg {
                 let content_end = row.len().saturating_sub(mr);
@@ -583,4 +607,62 @@ pub fn layout_block(block: &StyledBlock, width: usize) -> Vec<Vec<Cell>> {
             row
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Style;
+
+    /// A row whose content cells all share the same background (markdown code
+    /// blocks) gets that background extended across the whole terminal width,
+    /// rendering as a quiet band rather than a chip under the text.
+    #[test]
+    fn uniform_row_bg_extends_across_row() {
+        let text = StyledText::from(Span::new(
+            "let x = 1;",
+            Style::default().bg(Color::DarkGrey),
+        ));
+        let block = StyledBlock::new(text);
+        let rows = layout_block(&block, 30);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].iter().all(|c| c.style.bg == Some(Color::DarkGrey)),
+            "uniform row bg must extend to the full width, got {:?}",
+            rows[0].iter().map(|c| c.style.bg).collect::<Vec<_>>()
+        );
+    }
+
+    /// Rows mixing styled and unstyled cells (inline code inside prose) must
+    /// keep plain padding — banding only happens when the *whole* row shares
+    /// one background.
+    #[test]
+    fn mixed_bg_rows_keep_plain_padding() {
+        let mut t = StyledText::new();
+        t.push(Span::new("use ", Style::default()));
+        t.push(Span::new("foo()", Style::default().bg(Color::DarkGrey)));
+        t.push(Span::new(" here", Style::default()));
+        let block = StyledBlock::new(t);
+        let rows = layout_block(&block, 30);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        // "use " (4) stays plain.
+        assert!(
+            row[..4].iter().all(|c| c.style.bg.is_none()),
+            "leading prose must stay plain, got {:?}",
+            row.iter().map(|c| c.style.bg).collect::<Vec<_>>()
+        );
+        // "foo()" (5) keeps its own background.
+        assert!(row[4..9].iter().all(|c| c.style.bg == Some(Color::DarkGrey)));
+        // " here" (5) and the padding (16) stay plain — no full-row band.
+        assert!(
+            row[9..].iter().all(|c| c.style.bg.is_none()),
+            "mixed-content rows must not band the padding, got {:?}",
+            row.iter().map(|c| c.style.bg).collect::<Vec<_>>()
+        );
+    }
 }
