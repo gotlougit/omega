@@ -71,6 +71,25 @@ cheap — no repeated cloning.
 - **Doing `/project` is optional.** Sessions without a project behave exactly
   as before, with tools rooted at the daemon's working directory.
 
+## Renaming a worktree
+
+Worktrees are created with opaque names (`<session>-<rand>`). Once the work is
+done you can give one a descriptive name — say `fix-tui-crash` — so it (and
+its branch, `omega/fix-tui-crash`) is easy to identify later, in the worktree
+listing, the git forge, or the session index.
+
+The agent does this itself: project-bound sessions get a native
+`RenameWorktree` tool, and the system prompt instructs the agent to call it
+**once, as the final step**, once the task is complete and the work is
+committed. Renaming moves the checkout directory and renames the branch,
+preserving the commit history and any uncommitted files, and the new name is
+persisted in the session metadata — so resume, the TUI status line, and the
+git-host session index all keep working against the renamed worktree.
+
+Because the session's file tools still point at the old directory after the
+rename, the agent is instructed not to run any more Bash/Read/Write/Edit
+calls afterwards.
+
 ## Tips
 
 - Committing from inside a worktree is a normal `git commit` on the session's

@@ -244,6 +244,100 @@ impl ProjectManager {
         Ok(())
     }
 
+    /// Rename a session worktree to a descriptive name, so it can be easily
+    /// identified once the work is done.
+    ///
+    /// Renames both the checkout directory and its branch (`omega/<name>`),
+    /// keeping the worktree attached to the same HEAD and preserving any
+    /// (possibly uncommitted) files. Returns the updated [`ActiveProject`]
+    /// with the new path and branch.
+    pub async fn rename_worktree(
+        &self,
+        active: &ActiveProject,
+        new_name: &str,
+    ) -> Result<ActiveProject> {
+        let name = sanitize_ref_component(new_name);
+        if new_name.trim().is_empty() {
+            bail!("worktree name must not be empty");
+        }
+
+        let repo = self.repo_dir(&active.project.name);
+        if !repo.join("HEAD").exists() {
+            bail!(
+                "project '{}' has no local clone (repo {} missing)",
+                active.project.name,
+                repo.display()
+            );
+        }
+        if !Path::new(&active.worktree_path).is_dir() {
+            bail!(
+                "worktree '{}' no longer exists on disk",
+                active.worktree_path
+            );
+        }
+
+        let new_branch = format!("omega/{name}");
+        let new_path = self.worktrees_dir(&active.project.name).join(&name);
+
+        // Nothing to do when the name is unchanged — the branch (and by
+        // extension the checkout directory) already carries it.
+        if new_branch == active.branch {
+            return Ok(active.clone());
+        }
+
+        if new_path.exists() {
+            bail!(
+                "a worktree named '{name}' already exists at {}",
+                new_path.display()
+            );
+        }
+
+        // Move the checkout directory (--force so uncommitted files survive).
+        if active.worktree_path != new_path.display().to_string() {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "move",
+                    "--force",
+                    &active.worktree_path,
+                    &new_path.display().to_string(),
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to move worktree '{}' to '{}'",
+                    active.worktree_path,
+                    new_path.display()
+                )
+            })?;
+        }
+
+        // Rename the branch so the worktree keeps its identity. This works
+        // while the branch is checked out in its own (just moved) worktree.
+        if active.branch != new_branch {
+            git(&repo, &["branch", "-m", &active.branch, &new_branch])
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to rename branch '{}' to '{new_branch}'",
+                        active.branch
+                    )
+                })?;
+        }
+
+        Ok(ActiveProject {
+            project: active.project.clone(),
+            worktree_path: new_path
+                .canonicalize()
+                .unwrap_or(new_path)
+                .display()
+                .to_string(),
+            branch: new_branch,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Low-level git operations
     // -----------------------------------------------------------------------
@@ -733,6 +827,216 @@ mod tests {
             .await
             .unwrap();
         assert!(Path::new(&again.worktree_path).is_dir());
+    }
+
+    // -----------------------------------------------------------------------
+    // Worktree renaming
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rename_worktree_moves_dir_and_renames_branch() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+        let repo = fx.manager.repo_dir(&active.project.name);
+        configure_worktree_identity(&fx.manager, &active.project).await;
+
+        // Put some (uncommitted) work in the worktree — a rename must keep it.
+        let wt = Path::new(&active.worktree_path);
+        tokio::fs::write(wt.join("wip.txt"), "work in progress\n")
+            .await
+            .unwrap();
+
+        let renamed = fx
+            .manager
+            .rename_worktree(&active, "fix tui crash")
+            .await
+            .unwrap();
+
+        // Directory moved under the store's worktrees dir.
+        assert_eq!(
+            renamed.worktree_path,
+            fx.manager
+                .worktrees_dir(&active.project.name)
+                .join("fix-tui-crash")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert!(Path::new(&renamed.worktree_path).is_dir());
+        assert!(
+            !Path::new(&active.worktree_path).exists(),
+            "old worktree dir should be gone"
+        );
+        assert_eq!(
+            renamed.branch, "omega/fix-tui-crash",
+            "branch should be renamed to omega/<name>"
+        );
+
+        // The moved worktree is still a git checkout on the renamed branch,
+        // with the uncommitted file intact.
+        let new_wt = Path::new(&renamed.worktree_path);
+        assert_eq!(
+            git(new_wt, &["rev-parse", "--is-inside-work-tree"])
+                .await
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            git(new_wt, &["branch", "--show-current"]).await.unwrap(),
+            renamed.branch
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(new_wt.join("wip.txt"))
+                .await
+                .unwrap(),
+            "work in progress\n"
+        );
+
+        // Git's worktree bookkeeping points at the new path only.
+        let list = git(&repo, &["worktree", "list"]).await.unwrap();
+        assert!(list.contains(&renamed.worktree_path), "{list}");
+        assert!(!list.contains(&active.worktree_path), "{list}");
+        assert_eq!(count_lines(&list), 2, "bare repo + 1 moved worktree");
+
+        // The old branch no longer exists; the new one does.
+        let old_branch = git(&repo, &["branch", "--list", &active.branch])
+            .await
+            .unwrap();
+        assert!(old_branch.is_empty(), "old branch should be deleted");
+        let new_branch = git(&repo, &["branch", "--list", "omega/fix-tui-crash"])
+            .await
+            .unwrap();
+        assert!(new_branch.contains("omega/fix-tui-crash"));
+    }
+
+    #[tokio::test]
+    async fn rename_worktree_preserves_commit_history() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+        configure_worktree_identity(&fx.manager, &active.project).await;
+
+        let wt = Path::new(&active.worktree_path);
+        tokio::fs::write(wt.join("feature.txt"), "feature\n")
+            .await
+            .unwrap();
+        git(wt, &["add", "."]).await.unwrap();
+        git(wt, &["commit", "-m", "add feature"]).await.unwrap();
+
+        let renamed = fx
+            .manager
+            .rename_worktree(&active, "add-feature")
+            .await
+            .unwrap();
+
+        // Commits live on the renamed branch, reachable from the new name.
+        let log = git(Path::new(&renamed.worktree_path), &["log", "--oneline"])
+            .await
+            .unwrap();
+        assert!(log.contains("add feature"), "{log}");
+        assert_eq!(
+            git(
+                Path::new(&renamed.worktree_path),
+                &["log", "--oneline", "-1"]
+            )
+            .await
+            .unwrap(),
+            git(
+                &fx.manager.repo_dir(&active.project.name),
+                &["log", "--oneline", "-1", &renamed.branch]
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_worktree_rejects_empty_and_duplicate_names() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+
+        // Empty name → rejected before touching git.
+        let err = fx
+            .manager
+            .rename_worktree(&active, "   ")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "empty name error: {err:#}"
+        );
+
+        // Renaming to a name already taken by another worktree → rejected.
+        let other = fx
+            .manager
+            .activate(&fx.remote_url, "sess-2", None)
+            .await
+            .unwrap();
+        let taken = fx
+            .manager
+            .rename_worktree(&other, "taken-name")
+            .await
+            .unwrap();
+        let err = fx
+            .manager
+            .rename_worktree(&active, "taken-name")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "duplicate name error: {err:#}"
+        );
+        // The first worktree is untouched by the failed rename.
+        assert!(Path::new(&taken.worktree_path).is_dir());
+        assert_eq!(
+            git(
+                &Path::new(&taken.worktree_path),
+                &["branch", "--show-current"]
+            )
+            .await
+            .unwrap(),
+            taken.branch
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_worktree_same_name_is_a_noop() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+        let repo = fx.manager.repo_dir(&active.project.name);
+
+        // Re-naming to the current directory/branch name must succeed and
+        // change nothing.
+        let current_dir = Path::new(&active.worktree_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let renamed = fx
+            .manager
+            .rename_worktree(&active, &current_dir)
+            .await
+            .unwrap();
+        assert_eq!(renamed.worktree_path, active.worktree_path);
+        assert_eq!(renamed.branch, active.branch);
+        let list = git(&repo, &["worktree", "list"]).await.unwrap();
+        assert_eq!(count_lines(&list), 2);
     }
 
     // -----------------------------------------------------------------------

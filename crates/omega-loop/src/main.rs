@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use omega_projects::{ActiveProject, ProjectInfo, ProjectManager};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Mutex};
@@ -36,9 +37,13 @@ mod helpers;
 mod runtime;
 mod session;
 
-use omega_core::core::{InputMessage, OutputChunk, SessionInfo};
-use omega_llm::{AuthConfig, ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider};
-use omega_tools::ToolRegistry;
+use omega_core::core::{InputMessage, OutputChunk, SessionInfo, ToolInfo, ToolResult, ToolRuntime};
+use omega_llm::types::CustomTool;
+use omega_llm::{
+    AuthConfig, ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider, ToolDefinition,
+    ToolInputSchema,
+};
+use omega_tools::{Tool, ToolRegistry};
 
 use crate::agent::{AgentConfig, StandardAgent};
 use crate::runtime::{AgentHandle, AgentRuntime};
@@ -76,7 +81,7 @@ struct SessionConfig {
     no_cache: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
 enum ServerEvent {
     Created {
@@ -319,14 +324,21 @@ const META_ACTIVE_PROJECT: &str = "active_project";
 
 /// Build a tool registry whose proxy tools run inside `dir` — used for
 /// project-bound sessions so every Bash/Read/Write/Edit executes in the
-/// session's git worktree.
-fn create_tools_for_dir(dir: &Path, session_id: &str) -> Arc<ToolRegistry> {
+/// session's git worktree. Project-bound sessions also get the native
+/// `RenameWorktree` tool so the agent can give the worktree a descriptive
+/// name once its work is done.
+fn create_tools_for_dir(
+    dir: &Path,
+    session_id: &str,
+    rename_tool: RenameWorktreeTool,
+) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
     let omega = OmegaClient::new()
         .with_session(session_id.to_string())
         .with_dir(dir.display().to_string());
     omega_sh_client::register_proxy_tools(&mut registry, omega);
     omega_tools::register_default_tools(&mut registry);
+    registry.register(rename_tool);
     Arc::new(registry)
 }
 
@@ -336,15 +348,165 @@ fn tools_for_session(
     default: &Arc<ToolRegistry>,
     active: Option<&ActiveProject>,
     session_id: &str,
+    rename_tool: RenameWorktreeTool,
 ) -> Arc<ToolRegistry> {
     match active {
-        Some(active) => create_tools_for_dir(Path::new(&active.worktree_path), session_id),
+        Some(active) => {
+            create_tools_for_dir(Path::new(&active.worktree_path), session_id, rename_tool)
+        }
         None => default.clone(),
     }
 }
 
+/// Native tool that renames the session's git worktree once the work is
+/// done, so the worktree (and its branch) can be easily identified later.
+///
+/// Renaming moves the checkout directory and renames the branch, then keeps
+/// the daemon's view consistent: the live session binding, the persisted
+/// session metadata (source of truth for resume + the git-host session
+/// index) and connected clients (via `ProjectActive`) all see the new
+/// path/branch. File tools in the session still point at the *old*
+/// directory, so the agent is instructed to call this as the final step.
+#[derive(Clone)]
+struct RenameWorktreeTool {
+    projects: Arc<ProjectManager>,
+    session_id: String,
+    session_projects: Arc<Mutex<HashMap<String, ActiveProject>>>,
+    session_storage: Arc<crate::session::SessionStorage>,
+    event_tx: broadcast::Sender<ServerEvent>,
+}
+
+/// Build a [`RenameWorktreeTool`] for a session, wiring it to the daemon
+/// state the rename must keep consistent (live binding, persisted metadata,
+/// connected clients).
+fn rename_worktree_tool(
+    projects: &Arc<ProjectManager>,
+    session_id: &str,
+    session_projects: &Arc<Mutex<HashMap<String, ActiveProject>>>,
+    session_storage: &Arc<crate::session::SessionStorage>,
+    event_tx: &broadcast::Sender<ServerEvent>,
+) -> RenameWorktreeTool {
+    RenameWorktreeTool {
+        projects: Arc::clone(projects),
+        session_id: session_id.to_string(),
+        session_projects: Arc::clone(session_projects),
+        session_storage: Arc::clone(session_storage),
+        event_tx: event_tx.clone(),
+    }
+}
+
+/// Shared description used for the tool definition and the system prompt.
+const RENAME_WORKTREE_DESCRIPTION: &str =
+    "Rename this session's git worktree to a short, descriptive name so it can be easily \
+     identified later (e.g. 'fix-tui-crash' or 'add-billing-api'). Use this once, as the final \
+     step, once the task is complete and the work has been committed.";
+
+#[async_trait::async_trait]
+impl Tool for RenameWorktreeTool {
+    fn name(&self) -> &str {
+        "RenameWorktree"
+    }
+
+    fn description(&self) -> &str {
+        RENAME_WORKTREE_DESCRIPTION
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::Custom(CustomTool {
+            name: self.name().to_string(),
+            description: Some(self.description().to_string()),
+            input_schema: ToolInputSchema::new()
+                .with_properties(serde_json::json!({
+                    "name": {
+                        "type": "string",
+                        "description": "Short descriptive name for the worktree \
+                                       (e.g. 'fix-tui-crash'); spaces and special \
+                                       characters are converted to dashes"
+                    }
+                }))
+                .with_required(vec!["name".to_string()]),
+            tool_type: None,
+            cache_control: None,
+        })
+    }
+
+    fn get_info(&self, input: &Value) -> ToolInfo {
+        ToolInfo {
+            name: self.name().to_string(),
+            action_description: "Rename the session's git worktree".to_string(),
+            details: input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| format!("rename worktree to '{n}'")),
+        }
+    }
+
+    async fn execute(&self, input: &Value, rt: &mut dyn ToolRuntime) -> Result<ToolResult> {
+        let name = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(name) = name else {
+            return Ok(ToolResult::error(
+                "RenameWorktree requires a non-empty 'name' argument",
+            ));
+        };
+
+        // The live binding for this session — the daemon keeps it in sync
+        // with the persisted metadata.
+        let current = {
+            let map = self.session_projects.lock().await;
+            map.get(&self.session_id).cloned()
+        };
+        let Some(current) = current else {
+            return Ok(ToolResult::error(
+                "no active project worktree for this session",
+            ));
+        };
+
+        let renamed = match self.projects.rename_worktree(&current, name).await {
+            Ok(renamed) => renamed,
+            Err(e) => {
+                return Ok(ToolResult::error(format!("worktree rename failed: {e:#}")));
+            }
+        };
+
+        // Keep every view of the binding consistent: the per-connection map,
+        // the persisted session metadata (source of truth for resume and the
+        // git-host session index), and connected clients.
+        self.session_projects
+            .lock()
+            .await
+            .insert(self.session_id.clone(), renamed.clone());
+
+        if let Ok(mut meta) = self.session_storage.load_metadata(&self.session_id) {
+            save_active_to_metadata(&mut meta, &renamed);
+            let _ = self.session_storage.save_metadata(&meta);
+        }
+
+        let _ = self.event_tx.send(ServerEvent::ProjectActive {
+            project: renamed.project.clone(),
+            worktree_path: renamed.worktree_path.clone(),
+            branch: renamed.branch.clone(),
+        });
+
+        rt.send_text(&format!(
+            "Worktree renamed to '{}' — new path: {} (branch {})",
+            name, renamed.worktree_path, renamed.branch
+        ));
+
+        Ok(ToolResult::success(format!(
+            "Renamed worktree to '{}'.\nNew path: {}\nNew branch: {}",
+            name, renamed.worktree_path, renamed.branch
+        )))
+    }
+}
+
 /// System-prompt context injected into project-bound sessions, giving the
-/// agent immediate context about the repository it is working in.
+/// agent immediate context about the repository it is working in — including
+/// the instruction to rename the worktree once the work is done so it can be
+/// easily identified later.
 fn project_system_context(active: &ActiveProject) -> String {
     format!(
         "\n\nYou are working on the project '{}'.\n\
@@ -353,7 +515,13 @@ fn project_system_context(active: &ActiveProject) -> String {
          Working directory: {}\n\
          All file reads/writes/edits and shell commands operate inside this\n\
          directory (a dedicated git worktree). Commit your work on the current\n\
-         branch; do not push or merge unless the user asks.",
+         branch; do not push or merge unless the user asks.\n\n\
+         When the task is complete and the work has been committed, rename the\n\
+         worktree to a short, descriptive name with the RenameWorktree tool so\n\
+         it can be easily identified later (e.g. 'fix-tui-crash' or\n\
+         'add-billing-api'). Do this once, as the final step: afterwards the\n\
+         file tools still point at the old directory, so do not run any more\n\
+         Bash/Read/Write/Edit calls after renaming.",
         active.project.name, active.project.url, active.branch, active.worktree_path
     )
 }
@@ -702,8 +870,18 @@ async fn handle_connection(
                         .and_then(|p| std::fs::read_to_string(p).ok())
                         .unwrap_or_default();
 
-                    let session_tools =
-                        tools_for_session(&tools, desired_project.as_ref(), &session_id);
+                    let session_tools = tools_for_session(
+                        &tools,
+                        desired_project.as_ref(),
+                        &session_id,
+                        rename_worktree_tool(
+                            &projects,
+                            &session_id,
+                            &session_projects,
+                            &session_storage,
+                            &event_tx,
+                        ),
+                    );
                     let provider = current_provider.read().unwrap().clone();
 
                     let handle = match create_session(
@@ -821,7 +999,18 @@ async fn handle_connection(
                         .ok()
                         .and_then(|p| std::fs::read_to_string(p).ok())
                         .unwrap_or_default();
-                    let session_tools = tools_for_session(&tools, Some(&active), &session_id);
+                    let session_tools = tools_for_session(
+                        &tools,
+                        Some(&active),
+                        &session_id,
+                        rename_worktree_tool(
+                            &projects,
+                            &session_id,
+                            &session_projects,
+                            &session_storage,
+                            &event_tx,
+                        ),
+                    );
                     let provider = current_provider.read().unwrap().clone();
 
                     match create_session(
@@ -920,7 +1109,18 @@ async fn handle_connection(
                         }
 
                         let prov = current_provider.read().unwrap().clone();
-                        let session_tools = tools_for_session(&tools, active.as_ref(), &session_id);
+                        let session_tools = tools_for_session(
+                            &tools,
+                            active.as_ref(),
+                            &session_id,
+                            rename_worktree_tool(
+                                &projects,
+                                &session_id,
+                                &session_projects,
+                                &session_storage,
+                                &event_tx,
+                            ),
+                        );
                         let agent_cfg = AgentConfig::new().with_tools(session_tools);
                         let agent = StandardAgent::new(agent_cfg, prov);
 
@@ -1041,7 +1241,18 @@ async fn handle_connection(
                         }
 
                         let prov = current_provider.read().unwrap().clone();
-                        let session_tools = tools_for_session(&tools, active.as_ref(), &session_id);
+                        let session_tools = tools_for_session(
+                            &tools,
+                            active.as_ref(),
+                            &session_id,
+                            rename_worktree_tool(
+                                &projects,
+                                &session_id,
+                                &session_projects,
+                                &session_storage,
+                                &event_tx,
+                            ),
+                        );
                         let agent_cfg = AgentConfig::new().with_tools(session_tools);
                         let agent = StandardAgent::new(agent_cfg, prov);
 
@@ -1199,6 +1410,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omega_core::core::ToolResultData;
     use omega_llm::{ContentBlock, Message};
     use tempfile::TempDir;
 
@@ -1229,6 +1441,24 @@ mod tests {
         assert!(ctx.contains("/tmp/wt/omega/sess-1"));
         assert!(ctx.contains("omega/sess-abc123"));
         assert!(ctx.contains("git worktree"));
+    }
+
+    #[test]
+    fn project_system_context_instructs_worktree_rename_when_done() {
+        let active = sample_active("omega", "/tmp/wt/omega/sess-1");
+        let ctx = project_system_context(&active);
+        assert!(
+            ctx.contains("RenameWorktree"),
+            "context must mention the rename tool: {ctx}"
+        );
+        assert!(
+            ctx.contains("task is complete") || ctx.contains("final step"),
+            "context must say to rename when the work is done: {ctx}"
+        );
+        assert!(
+            ctx.contains("identified") || ctx.contains("identify"),
+            "context must explain why renaming helps: {ctx}"
+        );
     }
 
     #[test]
@@ -1363,6 +1593,156 @@ mod tests {
         assert!(resolve_project_context(&projects, "sess-1", None, None)
             .await
             .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // RenameWorktree tool — the agent-facing rename of a session worktree
+    // -----------------------------------------------------------------------
+
+    /// Minimal [`ToolRuntime`] for tool tests: records nothing, never
+    /// interrupted.
+    struct NoopRuntime;
+
+    impl ToolRuntime for NoopRuntime {
+        fn send_output(&self, _chunk: OutputChunk) {}
+        fn is_interrupted(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_worktree_tool_renames_binding_metadata_and_broadcasts() {
+        // Live store + remote kept alive for the duration of the test.
+        let base = TempDir::new().unwrap();
+        let projects = ProjectManager::with_root(base.path().join("store"));
+        let active = projects
+            .activate(&init_remote_repo().await, "sess-1", None)
+            .await
+            .unwrap();
+
+        // The daemon-side state the tool must keep consistent.
+        let session_projects: Arc<Mutex<HashMap<String, ActiveProject>>> = Arc::new(Mutex::new(
+            HashMap::from([("sess-1".to_string(), active.clone())]),
+        ));
+        let storage = Arc::new(crate::session::SessionStorage::with_dir(
+            base.path().join("sessions"),
+        ));
+        let mut meta =
+            crate::session::metadata::SessionMetadata::new("sess-1", "omega", "omega-tui", "d");
+        save_active_to_metadata(&mut meta, &active);
+        storage.save_metadata(&meta).unwrap();
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let tool = RenameWorktreeTool {
+            projects: Arc::new(projects),
+            session_id: "sess-1".to_string(),
+            session_projects: session_projects.clone(),
+            session_storage: storage.clone(),
+            event_tx: tx,
+        };
+
+        let result = tool
+            .execute(
+                &serde_json::json!({ "name": "fix-tui-crash" }),
+                &mut NoopRuntime,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "rename failed: {:?}", result.content);
+
+        // Worktree + branch moved on disk.
+        let old_dir = Path::new(&active.worktree_path);
+        assert!(!old_dir.exists(), "old worktree dir must be gone");
+        let new_dir = old_dir.parent().unwrap().join("fix-tui-crash");
+        assert!(new_dir.is_dir(), "renamed worktree must exist");
+        assert_eq!(
+            git_for_test(&new_dir, &["branch", "--show-current"]).await,
+            "omega/fix-tui-crash"
+        );
+        let ToolResultData::Text(text) = &result.content else {
+            panic!("unexpected result content");
+        };
+        assert!(text.contains("fix-tui-crash"), "result: {text}");
+
+        // Live binding map updated.
+        let binding = session_projects
+            .lock()
+            .await
+            .get("sess-1")
+            .cloned()
+            .expect("binding present");
+        assert_eq!(binding.branch, "omega/fix-tui-crash");
+        assert_eq!(binding.worktree_path, new_dir.display().to_string());
+
+        // Persisted metadata updated (source of truth for resume + git-host).
+        let persisted = active_from_metadata(&storage.load_metadata("sess-1").unwrap())
+            .expect("active project persisted");
+        assert_eq!(persisted.branch, "omega/fix-tui-crash");
+        assert_eq!(persisted.worktree_path, binding.worktree_path);
+
+        // Clients got a ProjectActive announcement with the new name.
+        match rx.recv().await {
+            Ok(ServerEvent::ProjectActive {
+                worktree_path,
+                branch,
+                ..
+            }) => {
+                assert_eq!(branch, "omega/fix-tui-crash");
+                assert_eq!(worktree_path, binding.worktree_path);
+            }
+            other => panic!("expected ProjectActive, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_worktree_tool_rejects_bad_input_and_missing_binding() {
+        let base = TempDir::new().unwrap();
+        let projects = ProjectManager::with_root(base.path().join("store"));
+        let session_projects: Arc<Mutex<HashMap<String, ActiveProject>>> = Arc::default();
+        let storage = Arc::new(crate::session::SessionStorage::with_dir(
+            base.path().join("sessions"),
+        ));
+        let (tx, _rx) = broadcast::channel(16);
+        let tool = RenameWorktreeTool {
+            projects: Arc::new(projects),
+            session_id: "sess-1".to_string(),
+            session_projects: session_projects.clone(),
+            session_storage: storage.clone(),
+            event_tx: tx,
+        };
+
+        // Missing/empty name → clean error result, no panic.
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({ "name": "" }),
+            serde_json::json!({ "name": "   " }),
+        ] {
+            let result = tool.execute(&input, &mut NoopRuntime).await.unwrap();
+            assert!(result.is_error, "input {input} should fail");
+        }
+
+        // No project bound to the session → clean error result.
+        let result = tool
+            .execute(
+                &serde_json::json!({ "name": "fix-tui-crash" }),
+                &mut NoopRuntime,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "unbound session should fail");
+    }
+
+    /// Run a git command in `dir` and return trimmed stdout (test helper).
+    async fn git_for_test(dir: &Path, args: &[&str]) -> String {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     // -----------------------------------------------------------------------
