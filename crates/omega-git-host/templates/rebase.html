@@ -1,0 +1,149 @@
+{% extends "layout.html" %}
+
+{% block title %}
+<title>omega-git-host — rebase cron</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <h3>Upstream rebase cron</h3>
+    <p>
+      Keeps each cron-jobbable project's <code>main</code> branch in sync with
+      upstream. When upstream has moved and a plain fast-forward is possible,
+      <code>omega-loop</code> does it without the model. When the local main
+      also carries commits upstream doesn't have (diverged), the project's
+      dedicated <strong>upstream rebaser</strong> chat is woken to rebase
+      main onto upstream — and to resolve any merge conflicts itself.
+    </p>
+
+    <h4 class="mt-3">Schedule</h4>
+    <p>
+      Every <code>{{ interval_seconds }}s</code> (<code>{{ interval_display }}</code>).
+      {% if defaults_present %}
+      Defaults come from the NixOS module (<code>services.omega.rebaseJob</code>);
+      values set below override them imperatively.
+      {% else %}
+      No NixOS defaults file is present — settings below are the whole config.
+      {% endif %}
+    </p>
+
+    <form method="post" action="/rebase/interval" class="form-inline">
+      <label for="interval_seconds" class="mr-2">Interval (seconds):</label>
+      <input type="number" id="interval_seconds" name="interval_seconds"
+             value="{{ interval_seconds }}" min="30" class="form-control mr-2" />
+      <button type="submit" class="btn btn-primary">Set interval</button>
+    </form>
+    <form method="post" action="/rebase/run" class="form-inline mt-2">
+      <button type="submit" class="btn btn-success">Run now</button>
+      <span class="text-muted ml-2">
+        drops a <code>rebase-now</code> marker; the daemon picks it up within seconds
+      </span>
+    </form>
+
+    <h4 class="mt-4">Projects</h4>
+    <table class="table table-sm">
+      <thead>
+        <tr><th>project</th><th>source</th><th>rebaser chat</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for p in projects %}
+        <tr>
+          <td>
+            <a href="/{{ p.name }}/">{{ p.name }}</a>
+            {% if not p.registered %}<span class="text-danger">(not registered)</span>{% endif %}
+          </td>
+          <td class="text-muted">
+            {% if p.from_config %}NixOS config{% else %}web UI{% endif %}
+          </td>
+          <td>
+            {% for r in rebasers %}
+              {% if r.project == p.name %}
+                {% if r.exists %}
+                  <a href="/sessions/{{ r.session_id }}">{{ r.session_id }}</a>
+                {% else %}
+                  <span class="text-muted">not started yet</span>
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+          </td>
+          <td class="text-right">
+            <form method="post" action="/rebase/toggle">
+              <input type="hidden" name="project" value="{{ p.name }}" />
+              <input type="hidden" name="enabled" value="false" />
+              <button type="submit" class="btn btn-danger btn-sm">Disable</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-muted">No cron-jobbable projects yet.</td></tr>
+        {% endfor %}
+        {% if addable %}
+        {% for name in addable %}
+        <tr>
+          <td><a href="/{{ name }}/">{{ name }}</a></td>
+          <td class="text-muted">—</td>
+          <td class="text-muted">—</td>
+          <td class="text-right">
+            <form method="post" action="/rebase/toggle">
+              <input type="hidden" name="project" value="{{ name }}" />
+              <input type="hidden" name="enabled" value="true" />
+              <button type="submit" class="btn btn-primary btn-sm">Enable</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+
+    {% if last_run %}
+    <h4 class="mt-4">Last run</h4>
+    <p class="text-muted">{{ last_run.at }}</p>
+    <table class="table table-sm">
+      <thead><tr><th>project</th><th>result</th></tr></thead>
+      <tbody>
+        {% for name, entry in last_run.per_project %}
+        <tr>
+          <td>{{ name }}</td>
+          <td>
+            {{ entry.status }}
+            {% if entry.detail %}<span class="text-muted">— {{ entry.detail }}</span>{% endif %}
+            {% if entry.ahead %}<span class="text-muted">
+              ({{ entry.ahead }} local commit(s), {{ entry.behind }} upstream)</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if not writable %}
+    <p class="text-danger">
+      The project store is read-only for this service — imperative changes can't be
+      saved. Configure <code>services.omega.rebaseJob</code> in NixOS instead.
+    </p>
+    {% endif %}
+  </div>
+
+  <div class="col-md-4">
+    <h3>Rebaser prompt</h3>
+    {% if agent_prompt %}
+    <p class="text-muted">The system prompt of each project's upstream-rebaser chat (configurable via <code>services.omega.rebaseJob.systemPrompt</code>):</p>
+    <pre class="text-muted"><code>{{ agent_prompt }}</code></pre>
+    {% else %}
+    <p class="text-muted">
+      No defaults file — omega-loop uses its built-in rebaser prompt.
+      Configure <code>services.omega.rebaseJob.systemPrompt</code> in NixOS to override it.
+    </p>
+    {% endif %}
+    <h3>How to wake it yourself</h3>
+    <p>
+      Each upstream rebaser is an ordinary omega session. Open the
+      <code>rebaser-&lt;project&gt;</code> session in the TUI anytime and just
+      ask; it will rebase main onto upstream and resolve conflicts.
+    </p>
+  </div>
+</div>
+{% endblock %}

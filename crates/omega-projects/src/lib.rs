@@ -28,6 +28,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+/// Rebase-cron configuration & state, shared with omega-loop and
+/// omega-git-host (see `rebase.rs`).
+pub mod rebase;
+
 /// A registered project: a git repository cloned into the project store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectInfo {
@@ -57,6 +61,31 @@ pub struct ActiveProject {
 #[derive(Debug, Clone)]
 pub struct ProjectManager {
     root: PathBuf,
+}
+
+/// Outcome of [`ProjectManager::update_default_branch`]: the project's
+/// default branch relative to upstream after a fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultBranchStatus {
+    /// Local default branch == upstream; nothing to do.
+    UpToDate,
+    /// Local default branch has commits that upstream does not, but
+    /// upstream has no new commits; nothing to do (local-only
+    /// functionality — never touch it).
+    AheadOnly,
+    /// Local default branch is strictly behind upstream; it was
+    /// fast-forwarded. Carries (old_sha, new_sha).
+    FastForwarded(String, String),
+    /// Both sides moved: upstream has `behind` new commits and the local
+    /// default branch has `ahead` local-only commits on top of
+    /// upstream's history. Needs a real rebase (the dedicated
+    /// upstream-rebaser agent handles it). Carries local_sha, upstream_sha.
+    Diverged {
+        local: String,
+        upstream: String,
+        ahead: usize,
+        behind: usize,
+    },
 }
 
 impl ProjectManager {
@@ -189,6 +218,17 @@ impl ProjectManager {
                 "project '{}' has no local clone yet (repo {} missing)",
                 info.name,
                 repo.display()
+            );
+        }
+
+        // Make sure the default branch is as current as possible before the
+        // worktree forks off it. Best-effort: an offline fetch must never
+        // block activation — the local clone is still usable.
+        if let Err(e) = self.update_default_branch(info).await {
+            tracing::debug!(
+                project = %info.name,
+                error = %e,
+                "could not refresh default branch before creating worktree"
             );
         }
 
@@ -399,6 +439,142 @@ impl ProjectManager {
     }
 
     // -----------------------------------------------------------------------
+    // Upstream sync — the "rebase cron" keeps the default branch current
+    // -----------------------------------------------------------------------
+
+    /// Fetch upstream and classify (and where safe, mechanically update) the
+    /// project's default branch relative to `origin/<default>`.
+    ///
+    /// - strictly behind  → fast-forward `refs/heads/<default>` (a pure
+    ///   mirror update — never drops local-only commits),
+    /// - diverged         → left alone for the upstream-rebaser agent (a
+    ///   rebase needs judgment),
+    /// - ahead-only       → left alone (local-only functionality).
+    ///
+    /// Fails only when the fetch itself fails (e.g. no network): callers
+    /// that must not block on the network should ignore the error.
+    pub async fn update_default_branch(
+        &self,
+        info: &ProjectInfo,
+    ) -> Result<Option<DefaultBranchStatus>> {
+        let repo = self.repo_dir(&info.name);
+        if !repo.join("HEAD").exists() {
+            bail!(
+                "project '{}' has no local clone (repo {} missing)",
+                info.name,
+                repo.display()
+            );
+        }
+        self.fetch(info).await?;
+
+        let Some(default) = self.default_branch(info).await else {
+            return Ok(None);
+        };
+        if default.is_empty() || default == "HEAD" {
+            return Ok(None);
+        }
+
+        let local_ref = format!("refs/heads/{default}");
+        let upstream_ref = format!("refs/remotes/origin/{default}");
+        let local = match git(&repo, &["rev-parse", &local_ref]).await {
+            Ok(sha) if !sha.is_empty() => sha,
+            _ => return Ok(None),
+        };
+        let upstream = match git(&repo, &["rev-parse", &upstream_ref]).await {
+            Ok(sha) if !sha.is_empty() => sha,
+            _ => return Ok(None), // no upstream ref yet (e.g. unborn remote)
+        };
+
+        if local == upstream {
+            return Ok(Some(DefaultBranchStatus::UpToDate));
+        }
+
+        // `git merge-base --is-ancestor A B` exits 0 when A is an ancestor
+        // of B.
+        let local_behind = is_ancestor(&repo, &local, &upstream).await;
+        if local_behind {
+            git(&repo, &["update-ref", &local_ref, &upstream]).await?;
+            return Ok(Some(DefaultBranchStatus::FastForwarded(local, upstream)));
+        }
+
+        let upstream_behind = is_ancestor(&repo, &upstream, &local).await;
+        if upstream_behind {
+            return Ok(Some(DefaultBranchStatus::AheadOnly));
+        }
+
+        let ahead = rev_count(&repo, &upstream, &local).await;
+        let behind = rev_count(&repo, &local, &upstream).await;
+        Ok(Some(DefaultBranchStatus::Diverged {
+            local,
+            upstream,
+            ahead,
+            behind,
+        }))
+    }
+
+    /// Ensure a dedicated worktree exists for the project's default branch —
+    /// the "main worktree" at `worktrees/<name>/main`. `git rebase` needs a
+    /// working tree, and the bare clone has none, so the upstream-rebaser
+    /// agent operates here, on the branch that may carry local-only commits.
+    ///
+    /// Returns the binding (existing worktree is reconciled, never
+    /// duplicated).
+    pub async fn ensure_main_worktree(&self, info: &ProjectInfo) -> Result<ActiveProject> {
+        let repo = self.repo_dir(&info.name);
+        if !repo.join("HEAD").exists() {
+            bail!(
+                "project '{}' has no local clone (repo {} missing)",
+                info.name,
+                repo.display()
+            );
+        }
+        let default = self
+            .default_branch(info)
+            .await
+            .unwrap_or_else(|| "HEAD".to_string());
+        let dir = self.worktrees_dir(&info.name).join("main");
+        let wt_str = dir.display().to_string();
+
+        // Already a live checkout? Reconcile with what's actually checked
+        // out there (identity, not the dir name, is the truth).
+        if dir.is_dir() && git(&dir, &["rev-parse", "--is-inside-work-tree"]).await.is_ok() {
+            let actual = git(&dir, &["symbolic-ref", "--short", "HEAD"]).await.unwrap_or(default.clone());
+            return Ok(ActiveProject {
+                project: info.clone(),
+                worktree_path: dir.canonicalize().unwrap_or(dir).display().to_string(),
+                branch: if actual.is_empty() || actual == "HEAD" { default } else { actual },
+            });
+        }
+        if dir.is_dir() && git(&dir, &["rev-parse", "--is-inside-work-tree"]).await.is_err() {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+
+        // The default branch may already be checked out elsewhere (a stale
+        // main worktree someone created manually): reuse that location
+        // instead of failing `git worktree add`.
+        if let Some(path) = worktree_path_for_branch(&repo, &default).await {
+            return Ok(ActiveProject {
+                project: info.clone(),
+                worktree_path: path,
+                branch: default,
+            });
+        }
+
+        git(&repo, &["worktree", "add", &wt_str, &default]).await?;
+        tracing::info!(
+            project = %info.name,
+            path = %wt_str,
+            branch = %default,
+            "ensured main worktree"
+        );
+        Ok(ActiveProject {
+            project: info.clone(),
+            worktree_path: dir.canonicalize().unwrap_or(dir).display().to_string(),
+            branch: default,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Low-level git operations
     // -----------------------------------------------------------------------
 
@@ -454,13 +630,25 @@ impl ProjectManager {
 
     async fn fetch(&self, info: &ProjectInfo) -> Result<()> {
         let repo = self.repo_dir(&info.name);
-        git(&repo, &["fetch", "origin", "--prune"]).await?;
+        // Explicit refspec: keeps refs/remotes/origin/* up to date even for
+        // clones made by `git clone` local-path optimizations, which skip
+        // the remote-tracking refspec (tests use local dirs as remotes).
+        git(
+            &repo,
+            &[
+                "fetch",
+                "origin",
+                "--prune",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     /// Best-effort default branch detection: the bare clone's own HEAD
     /// (which mirrors the remote's default branch at clone time).
-    async fn default_branch(&self, info: &ProjectInfo) -> Option<String> {
+    pub async fn default_branch(&self, info: &ProjectInfo) -> Option<String> {
         let repo = self.repo_dir(&info.name);
         for args in [
             vec!["symbolic-ref", "--short", "HEAD"],
@@ -535,6 +723,32 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether `ancestor` is an ancestor of `descendant` (`git merge-base
+/// --is-ancestor`, which exits 0 for yes).
+async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(
+        repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ],
+    )
+    .await
+    .is_ok()
+}
+
+/// Number of commits reachable from `from` but not `to`
+/// (`git rev-list --count from..to`).
+async fn rev_count(repo: &Path, from: &str, to: &str) -> usize {
+    git(repo, &["rev-list", "--count", &format!("{from}..{to}")])
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Whether a local branch exists in the bare clone.
@@ -1328,4 +1542,172 @@ mod tests {
         assert_eq!(sanitize_ref_component("sess 1/foo"), "sess-1-foo");
         assert_eq!(sanitize_ref_component("!!!"), "session");
     }
+
+    // -----------------------------------------------------------------------
+    // Upstream sync (update_default_branch / ensure_main_worktree)
+    // -----------------------------------------------------------------------
+
+    /// Push a new commit to the *remote* (upstream) main.
+    async fn advance_remote(remote: &Path) {
+        let stamp = uuid::Uuid::new_v4().simple().to_string();
+        tokio::fs::write(remote.join(format!("remote-{stamp}.txt")), "upstream\n")
+            .await
+            .unwrap();
+        git(remote, &["add", "."]).await.unwrap();
+        git(remote, &["commit", "-m", &format!("upstream advance {stamp}")])
+            .await
+            .unwrap();
+    }
+
+    /// Create a *local-only* commit on the project's main branch (through its
+    /// main worktree — the only place `refs/heads/main` can be written
+    /// locally). Returns the new sha.
+    async fn local_only_commit(manager: &ProjectManager, info: &ProjectInfo) -> String {
+        let main = manager.ensure_main_worktree(info).await.unwrap();
+        configure_worktree_identity(manager, info).await;
+        let dir = Path::new(&main.worktree_path);
+        let stamp = uuid::Uuid::new_v4().simple().to_string();
+        tokio::fs::write(dir.join(format!("local-{stamp}.txt")), "local-only\n")
+            .await
+            .unwrap();
+        git(dir, &["add", "."]).await.unwrap();
+        git(
+            dir,
+            &["commit", "-m", &format!("local-only {stamp}")],
+        )
+        .await
+        .unwrap();
+        git(dir, &["rev-parse", "HEAD"]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_default_branch_fast_forwards_when_strictly_behind() {
+        let fx = fixture().await;
+        let info = fx
+            .manager
+            .resolve(&fx.remote_url)
+            .await
+            .unwrap();
+        let repo = fx.manager.repo_dir(&info.name);
+
+        // Upstream advances; local main is an ancestor → mechanical FF.
+        advance_remote(fx._remote.path()).await;
+        let status = fx
+            .manager
+            .update_default_branch(&info)
+            .await
+            .unwrap()
+            .expect("a status");
+        match status {
+            DefaultBranchStatus::FastForwarded(old, new) => {
+                assert_ne!(old, new, "fast-forward should move the ref");
+                let local = git(&repo, &["rev-parse", "refs/heads/main"])
+                    .await
+                    .unwrap();
+                assert_eq!(local, new);
+                let upstream = git(&repo, &["rev-parse", "refs/remotes/origin/main"])
+                    .await
+                    .unwrap();
+                assert_eq!(local, upstream, "main should now equal upstream");
+            }
+            other => panic!("expected FastForwarded, got {other:?}"),
+        }
+
+        // A fully-synced branch stays UpToDate.
+        let status = fx
+            .manager
+            .update_default_branch(&info)
+            .await
+            .unwrap()
+            .expect("a status");
+        assert!(matches!(status, DefaultBranchStatus::UpToDate));
+    }
+
+    #[tokio::test]
+    async fn update_default_branch_detects_diverged_and_never_drops_local_commits() {
+        let fx = fixture().await;
+        let info = fx
+            .manager
+            .resolve(&fx.remote_url)
+            .await
+            .unwrap();
+        let repo = fx.manager.repo_dir(&info.name);
+
+        // Local-only commit first (omega-added functionality upstream lacks).
+        let local_sha = local_only_commit(&fx.manager, &info).await;
+        // Then upstream advances.
+        advance_remote(fx._remote.path()).await;
+
+        let status = fx
+            .manager
+            .update_default_branch(&info)
+            .await
+            .unwrap()
+            .expect("a status");
+        match status {
+            DefaultBranchStatus::Diverged {
+                ahead, behind, ..
+            } => {
+                assert_eq!(ahead, 1, "one local-only commit");
+                assert_eq!(behind, 1, "one upstream commit");
+            }
+            other => panic!("expected Diverged, got {other:?}"),
+        }
+
+        // The divergence must NOT have been resolved mechanically: the local
+        // commit is still on main.
+        assert!(is_ancestor(&repo, &local_sha, "refs/heads/main").await);
+    }
+
+    #[tokio::test]
+    async fn update_default_branch_reports_ahead_only() {
+        let fx = fixture().await;
+        let info = fx
+            .manager
+            .resolve(&fx.remote_url)
+            .await
+            .unwrap();
+
+        // Local-only commit, upstream unchanged.
+        local_only_commit(&fx.manager, &info).await;
+        let status = fx
+            .manager
+            .update_default_branch(&info)
+            .await
+            .unwrap()
+            .expect("a status");
+        assert!(matches!(status, DefaultBranchStatus::AheadOnly));
+    }
+
+    #[tokio::test]
+    async fn ensure_main_worktree_creates_once_and_reconciles() {
+        let fx = fixture().await;
+        let info = fx
+            .manager
+            .resolve(&fx.remote_url)
+            .await
+            .unwrap();
+
+        let first = fx.manager.ensure_main_worktree(&info).await.unwrap();
+        assert_eq!(first.branch, "main");
+        let dir = Path::new(&first.worktree_path);
+        assert!(dir.is_dir(), "main worktree dir should exist");
+        assert_eq!(
+            git(dir, &["branch", "--show-current"]).await.unwrap(),
+            "main",
+            "main worktree checks out the default branch"
+        );
+
+        // Idempotent: calling again reuses the same checkout instead of
+        // creating a second one.
+        let second = fx.manager.ensure_main_worktree(&info).await.unwrap();
+        assert_eq!(first.worktree_path, second.worktree_path);
+        let count = git(&fx.manager.repo_dir(&info.name), &["worktree", "list"])
+            .await
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(count, 2, "bare repo + one main worktree");
+    }
+
 }

@@ -34,6 +34,7 @@ use tracing_subscriber::EnvFilter;
 
 mod agent;
 mod helpers;
+mod rebase_job;
 mod runtime;
 mod session;
 
@@ -327,7 +328,7 @@ const META_ACTIVE_PROJECT: &str = "active_project";
 /// session's git worktree. Project-bound sessions also get the native
 /// `RenameWorktree` tool so the agent can give the worktree a descriptive
 /// name once its work is done.
-fn create_tools_for_dir(
+pub(crate) fn create_tools_for_dir(
     dir: &Path,
     session_id: &str,
     rename_tool: RenameWorktreeTool,
@@ -368,7 +369,7 @@ fn tools_for_session(
 /// path/branch. File tools in the session still point at the *old*
 /// directory, so the agent is instructed to call this as the final step.
 #[derive(Clone)]
-struct RenameWorktreeTool {
+pub(crate) struct RenameWorktreeTool {
     projects: Arc<ProjectManager>,
     session_id: String,
     session_projects: Arc<Mutex<HashMap<String, ActiveProject>>>,
@@ -379,7 +380,7 @@ struct RenameWorktreeTool {
 /// Build a [`RenameWorktreeTool`] for a session, wiring it to the daemon
 /// state the rename must keep consistent (live binding, persisted metadata,
 /// connected clients).
-fn rename_worktree_tool(
+pub(crate) fn rename_worktree_tool(
     projects: &Arc<ProjectManager>,
     session_id: &str,
     session_projects: &Arc<Mutex<HashMap<String, ActiveProject>>>,
@@ -500,10 +501,21 @@ impl Tool for RenameWorktreeTool {
 }
 
 /// System-prompt context injected into project-bound sessions, giving the
-/// agent immediate context about the repository it is working in — including
-/// the instruction to rename the worktree once the work is done so it can be
-/// easily identified later.
-fn project_system_context(active: &ActiveProject) -> String {
+/// agent immediate context about the repository it is working in — that its
+/// checkout must be kept up to date with upstream, and the instruction to
+/// rename the worktree once the work is done so it can be easily identified
+/// later.
+///
+/// `update_instruction` is the (configurable) "keep your checkout up to
+/// date with upstream" paragraph; `{branch}` is replaced with the project's
+/// default branch when present.
+fn project_system_context(active: &ActiveProject, update_instruction: &str) -> String {
+    let default_branch = active
+        .project
+        .default_branch
+        .as_deref()
+        .unwrap_or("main");
+    let update = update_instruction.replace("{branch}", default_branch);
     format!(
         "\n\nYou are working on the project '{}'.\n\
          Repo URL: {}\n\
@@ -512,6 +524,7 @@ fn project_system_context(active: &ActiveProject) -> String {
          All file reads/writes/edits and shell commands operate inside this\n\
          directory (a dedicated git worktree). Commit your work on the current\n\
          branch; do not push or merge unless the user asks.\n\n\
+         {update}\n\n\
          When the task is complete and the work has been committed, rename the\n\
          worktree to a short, descriptive name with the RenameWorktree tool so\n\
          it can be easily identified later (e.g. 'fix-tui-crash' or\n\
@@ -520,6 +533,15 @@ fn project_system_context(active: &ActiveProject) -> String {
          Bash/Read/Write/Edit calls after renaming.",
         active.project.name, active.project.url, active.branch, active.worktree_path
     )
+}
+
+/// Resolve the "update your checkout" instruction: the configured one from
+/// the rebase-cron defaults (NixOS), or the built-in default. `{branch}`
+/// is interpolated by [`project_system_context`].
+fn update_instruction() -> String {
+    omega_projects::rebase::load_defaults()
+        .map(|d| d.update_instruction)
+        .unwrap_or_else(|| omega_projects::rebase::DEFAULT_UPDATE_INSTRUCTION.to_string())
 }
 
 fn save_active_to_metadata(
@@ -616,7 +638,7 @@ async fn create_session(
 ) -> anyhow::Result<AgentHandle> {
     let mut system_prompt = base_system_prompt.to_string();
     if let Some(active) = project {
-        system_prompt.push_str(&project_system_context(active));
+        system_prompt.push_str(&project_system_context(active, &update_instruction()));
     }
 
     let mut agent_session = AgentSession::new_with_storage(
@@ -1408,6 +1430,31 @@ async fn main() -> Result<()> {
     let projects = Arc::new(ProjectManager::new());
     let projects_root = projects.root().display().to_string();
 
+    // Upstream rebaser cron: keeps cron-jobbable projects' main branches in
+    // sync with upstream (mechanical fast-forward when possible, waking the
+    // dedicated rebaser chat when a real rebase with conflict resolution is
+    // needed). Runs in the background for the daemon's whole lifetime;
+    // with no config it is idle and costs nothing.
+    {
+        let defaults = omega_projects::rebase::load_defaults();
+        let job = rebase_job::RebaseJob::new(
+            Arc::clone(&projects),
+            runtime.clone(),
+            Arc::clone(&current_provider),
+            Arc::clone(&session_storage),
+            defaults,
+        );
+        tokio::spawn(job.run());
+        match omega_projects::rebase::load_defaults() {
+            Some(d) if !d.projects.is_empty() => tracing::info!(
+                projects = ?d.projects,
+                interval_seconds = d.interval_seconds,
+                "upstream rebaser cron enabled"
+            ),
+            _ => tracing::debug!("upstream rebaser cron idle (no configured projects)"),
+        }
+    }
+
     let socket_path =
         env::var("OMEGA_LOOP_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
 
@@ -1480,7 +1527,7 @@ mod tests {
     #[test]
     fn project_system_context_includes_repo_and_worktree() {
         let active = sample_active("omega", "/tmp/wt/omega/sess-1");
-        let ctx = project_system_context(&active);
+        let ctx = project_system_context(&active, &update_instruction());
         assert!(ctx.contains("omega"), "context mentions project name");
         assert!(ctx.contains("https://example.com/omega.git"));
         assert!(ctx.contains("/tmp/wt/omega/sess-1"));
@@ -1491,7 +1538,7 @@ mod tests {
     #[test]
     fn project_system_context_instructs_worktree_rename_when_done() {
         let active = sample_active("omega", "/tmp/wt/omega/sess-1");
-        let ctx = project_system_context(&active);
+        let ctx = project_system_context(&active, &update_instruction());
         assert!(
             ctx.contains("RenameWorktree"),
             "context must mention the rename tool: {ctx}"
@@ -1503,6 +1550,34 @@ mod tests {
         assert!(
             ctx.contains("identified") || ctx.contains("identify"),
             "context must explain why renaming helps: {ctx}"
+        );
+    }
+
+    #[test]
+    fn project_system_context_instructs_checkout_update() {
+        let active = sample_active("omega", "/tmp/wt/omega/sess-1");
+        // The built-in default instruction is used when no config file is
+        // set; it must tell the agent to keep the checkout in sync.
+        let ctx = project_system_context(&active, &update_instruction());
+        assert!(
+            ctx.to_lowercase().contains("up to date with upstream")
+                || ctx.to_lowercase().contains("update your checkout"),
+            "context must tell the agent to update its checkout: {ctx}"
+        );
+        assert!(
+            ctx.contains("rebase"),
+            "context must tell the agent to rebase on the updated main: {ctx}"
+        );
+    }
+
+    #[test]
+    fn project_system_context_interpolates_branch_placeholder() {
+        let active = sample_active("omega", "/tmp/wt/omega/sess-1");
+        let instruction = "rebase your worktree on {branch} when entering";
+        let ctx = project_system_context(&active, instruction);
+        assert!(
+            ctx.contains("rebase your worktree on main when entering"),
+            "the {{branch}} placeholder must be replaced with the default branch: {ctx}"
         );
     }
 

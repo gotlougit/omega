@@ -1606,7 +1606,7 @@ fn main() -> Result<()> {
         .open(&log_path)
     {
         Ok(file) => {
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(file)
                 .try_init();
@@ -1614,7 +1614,7 @@ fn main() -> Result<()> {
         Err(_) => {
             // Never write to the tty — if no log file can be opened, silence
             // logging rather than corrupt the UI.
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
                 .try_init();
         }

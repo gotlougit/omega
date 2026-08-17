@@ -56,6 +56,13 @@
       <h3>origin</h3>
       <p><a href="{{ origin }}">{{ origin }}</a></p>
       {% endif %}
+      <h3>rebase cron</h3>
+      {% if rebase_enabled %}
+      <p><span class="text-success">enabled</span> — main is kept in sync with upstream (rebaser chat: <code>rebaser-{{ name }}</code>).</p>
+      {% else %}
+      <p><span class="text-muted">disabled</span> — main is not auto-synced with upstream.</p>
+      {% endif %}
+      <p class="text-muted"><a href="/rebase/">manage in the rebase page</a></p>
     </div>
   </div>
 </div>

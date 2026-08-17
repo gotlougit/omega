@@ -594,3 +594,103 @@ async fn empty_sessions_are_not_listed_or_linked() {
 
     drop(server);
 }
+
+/// Minimal HTTP/1.1 POST with an urlencoded form body, returning the raw
+/// response (a 303 redirect for the rebase controls).
+async fn http_post_form(port: u16, path: &str, form: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{form}",
+        form.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// The rebase page renders, and the imperative controls persist to the
+/// store's state file (which is what omega-loop acts on).
+#[tokio::test]
+async fn rebase_page_renders_and_controls_persist_state() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let (project, _worktree_branch) = seed_store(store.path()).await;
+
+    let port = free_port();
+    let server = spawn_server(store.path(), sessions.path(), port).await;
+    wait_for_server(port).await;
+
+    // Initial page: no cron-jobbable projects, project listed as addable.
+    let body = http_get(port, "/rebase").await;
+    assert!(
+        body.contains("Upstream rebase cron"),
+        "rebase page title:\n{body}"
+    );
+    assert!(body.contains("No cron-jobbable projects yet"));
+    assert!(body.contains("Enable</button>"), "addable row:\n{body}");
+
+    // Enable the project imperatively → state file gets `project: true`.
+    let resp = http_post_form(
+        port,
+        "/rebase/toggle",
+        &format!("project={project}&enabled=true"),
+    )
+    .await;
+    assert!(resp.contains("303 See Other"), "toggle response:\n{resp}");
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.path().join("rebase-job.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["project_states"][project.as_str()].as_bool(),
+        Some(true),
+        "state file after enable: {state}"
+    );
+
+    // The page now lists it as enabled (Disable button).
+    let body = http_get(port, "/rebase").await;
+    assert!(body.contains("Disable</button>"), "enabled row:\n{body}");
+
+    // Set the interval; the state file records the override.
+    let resp = http_post_form(port, "/rebase/interval", "interval_seconds=90").await;
+    assert!(resp.contains("303 See Other"));
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.path().join("rebase-job.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["interval_seconds"].as_u64(), Some(90));
+
+    // "Run now" drops the marker file the daemon polls.
+    let resp = http_post_form(port, "/rebase/run", "").await;
+    assert!(resp.contains("303 See Other"), "run now response:\n{resp}");
+    assert!(
+        store.path().join("rebase-now").is_file(),
+        "run-now marker should exist"
+    );
+
+    // Disabling again persists `project: false` (which wins over any NixOS
+    // defaults list).
+    let resp = http_post_form(
+        port,
+        "/rebase/toggle",
+        &format!("project={project}&enabled=false"),
+    )
+    .await;
+    assert!(resp.contains("303 See Other"));
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.path().join("rebase-job.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["project_states"][project.as_str()].as_bool(),
+        Some(false),
+        "state file after disable: {state}"
+    );
+
+    drop(server);
+}

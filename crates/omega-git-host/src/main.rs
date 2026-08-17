@@ -17,8 +17,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
+use omega_projects::rebase::{self, RebaseDefaults};
 use omega_projects::ProjectManager;
 use tracing::info;
 
@@ -50,6 +51,10 @@ pub struct AppState {
     pub projects: ProjectManager,
     pub templates: Arc<templates::Templates>,
     pub session_dir: std::path::PathBuf,
+    /// Rebase-cron defaults from the NixOS module (`OMEGA_REBASE_JOB_CONFIG`);
+    /// `None` when running without the module. The imperative state file in
+    /// the project store is read on demand.
+    pub rebase_defaults: Option<RebaseDefaults>,
 }
 
 #[tokio::main]
@@ -85,6 +90,7 @@ async fn main() -> Result<()> {
         projects,
         templates: Arc::new(templates::Templates::new()?),
         session_dir,
+        rebase_defaults: rebase::load_defaults(),
     };
 
     let app = Router::new()
@@ -103,6 +109,13 @@ async fn main() -> Result<()> {
         .route("/{name}/tree/{*path}", get(pages::tree_page))
         .route("/{name}/blob/{*path}", get(pages::blob_page))
         .route("/{name}/commit/{*sha}", get(pages::commit_page))
+        // Rebase cron: status page + imperative controls (state file in the
+        // project store; omega-loop acts on it).
+        .route("/rebase", get(pages::rebase_page))
+        .route("/rebase/", get(pages::rebase_page))
+        .route("/rebase/toggle", post(pages::rebase_toggle))
+        .route("/rebase/interval", post(pages::rebase_interval))
+        .route("/rebase/run", post(pages::rebase_run_now))
         // Session transcript pages (Phase 4).
         .route("/sessions", get(pages::sessions_index))
         .route("/sessions/", get(pages::sessions_index))

@@ -84,6 +84,7 @@ let
   omegaShSocket = "/run/omega/omega-sh.sock";
   omegaLoopSocket = "/run/omega/omega-loop.sock";
   systemPromptPath = "/etc/omega/system-prompt.md";
+  rebaseDefaultsPath = "/etc/omega/rebase-job.defaults.json";
 
   # Default system prompt used when the user doesn't set cfg.systemPrompt.
   defaultSystemPrompt = ''
@@ -128,6 +129,63 @@ let
     You can create project directories under ${cfg.projectsDir}
     or clone repos there.
   '';
+
+  # Default paragraph appended to the prompt of every session that enters a
+  # project: keep the checkout in sync with upstream. Must match
+  # omega-projects/src/rebase.rs `DEFAULT_UPDATE_INSTRUCTION` — keep in sync.
+  defaultRebaseUpdatePrompt = ''
+    Keep your checkout up to date with upstream. Before starting work in this project,
+    update your checkout: run `git fetch origin` (if your worktree predates the latest
+    upstream), then rebase your worktree branch onto the project's up-to-date main branch
+    so the worktree is on top of the latest upstream changes. The project's main branch is
+    kept in sync with upstream by a periodic job, so a simple `git rebase {branch}` is
+    normally all that is needed. If rebasing surfaces conflicts, resolve them yourself
+    before making changes, and make sure the worktree still builds and tests pass.
+  '';
+
+  # Default system prompt for each project's dedicated "upstream rebaser"
+  # chat. Must match omega-projects/src/rebase.rs `DEFAULT_REBASER_PROMPT`
+  # (modulo the {branch} placeholder) — keep in sync.
+  defaultRebaserPrompt = ''
+    You are the dedicated "upstream rebaser" chat for this project.
+
+    Your job: keep the project's main branch in sync with upstream. The project's main
+    branch may carry commits that exist only locally (functionality upstream won't or
+    can't add) on top of the upstream history.
+
+    When you are woken (by the periodic rebase job or by the user), do this:
+    1. Run `git fetch origin` so the upstream refs are current.
+    2. Rebase the main branch onto the latest upstream (`git rebase origin/{branch}` in
+       your worktree). The worktree is your sole writer of the main branch.
+    3. If the rebase stops on conflicts, resolve them yourself: keep the intent of
+       upstream's changes AND preserve the local-only functionality. When in doubt, keep
+       both sides' intent, prefer the upstream change where they genuinely conflict, and
+       ask the user in the session if a choice is really ambiguous.
+    4. Once the rebase is complete (continue it to the end), verify the worktree builds
+       / tests pass and report what you did.
+
+    The user can also ask you directly to rebase at any time; treat that the same way.
+  '';
+
+  # Parse a duration string ("6h", "30m", "45s", "3600", "1d") to seconds.
+  parseInterval = interval:
+    let
+      m = builtins.match "([0-9]+)([smhd])?" interval;
+    in
+    if m == null then
+      throw "services.omega.rebaseJob.interval: cannot parse '${interval}' (use e.g. '6h', '30m', '3600')"
+    else
+      let
+        n = builtins.fromJSON (builtins.head m);
+        unit = if builtins.length m > 1 && builtins.elemAt m 1 != "" then builtins.elemAt m 1 else "s";
+        mult = {
+          s = 1;
+          m = 60;
+          h = 3600;
+          d = 86400;
+        }.${unit};
+      in
+      n * mult;
 
   # Final system prompt: if the user set systemPrompt, use that as the base;
   # otherwise use the default.  extraSystemPrompt is always appended.
@@ -290,6 +348,78 @@ in
     };
 
     # -------------------------------------------------------------------
+    # rebaseJob — upstream rebase cron + dedicated "upstream rebaser" chats
+    # -------------------------------------------------------------------
+    rebaseJob = mkOption {
+      type = types.submodule {
+        options = {
+          enable = mkEnableOption ''
+            the upstream rebase cron: keeps cron-jobbable projects' main
+            branches in sync with upstream, fast-forwarding mechanically
+            when possible and waking a dedicated "upstream rebaser" chat to
+            rebase + resolve conflicts when local main has diverged
+          '';
+
+          interval = mkOption {
+            type = types.str;
+            default = "6h";
+            example = "30m";
+            description = ''
+              Interval between scheduled runs, as a duration string
+              ("30m", "6h", "1d") or a bare number of seconds ("3600").
+            '';
+          };
+
+          projects = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            example = [ "omega" "pi-omega" ];
+            description = ''
+              Projects (by registered name) to keep rebased on upstream
+              automatically.  The web UI can also enable/disable projects
+              imperatively — see the "rebase" page — and the set here is the
+              seed/default for that.
+            '';
+          };
+
+          systemPrompt = mkOption {
+            type = types.str;
+            default = defaultRebaserPrompt;
+            description = ''
+              System prompt for each project's dedicated "upstream rebaser"
+              chat: the agent that rebases the project's main branch onto
+              upstream and auto-fixes merge conflicts (preserving local-only
+              commits).  The default tells it to keep the intent of both
+              sides.  Override to change the rebaser's behaviour/wording.
+            '';
+          };
+
+          updatePrompt = mkOption {
+            type = types.str;
+            default = defaultRebaseUpdatePrompt;
+            description = ''
+              Paragraph appended to the system prompt of every session that
+              enters a project ("keep your checkout up to date with
+              upstream").  `{branch}` is replaced with the project's default
+              branch name.
+            '';
+          };
+        };
+      };
+      default = { };
+      description = ''
+        Upstream rebase cron for the project store.  On every `interval`,
+        omega-loop fetches upstream for each cron-jobbable project and
+        brings the project's main branch up to date: a mechanical
+        fast-forward when upstream merely moved, or a woken "upstream
+        rebaser" chat when the local main must be rebased onto upstream
+        (conflicts are fixed by that agent).  Individual projects can also
+        be toggled imperatively on the git-host "rebase" page; NixOS
+        `projects` seeds that set, and a web-UI disable always wins.
+      '';
+    };
+
+    # -------------------------------------------------------------------
     # omega-git-host — read-only git forge + web UI over the project store
     # -------------------------------------------------------------------
     gitHost = mkOption {
@@ -420,6 +550,20 @@ in
       # ----- system prompt file --------------------------------------------
       environment.etc."omega/system-prompt.md".text = systemPrompt;
 
+      # ----- rebase cron defaults (services.omega.rebaseJob) ---------------
+      # Written when the job is enabled; omega-loop (and the git-host rebase
+      # page) read it via OMEGA_REBASE_JOB_CONFIG. The imperative state file
+      # (rebase-job.json in the project store, edited from the web UI)
+      # overlays these defaults.
+      environment.etc."omega/rebase-job.defaults.json" = mkIf cfg.rebaseJob.enable {
+        text = builtins.toJSON {
+          interval_seconds = parseInterval cfg.rebaseJob.interval;
+          projects = cfg.rebaseJob.projects;
+          agent_prompt = cfg.rebaseJob.systemPrompt;
+          update_instruction = cfg.rebaseJob.updatePrompt;
+        };
+      };
+
       # ----- tmpfiles: runtime directory with correct permissions ----------
       systemd.tmpfiles.rules = [
         "d /run/omega 0770 ${clankerUser} ${clankerGroup} -"
@@ -513,7 +657,8 @@ in
             "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
             "OMEGA_SESSION_DIR=${cfg.sessionDir}"
             "RUST_LOG=${cfg.logLevel}"
-          ];
+          ]
+          ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}";
 
           # Security hardening
           NoNewPrivileges = true;
@@ -577,15 +722,21 @@ in
           "OMEGA_GIT_HOST_LISTEN=${cfg.gitHost.listenAddress}"
           "OMEGA_GIT_HOST_PORT=${toString cfg.gitHost.port}"
           "RUST_LOG=${cfg.logLevel}"
-        ];
+        ]
+        ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}";
 
-        # Security hardening — the forge is read-only by design, so the whole
-        # home tree is mounted read-only.
+        # Security hardening — the forge serves read-only views of the store,
+        # but the "rebase" page is the imperative control panel for the cron,
+        # so exactly the state file + run-now marker are writable (ReadWritePaths
+        # takes precedence over the ReadOnlyPaths below for these two paths).
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = false; # needs to read the project store + sessions
         ReadOnlyPaths = [ clankerHome ];
+        ReadWritePaths =
+          optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-job.json"
+          ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-now";
 
         RuntimeDirectory = "omega";
         RuntimeDirectoryMode = "0770";

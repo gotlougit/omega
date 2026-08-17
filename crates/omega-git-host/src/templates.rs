@@ -42,6 +42,8 @@ impl Templates {
             .context("register repo-sessions.html")?;
         env.add_template("clone.html", include_str!("../templates/clone.html"))
             .context("register clone.html")?;
+        env.add_template("rebase.html", include_str!("../templates/rebase.html"))
+            .context("register rebase.html")?;
         env.add_template("sessions.html", include_str!("../templates/sessions.html"))
             .context("register sessions.html")?;
         env.add_template("session.html", include_str!("../templates/session.html"))

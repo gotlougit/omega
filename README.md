@@ -86,12 +86,58 @@ serves full session transcripts, which may contain sensitive tool output.
 Expose it deliberately (SSH tunnel, reverse proxy, tailscale) if you want it
 reachable.
 
+One exception to "read-only": the `/rebase` page is the *imperative control
+panel* for the upstream rebase cron (see below) — it writes the cron state
+file into the project store.
+
 On NixOS, enable it through the module instead of running it by hand:
 
 ```nix
 services.omega.gitHost.enable = true;
 services.omega.gitHost.port = 8080;                  # default
 services.omega.gitHost.listenAddress = "127.0.0.1";  # default
+```
+
+## Upstream rebase cron
+
+Omega can keep a project's **main branch** in sync with upstream on a
+schedule, and hand the judgment parts to a dedicated agent:
+
+- Every interval, for each cron-jobbable project, the daemon fetches
+  upstream and checks the local default branch against `origin/<default>`:
+  - strictly behind → **mechanical fast-forward**, no model involved;
+  - up to date, or ahead only (commits upstream doesn't have) → nothing —
+    local-only functionality is never touched;
+  - **diverged** (local main carries commits upstream lacks *and* upstream
+    moved) → the project's dedicated **upstream rebaser** chat is woken. It
+    rebases main onto upstream in the project's `main` worktree and
+    **resolves the merge conflicts itself**, preserving the local-only
+    commits and finishing the rebase.
+- The rebaser chats are ordinary persistent sessions
+  (`rebaser-<project>`), so you can wake one yourself anytime from the TUI
+  and read its transcripts in the web UI.
+- Every session that enters a project is told, via its system prompt, to
+  keep its checkout up to date with upstream first.
+
+Configuration has two sources, merged at runtime:
+
+1. **NixOS defaults** — `services.omega.rebaseJob` (interval, projects,
+   the rebaser system prompt, and the per-session “update your checkout”
+   instruction), written to `/etc/omega/rebase-job.defaults.json`.
+2. **Imperative state** — the web UI's `/rebase` page toggles projects in
+   and out of the cron set, changes the interval, and has a “run now”
+   button; it persists to `rebase-job.json` in the project store. A
+   web-UI disable always wins over the NixOS project list.
+
+```nix
+services.omega.rebaseJob = {
+  enable = true;
+  interval = "6h";                  # or "30m", "1d", "3600"
+  projects = [ "pi-omega" ];        # seed; the web UI can add/remove more
+  systemPrompt = ''                # default: rebase main on upstream + fix conflicts
+    You are the upstream rebaser for this project...
+  '';
+};
 ```
 
 ## NixOS module

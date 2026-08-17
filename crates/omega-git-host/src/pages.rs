@@ -6,12 +6,13 @@
 
 use std::path::PathBuf;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use omega_projects::rebase::{self};
 use omega_projects::{ProjectInfo, ProjectManager};
 
 use crate::repo::{self, RefKind};
@@ -158,6 +159,12 @@ pub async fn summary(
     ctx["branches"] = json!(branches);
     ctx["tags"] = json!(tags);
     ctx["worktrees"] = json!(worktrees_json);
+    // Rebase-cron status for this project (from the imperative state file
+    // plus the NixOS defaults).
+    let root = state.projects.root().to_path_buf();
+    let state_file = rebase::load_state(&root);
+    let eff = rebase::resolve_effective(state.rebase_defaults.as_ref(), &state_file);
+    ctx["rebase_enabled"] = json!(eff.projects.contains(&name));
     render(state, "summary.html", ctx)
 }
 
@@ -654,6 +661,192 @@ pub async fn session_system_prompt(
         "nav_sessions_active": true,
     });
     render(state, "session-prompt.html", ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Rebase cron — status page + imperative controls
+// ---------------------------------------------------------------------------
+
+/// Form for `/rebase/toggle`: enable or disable one project's cron rebase.
+#[derive(Deserialize)]
+pub(crate) struct RebaseToggleForm {
+    project: String,
+    enabled: String,
+}
+
+/// Form for `/rebase/interval`: set the interval in seconds.
+#[derive(Deserialize)]
+pub(crate) struct RebaseIntervalForm {
+    interval_seconds: u64,
+}
+
+/// The rebaser session id omega-loop uses for a project (same derivation as
+/// `rebase_job::session_id_for` — keep in sync).
+fn rebaser_session_id(project: &str) -> String {
+    let mut out = String::from("rebaser-");
+    for c in project.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        } else {
+            out.push('-');
+        }
+    }
+    out
+}
+
+/// `GET /rebase` — current cron config, per-project toggles, interval
+/// editor, "run now", and a summary of the last run.
+pub async fn rebase_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let root = state.projects.root().to_path_buf();
+    let state_file = rebase::load_state(&root);
+    let eff = rebase::resolve_effective(state.rebase_defaults.as_ref(), &state_file);
+
+    let mut projects = Vec::new();
+    let registered: Vec<String> = match state.projects.list().await {
+        Ok(list) => list.into_iter().map(|p| p.name).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "list projects for rebase page");
+            Vec::new()
+        }
+    };
+    for name in &eff.projects {
+        projects.push(json!({
+            "name": name,
+            "registered": registered.contains(name),
+            "from_config": !state_file.project_states.contains_key(name),
+        }));
+    }
+    // Projects the user can add: registered but not currently enabled.
+    let addable: Vec<String> = registered
+        .into_iter()
+        .filter(|n| !eff.projects.contains(n))
+        .collect();
+
+    // Link to each project's upstream-rebaser chat transcript, if it has
+    // one (created lazily by omega-loop on first divergence).
+    let sessions = SessionIndex::load(&state.session_dir).unwrap_or_default();
+    let rebasers: Vec<Value> = projects
+        .iter()
+        .map(|p| {
+            let id = rebaser_session_id(p["name"].as_str().unwrap_or_default());
+            json!({
+                "project": p["name"],
+                "session_id": id,
+                "exists": sessions.all().iter().any(|s| s.session_id == id),
+            })
+        })
+        .collect();
+
+    // Can this service write the imperative state file? (The NixOS service runs
+// the store read-only apart from the state file; standalone runs are on the
+// same filesystem as the daemon and can write.)
+    use std::os::unix::fs::PermissionsExt;
+    let writable = std::fs::metadata(&root)
+        .map(|m| m.permissions().mode() & 0o200 != 0)
+        .unwrap_or(false);
+
+    let base = base_url(&headers);
+    let ctx = json!({
+        "base": base,
+        "interval_seconds": eff.interval_seconds,
+        "interval_display": format_interval(eff.interval_seconds),
+        "projects": projects,
+        "addable": addable,
+        "rebasers": rebasers,
+        "last_run": state_file.last_run,
+        "defaults_present": state.rebase_defaults.is_some(),
+        "agent_prompt": state.rebase_defaults.as_ref().map(|d| d.agent_prompt.clone()),
+        "writable": writable,
+        "nav_projects_active": false,
+        "nav_rebase_active": true,
+        "nav_sessions_active": false,
+    });
+    render(state, "rebase.html", ctx)
+}
+
+/// Human "6h", "30m" display of a seconds interval.
+fn format_interval(seconds: u64) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// `POST /rebase/toggle` — enable/disable a project's cron rebase in the
+/// imperative state file.
+pub async fn rebase_toggle(
+    State(state): State<AppState>,
+    Form(form): Form<RebaseToggleForm>,
+) -> Response {
+    let project = form.project.trim();
+    if project.is_empty() {
+        return Redirect::to("/rebase").into_response();
+    }
+    let enabled = form.enabled == "true" || form.enabled == "1" || form.enabled == "on";
+    let root = state.projects.root().to_path_buf();
+    let mut state_file = rebase::load_state(&root);
+    state_file
+        .project_states
+        .insert(project.to_string(), enabled);
+    match rebase::save_state(&root, &state_file) {
+        Ok(()) => {
+            tracing::info!(project, enabled, "rebase cron toggle");
+            Redirect::to("/rebase").into_response()
+        }
+        Err(e) => {
+            tracing::error!(project, enabled, error = %e, "could not save rebase state");
+            text_response(StatusCode::INTERNAL_SERVER_ERROR, "could not save rebase state\n")
+        }
+    }
+}
+
+/// `POST /rebase/interval` — override the cron interval (seconds) in the
+/// imperative state file.
+pub async fn rebase_interval(
+    State(state): State<AppState>,
+    Form(form): Form<RebaseIntervalForm>,
+) -> Response {
+    if form.interval_seconds == 0 {
+        return Redirect::to("/rebase").into_response();
+    }
+    let root = state.projects.root().to_path_buf();
+    let mut state_file = rebase::load_state(&root);
+    state_file.interval_seconds = Some(form.interval_seconds);
+    match rebase::save_state(&root, &state_file) {
+        Ok(()) => {
+            tracing::info!(interval = form.interval_seconds, "rebase cron interval set");
+            Redirect::to("/rebase").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "could not save rebase state");
+            text_response(StatusCode::INTERNAL_SERVER_ERROR, "could not save rebase state\n")
+        }
+    }
+}
+
+/// `POST /rebase/run` — drop a `rebase-now` marker; omega-loop's cron picks
+/// it up within seconds and runs immediately.
+pub async fn rebase_run_now(State(state): State<AppState>) -> Response {
+    let root = state.projects.root().to_path_buf();
+    match std::fs::write(rebase::run_now_path(&root), b"") {
+        Ok(()) => {
+            tracing::info!("rebase-now marker written");
+            Redirect::to("/rebase").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "could not write run-now marker");
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not write run-now marker\n",
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
