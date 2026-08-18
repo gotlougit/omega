@@ -807,6 +807,10 @@ in
         RestartSec = "5s";
 
         Environment = [
+          "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
+          "OMEGA_SOCKET_PATH=${omegaShSocket}"
+          "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
+          "OMEGA_ROLES_PATH=${rolesPath}"
           "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
           "OMEGA_SESSION_DIR=${cfg.sessionDir}"
           "OMEGA_GIT_HOST_LISTEN=${cfg.gitHost.listenAddress}"
