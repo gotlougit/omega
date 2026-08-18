@@ -823,9 +823,8 @@ in
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = false; # needs to read the project store + sessions
-        ReadOnlyPaths = [ clankerHome ];
-        ReadWritePaths =
-          optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-job.json"
+        ReadWritePaths = [ clankerHome ]
+          ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-job.json"
           ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-now";
 
         RuntimeDirectory = "omega";
