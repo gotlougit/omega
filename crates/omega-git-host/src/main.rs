@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -23,6 +23,7 @@ use omega_projects::rebase::{self, RebaseDefaults};
 use omega_projects::ProjectManager;
 use tracing::info;
 
+mod daemon;
 mod git;
 mod pages;
 mod repo;
@@ -96,6 +97,10 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/static/main.css", get(css))
+        // Project lifecycle (web control panel).
+        .route("/projects/create", post(pages::project_create))
+        .route("/projects/delete", post(pages::project_delete))
+        .route("/{name}/merge", post(pages::project_merge))
         // Repo pages (param routes; more specific than the git wildcard).
         .route("/{name}", get(pages::summary))
         .route("/{name}/", get(pages::summary))
@@ -121,6 +126,13 @@ async fn main() -> Result<()> {
         .route("/sessions/", get(pages::sessions_index))
         .route("/sessions/{id}", get(pages::session_page))
         .route("/sessions/{id}/system-prompt", get(pages::session_system_prompt))
+        // Live chat (TUI capabilities in the web UI): start a session on a
+        // project, message it, interrupt it, and stream output over SSE.
+        .route("/sessions/{id}/live", get(pages::session_live))
+        .route("/sessions/{id}/stream", get(pages::session_stream))
+        .route("/sessions/{id}/message", post(pages::session_message))
+        .route("/sessions/{id}/interrupt", post(pages::session_interrupt))
+        .route("/{name}/sessions/create", post(pages::session_create))
         // Smart-HTTP git endpoints live at /{name}.git/info/refs,
         // /{name}.git/git-upload-pack, etc. — handled by the fallback (the
         // root-level wildcard would conflict with the repo page routes).
@@ -143,7 +155,11 @@ async fn main() -> Result<()> {
 
 /// Project index (sourcehut-style dashboard): every registered project with
 /// its clone URL.
-async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<pages::NoticeQuery>,
+) -> Response {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -174,6 +190,8 @@ async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
         "projects": projects,
         "nav_projects_active": true,
         "nav_sessions_active": false,
+        "error": query.error,
+        "ok": query.ok,
     });
 
     match state.templates.render("index.html", ctx) {

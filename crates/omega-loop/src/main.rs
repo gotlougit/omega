@@ -637,6 +637,44 @@ async fn resolve_project_context(
     }
 }
 
+/// Spawn a task that forwards a live agent's output chunks to `event_tx` as
+/// `ServerEvent::Chunk` events, tagging them with `session_id`.
+///
+/// A handle's output is a multi-subscriber broadcast, so any number of
+/// connections (TUI, multiple web pages) can attach their own forwarder to
+/// the same live session. Each forwarder ends when its `event_tx` is dropped
+/// (its connection closed) or the session's broadcast closes — it never
+/// outlives the session, and a detached session with no subscribers costs
+/// nothing.
+fn attach_forwarder(
+    handle: &AgentHandle,
+    event_tx: &broadcast::Sender<ServerEvent>,
+    session_id: &str,
+) {
+    let mut output_rx = handle.subscribe();
+    let ev_tx = event_tx.clone();
+    let sid = session_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            match output_rx.recv().await {
+                Ok(chunk) => {
+                    let event = ServerEvent::Chunk {
+                        session_id: sid.clone(),
+                        chunk,
+                    };
+                    if ev_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(%sid, "output forwarder lagged by {n}");
+                }
+            }
+        }
+    });
+}
+
 /// Create a brand-new agent session (persisted under `./sessions`), bound
 /// to `project` when given: the system prompt carries project context and
 /// the tool registry runs inside the worktree. Output chunks are forwarded
@@ -685,28 +723,7 @@ async fn create_session(
         .spawn(agent_session, |internals| agent.run(internals))
         .await?;
 
-    let mut output_rx = handle.subscribe();
-    let ev_tx = event_tx.clone();
-    let sid = session_id.to_string();
-    tokio::spawn(async move {
-        loop {
-            match output_rx.recv().await {
-                Ok(chunk) => {
-                    let event = ServerEvent::Chunk {
-                        session_id: sid.clone(),
-                        chunk,
-                    };
-                    if ev_tx.send(event).is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(%sid, "output forwarder lagged by {n}");
-                }
-            }
-        }
-    });
+    attach_forwarder(&handle, event_tx, session_id);
 
     Ok(handle)
 }
@@ -715,6 +732,7 @@ async fn create_session(
 // Connection handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // private daemon wiring for one connection
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     current_provider: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
@@ -723,6 +741,8 @@ async fn handle_connection(
     runtime: AgentRuntime,
     projects: Arc<ProjectManager>,
     roles: Vec<omega_projects::roles::Role>,
+    sessions: Arc<Mutex<HashMap<String, AgentHandle>>>,
+    session_projects: Arc<Mutex<HashMap<String, omega_projects::ActiveProject>>>,
 ) {
     let (reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
@@ -731,14 +751,11 @@ async fn handle_connection(
     // The writer task pumps this channel; session forwarders push into it.
     let (event_tx, _) = broadcast::channel(256);
 
-    // Sessions created on THIS connection (session_id → handle).
-    let sessions: Arc<Mutex<HashMap<String, AgentHandle>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    // Active project per session on this connection (session_id → worktree).
-    // The persisted session metadata is the source of truth across restarts;
-    // this map mirrors it for the live connection.
-    let session_projects: Arc<Mutex<HashMap<String, ActiveProject>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Sessions this connection has already attached an output forwarder for.
+    // A connection must attach at most once per session; otherwise a session
+    // it created and later resumed on the same connection would double-render.
+    let mut attached: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // --- writer task (sole writer to the socket) -------------------------
     let writer_handle = {
@@ -1039,6 +1056,7 @@ async fn handle_connection(
                     tracing::info!(%session_id, "session created");
 
                     sessions_lock.insert(session_id.clone(), handle);
+                    attached.insert(session_id.clone());
                 }
 
                 // --- forward user input to the agent ---------------------
@@ -1144,6 +1162,7 @@ async fn handle_connection(
                     {
                         Ok(handle) => {
                             sessions_lock.insert(session_id.clone(), handle);
+                            attached.insert(session_id.clone());
                         }
                         Err(e) => {
                             tracing::error!(%session_id, "activate_project create session: {e}");
@@ -1189,7 +1208,8 @@ async fn handle_connection(
             "resume_session" => {
                 if session_storage.session_exists(&session_id) {
                     let mut sessions_lock = sessions.lock().await;
-                    if !sessions_lock.contains_key(&session_id) {
+                    let already_live = sessions_lock.contains_key(&session_id);
+                    if !already_live {
                         // Load existing session from disk
                         let mut agent_session = match crate::session::AgentSession::load_with_storage(
                             &session_id,
@@ -1246,28 +1266,7 @@ async fn handle_connection(
                             .await
                             .unwrap();
 
-                        let mut output_rx = handle.subscribe();
-                        let ev_tx = event_tx.clone();
-                        let sid = session_id.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match output_rx.recv().await {
-                                    Ok(chunk) => {
-                                        let event = ServerEvent::Chunk {
-                                            session_id: sid.clone(),
-                                            chunk,
-                                        };
-                                        if ev_tx.send(event).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                                        tracing::warn!(%sid, "output forwarder lagged by {n}");
-                                    }
-                                }
-                            }
-                        });
+                        attach_forwarder(&handle, &event_tx, &session_id);
 
                         if let Some(active) = &active {
                             session_projects
@@ -1276,6 +1275,17 @@ async fn handle_connection(
                                 .insert(session_id.clone(), active.clone());
                         }
                         sessions_lock.insert(session_id.clone(), handle);
+                        attached.insert(session_id.clone());
+                    } else if let Some(handle) = sessions_lock.get(&session_id) {
+                        // The session is already running — but it may have
+                        // been created on THIS connection (which already
+                        // attached a forwarder). Attach a fresh one only if
+                        // we haven't, so a session that is created and later
+                        // resumed on the same connection doesn't double-render.
+                        if !attached.contains(&session_id) {
+                            attach_forwarder(handle, &event_tx, &session_id);
+                            attached.insert(session_id.clone());
+                        }
                     }
 
                     let _ = event_tx.send(ServerEvent::SessionResumed {
@@ -1381,28 +1391,7 @@ async fn handle_connection(
                             .unwrap();
 
                         // Forward output chunks to the event channel
-                        let mut output_rx = handle.subscribe();
-                        let ev_tx = event_tx.clone();
-                        let sid = session_id.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match output_rx.recv().await {
-                                    Ok(chunk) => {
-                                        let event = ServerEvent::Chunk {
-                                            session_id: sid.clone(),
-                                            chunk,
-                                        };
-                                        if ev_tx.send(event).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                                        tracing::warn!(%sid, "output forwarder lagged by {n}");
-                                    }
-                                }
-                            }
-                        });
+                        attach_forwarder(&handle, &event_tx, &session_id);
 
                         if let Some(active) = &active {
                             session_projects
@@ -1411,6 +1400,7 @@ async fn handle_connection(
                                 .insert(session_id.clone(), active.clone());
                         }
                         sessions_lock.insert(session_id.clone(), handle);
+                        attached.insert(session_id.clone());
 
                         let _ = event_tx.send(ServerEvent::SessionCompacted {
                             session_id: session_id.clone(),
@@ -1435,14 +1425,10 @@ async fn handle_connection(
         }
     }
 
-    // --- connection closed — shut down all sessions -----------------------
-    {
-        let mut sessions_lock = sessions.lock().await;
-        for (sid, handle) in sessions_lock.drain() {
-            let _ = handle.shutdown().await;
-            tracing::info!(session_id = %sid, "shut down on disconnect");
-        }
-    }
+    // --- connection closed -----------------------------------------------
+    // Sessions are daemon-global and keep running after this connection
+    // closes (they detach): a web page may unload freely, and the session
+    // either finishes on its own or is resumed from any later connection.
     drop(event_tx); // signals the writer task to stop
     let _ = writer_handle.await; // wait for writer to finish
 }
@@ -1523,6 +1509,18 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Cannot bind to {socket_path}"))?;
 
+    // Daemon-global live-session registry: unlike the previous per-connection
+    // model (where closing a connection tore every session down), sessions now
+    // live for the daemon's lifetime. A web page can come and go freely — its
+    // session keeps running, and any later connection (or the agent itself,
+    // in autonomous mode) can resume it. Handles are cheap channel wrappers;
+    // output is forwarded to each interested connection individually, so a
+    // detached session costs nothing until someone subscribes.
+    let sessions: Arc<Mutex<HashMap<String, AgentHandle>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let session_projects: Arc<Mutex<HashMap<String, omega_projects::ActiveProject>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     let cwd = env::current_dir()
         .map(|d| d.to_string_lossy().to_string())
         .unwrap_or_else(|_| "?".to_string());
@@ -1545,6 +1543,12 @@ async fn main() -> Result<()> {
                 let runtime = runtime.clone();
                 let projects = projects.clone();
                 let roles = roles.clone();
+                // Sessions and their project bindings are daemon-global: a
+                // session keeps running after the connection that created it
+                // closes (and survives across web page loads), so every
+                // connection shares the same live-session registry.
+                let sessions = sessions.clone();
+                let session_projects = session_projects.clone();
                 tokio::spawn(handle_connection(
                     stream,
                     current_provider,
@@ -1553,6 +1557,8 @@ async fn main() -> Result<()> {
                     runtime,
                     projects,
                     roles,
+                    sessions,
+                    session_projects,
                 ));
             }
             Err(e) => {

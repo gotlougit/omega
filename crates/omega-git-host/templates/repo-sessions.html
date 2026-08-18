@@ -8,11 +8,12 @@
 <div class="container">
   <div class="row">
     <div class="col-md-8">
+      {% if error %}<p class="text-danger">{{ error }}</p>{% endif %}
       {% if sessions %}
       <h3>sessions</h3>
       <p class="text-muted">
         Every omega session works in its own git worktree, served here as a
-        branch. Each entry links the branch to the chat transcript behind it.
+        branch. Each entry links the branch to the chat behind it.
       </p>
       <div class="event-list">
         {% for s in sessions %}
@@ -27,6 +28,7 @@
             {% if s.model %}
             <span class="text-muted">({{ s.model }})</span>
             {% endif %}
+            &mdash; <a class="ml-2" href="/sessions/{{ s.session_id }}/live">chat</a>
           </p>
         </div>
         {% endfor %}
@@ -35,6 +37,23 @@
       <h3>sessions</h3>
       <p class="text-muted">No omega sessions have worked on this project yet.</p>
       {% endif %}
+    </div>
+    <div class="col-md-4">
+      <h3>New session</h3>
+      <p class="text-muted">
+        Start an agent session on {{ name }}: the daemon creates a dedicated
+        git worktree (served as a branch) and the session runs autonomously —
+        it keeps going even if you close this tab, and you can interrupt it
+        from the chat page.
+      </p>
+      <form method="post" action="/{{ name }}/sessions/create">
+        <div class="form-group">
+          <label for="session-prompt">Initial prompt (optional)</label>
+          <textarea class="form-control" id="session-prompt" name="prompt" rows="3"
+                    placeholder="e.g. add a feature that …"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Start session</button>
+      </form>
     </div>
   </div>
 </div>

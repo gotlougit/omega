@@ -8,6 +8,8 @@
 <div class="container">
   <div class="row">
     <div class="col-md-8">
+      {% if error %}<p class="text-danger">{{ error }}</p>{% endif %}
+      {% if ok %}<p class="text-success">{{ ok }}</p>{% endif %}
       {% if worktrees %}
       <h3>session worktrees</h3>
       <div class="event-list">
@@ -22,8 +24,15 @@
             &mdash; <a href="/{{ name }}/commit/{{ w.short }}">{{ w.subject }}</a>
             {% if w.session %}
             <a class="ml-2" href="/sessions/{{ w.session.session_id }}">view chat</a>
+            <a class="ml-2" href="/sessions/{{ w.session.session_id }}/live">live</a>
             {% endif %}
           </p>
+          <form method="post" action="/{{ name }}/merge">
+            <input type="hidden" name="branch" value="{{ w.branch }}">
+            <input type="text" name="message" class="form-control form-control-sm d-inline-block"
+                   placeholder="merge message (optional)" style="width: 40%;">
+            <button type="submit" class="btn btn-primary btn-sm">Merge into main</button>
+          </form>
         </div>
         {% endfor %}
       </div>

@@ -33,7 +33,7 @@ An agent runtime and tool execution framework in Rust.
 | **omega-loop** | Agent daemon — `StandardAgent`, `AgentRuntime`, `AgentSession`, helpers, everything else |
 | **omega-loop-client** | Client library for the `omega-loop` daemon protocol |
 | **omega-projects** | Project store: register git repos (bare clone once) and create per-session git worktrees |
-| **omega-git-host** | Read-only self-hosted git forge over the project store: smart-HTTP remotes + a sourcehut-style web UI (repo pages, worktrees-as-branches, session transcripts) |
+| **omega-git-host** | Self-hosted git forge + web control panel over the project store: smart-HTTP remotes (read-only as a remote), a sourcehut-style web UI for repos/worktrees/transcripts, project & session management, and live chat with the agent (stream, message, interrupt) |
 | **omega-sh** | Unix-socket daemon for filesystem/shell tool execution |
 | **omega-sh-client** | Client library for `omega-sh` + proxy tools |
 | **cli** | Minimal TUI primitives (screen, style, terminal) |
@@ -45,7 +45,7 @@ An agent runtime and tool execution framework in Rust.
 - `omega-loop` — core agent daemon (LLM + tool orchestration)
 - `omega-sh` — filesystem/shell tool daemon
 - `omega-tui` — TUI client for `omega-loop`
-- `omega-git-host` — read-only git forge over the project store (smart HTTP + web UI)
+- `omega-git-host` — git forge + web control panel over the project store (smart HTTP + web UI, project/session management, live chat)
 - `clankersh` — REPL / one-shot client for `omega-sh`
 
 ## omega-git-host
@@ -56,13 +56,37 @@ remote; every session worktree is exposed as a branch; and the web UI — in
 sourcehut's minimal, no-JS styling — lets you browse repos and read the chat
 transcripts behind each worktree.
 
-Run it directly:
+The forge is read-only as a git remote (no push), and by default binds to
+loopback because it serves full session transcripts, which may contain
+sensitive tool output. Expose it deliberately (SSH tunnel, reverse proxy,
+tailscale) if you want it reachable.
+
+Beyond read-only hosting, the web UI is the **control panel** for the agent:
+
+- **Projects** — create a project from an upstream git URL (optionally under
+  a friendly name), and delete one. Your `main` is periodically rebased on
+  upstream (see the rebase cron).
+- **Sessions** — start a brand-new agent session on a project (the daemon
+  creates a dedicated git worktree), and chat with it live: streamed output
+  over SSE, a message box, and an **Interrupt** button — TUI capabilities in
+  the browser.
+- **Ship it** — once a session's work is committed in its worktree, merge
+  that branch into `main` so anyone cloning the repo can fetch it.
+- **Rename** — worktrees/sessions can be renamed (the model does this via
+  its rename tool; the UI reflects it) and are always found again.
+
+The web server talks to `omega-loop` over its Unix socket
+(`OMEGA_LOOP_SOCKET_PATH`). Sessions live in a daemon-global registry, so
+**a session keeps running even after you close the tab** — you can reopen the
+chat page at any time and resume it (or let it work autonomously).
+
+Run it directly (with the daemon):
 
 ```
 OMEGA_PROJECTS_DIR=/persist/clanker/projects \
 OMEGA_SESSION_DIR=/persist/clanker/omega/sessions \
-OMEGA_GIT_HOST_LISTEN=127.0.0.1 \
-OMEGA_GIT_HOST_PORT=8080 \
+OMEGA_LOOP_SOCKET_PATH=/run/omega/loop.sock \
+OMEGA_GIT_HOST_LISTEN=127.0.0.1 OMEGA_GIT_HOST_PORT=8080 \
 omega-git-host
 ```
 
@@ -70,25 +94,18 @@ omega-git-host
 |---|---|---|
 | `OMEGA_PROJECTS_DIR` | `./projects` | Project store (registered repos + worktrees) |
 | `OMEGA_SESSION_DIR` | `./sessions` | Session store (`metadata.json`, `history.jsonl`) |
+| `OMEGA_LOOP_SOCKET_PATH` | `/tmp/omega-loop.sock` | Daemon socket for chat/control |
 | `OMEGA_GIT_HOST_LISTEN` | `127.0.0.1` | Bind address — loopback on purpose, see below |
 | `OMEGA_GIT_HOST_PORT` | `8080` | TCP port |
 
-Clone, browse, read chats:
+Clone, browse, read chats, and drive sessions:
 
 ```
 git clone http://127.0.0.1:8080/pi-omega.git
 git checkout omega/<session>   # every session worktree is served as a branch
 # http://127.0.0.1:8080/ → project list → refs → session transcripts
+# /<project>/sessions → “Start session” → live chat page
 ```
-
-The forge is read-only (no push) and by default binds to loopback because it
-serves full session transcripts, which may contain sensitive tool output.
-Expose it deliberately (SSH tunnel, reverse proxy, tailscale) if you want it
-reachable.
-
-One exception to "read-only": the `/rebase` page is the *imperative control
-panel* for the upstream rebase cron (see below) — it writes the cron state
-file into the project store.
 
 On NixOS, enable it through the module instead of running it by hand:
 

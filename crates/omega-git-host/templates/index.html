@@ -8,6 +8,8 @@
 <div class="row">
   <div class="col-md-8">
     <h3>Projects</h3>
+    {% if error %}<p class="text-danger">{{ error }}</p>{% endif %}
+    {% if ok %}<p class="text-success">{{ ok }}</p>{% endif %}
     {% if projects %}
     <div class="event-list">
       {% for p in projects %}
@@ -32,6 +34,27 @@
     {% endif %}
   </div>
   <div class="col-md-4">
+    <h3>New project</h3>
+    <p class="text-muted">
+      Register an upstream repo as a project. It is cloned once; the agent can
+      fork it into session worktrees and merge finished work back to
+      <code>main</code>. Your <code>main</code> is periodically rebased on
+      upstream (see the rebase cron).
+    </p>
+    <form method="post" action="/projects/create">
+      <div class="form-group">
+        <label for="project-url">Upstream git URL</label>
+        <input class="form-control" id="project-url" name="url" type="text"
+               placeholder="https://github.com/foo/bar.git" required>
+      </div>
+      <div class="form-group">
+        <label for="project-name">Name (optional)</label>
+        <input class="form-control" id="project-name" name="name" type="text"
+               placeholder="my-fork">
+      </div>
+      <button type="submit" class="btn btn-primary">Create project</button>
+    </form>
+    <hr />
     <h3>About</h3>
     <p>
       Read-only git hosting for everything omega works on. Every session's

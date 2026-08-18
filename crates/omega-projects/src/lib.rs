@@ -67,6 +67,18 @@ pub struct ProjectManager {
     root: PathBuf,
 }
 
+/// Outcome of [`ProjectManager::merge_to_default`]: whether a session's
+/// worktree branch had anything to bring into the project's default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeStatus {
+    /// The branch was already an ancestor of the default branch; nothing to
+    /// do (it would be a no-op merge).
+    AlreadyUpToDate,
+    /// The branch was merged into the default branch; carries the new
+    /// default-branch sha.
+    Merged(String),
+}
+
 /// Outcome of [`ProjectManager::update_default_branch`]: the project's
 /// default branch relative to upstream after a fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +159,133 @@ impl ProjectManager {
             .unwrap_or_default()
             .into_iter()
             .find(|p| p.name == name))
+    }
+
+    /// Register a project explicitly, optionally giving it a name and an
+    /// upstream git URL.
+    ///
+    /// This is the web-UI entry point for *creating a project*: the caller
+    /// picks a name (possibly a friendlier one than the URL-derived default)
+    /// and, optionally, the upstream repo it should track and periodically
+    /// rebase against. The repo is cloned once into the store on first use,
+    /// exactly like [`Self::resolve`], and the name is preserved verbatim so
+    /// the user (and any session bound to it) can find it again later.
+    ///
+    /// * `url` — a git URL; required. The upstream is cloned on creation.
+    /// * `name` — optional friendly name. When omitted, the name is derived
+    ///   from the URL. When given, it must be filesystem/branch-safe and is
+    ///   used verbatim.
+    pub async fn create(&self, name: Option<&str>, url: &str) -> Result<ProjectInfo> {
+        let url = url.trim();
+        if url.is_empty() {
+            bail!("project upstream URL must not be empty");
+        }
+        let desired = match name {
+            Some(n) if !n.trim().is_empty() => Some(sanitize_project_name(n)),
+            _ => None,
+        };
+        let base_name = match desired {
+            Some(n) if !n.is_empty() => n,
+            _ => name_from_url(url),
+        };
+        if base_name.is_empty() {
+            bail!("cannot derive a project name from '{url}'");
+        }
+        // Reuse when the name (or derived name) already points at the same
+        // URL — creating it again is a no-op.
+        if let Some(existing) = self.find(&base_name).await? {
+            if existing.url == url {
+                return Ok(existing);
+            }
+            bail!(
+                "project '{base_name}' already exists (pointing at {})",
+                existing.url
+            );
+        }
+        let mut info = ProjectInfo {
+            name: base_name,
+            url: url.to_string(),
+            default_branch: None,
+            created_at: Utc::now(),
+        };
+        self.clone_repo(&info).await?;
+        info.default_branch = self.default_branch(&info).await;
+        self.register(&info).await?;
+        tracing::info!(project = %info.name, url = %info.url, "created project");
+        Ok(info)
+    }
+
+    /// Delete a registered project entirely: removes every worktree (session
+    /// and main), the bare clone, and the registry entry. The on-disk store
+    /// for nothing else but this project is touched.
+    pub async fn delete(&self, name: &str) -> Result<()> {
+        let info = match self.find(name).await? {
+            Some(info) => info,
+            None => bail!("project '{name}' is not registered"),
+        };
+        self.remove_all_worktrees(&info).await?;
+
+        let repo = self.repo_dir(&info.name);
+        if repo.exists() {
+            tokio::fs::remove_dir_all(&repo).await?;
+        }
+        let wt = self.worktrees_dir(&info.name);
+        if wt.exists() {
+            tokio::fs::remove_dir_all(&wt).await?;
+        }
+
+        let mut registry = self.load_registry().await?.unwrap_or_default();
+        registry.retain(|p| p.name != name);
+        let json = serde_json::to_string_pretty(&registry)?;
+        tokio::fs::create_dir_all(&self.root).await?;
+        tokio::fs::write(self.registry_path(), json).await?;
+        tracing::info!(project = %info.name, "deleted project");
+        Ok(())
+    }
+
+    /// Remove every worktree (session + main) of `info` and delete the
+    /// session worktree branches, leaving the bare clone and registry intact.
+    async fn remove_all_worktrees(&self, info: &ProjectInfo) -> Result<()> {
+        let repo = self.repo_dir(&info.name);
+        let wt = self.worktrees_dir(&info.name);
+        if !repo.join("HEAD").exists() {
+            if wt.exists() {
+                tokio::fs::remove_dir_all(&wt).await?;
+            }
+            return Ok(());
+        }
+
+        // Remove every registered worktree first (checkouts), then prune.
+        if let Ok(out) = git(&repo, &["worktree", "list", "--porcelain"]).await {
+            for line in out.lines() {
+                if let Some(path) = line.strip_prefix("worktree ") {
+                    let _ = git(&repo, &["worktree", "remove", "--force", path]).await;
+                }
+            }
+        }
+        let _ = git(&repo, &["worktree", "prune"]).await;
+        // Delete the session branches so no trace of them remains.
+        if let Ok(branches) = git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/omega/",
+            ],
+        )
+        .await
+        {
+            for b in branches.lines() {
+                let b = b.trim();
+                if !b.is_empty() {
+                    let _ = git(&repo, &["branch", "-D", b]).await;
+                }
+            }
+        }
+        if wt.exists() {
+            tokio::fs::remove_dir_all(&wt).await?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -609,6 +748,76 @@ impl ProjectManager {
     }
 
     // -----------------------------------------------------------------------
+    // Ship it — merge a session's worktree branch into the default branch
+    // -----------------------------------------------------------------------
+
+    /// Merge a session's worktree `branch` into the project's default branch
+    /// (e.g. `main`).
+    ///
+    /// This is the "shipping" step: once a session's work in its isolated
+    /// worktree is committed, merging it onto the default branch makes it
+    /// fetchable by anyone cloning the project — exactly as if the fork were
+    /// hosted on GitHub. The merge happens in the project's main worktree
+    /// (the one place the default branch can be written) with `--no-ff`, so
+    /// the session's work is introduced as an explicit merge commit and the
+    /// default branch never rewrites its own history.
+    ///
+    /// Returns [`MergeStatus::AlreadyUpToDate`] when the branch is already an
+    /// ancestor of the default branch (nothing new to bring in).
+    pub async fn merge_to_default(
+        &self,
+        active: &ActiveProject,
+        message: &str,
+    ) -> Result<MergeStatus> {
+        let info = &active.project;
+        let repo = self.repo_dir(&info.name);
+        if !repo.join("HEAD").exists() {
+            bail!(
+                "project '{}' has no local clone (repo {} missing)",
+                info.name,
+                repo.display()
+            );
+        }
+        let default = self
+            .default_branch(info)
+            .await
+            .unwrap_or_else(|| "main".to_string());
+        if !branch_exists(&repo, &active.branch).await {
+            bail!("worktree branch '{}' does not exist", active.branch);
+        }
+        // Already fully contained? A merge would be a no-op — report as such.
+        if is_ancestor(&repo, &active.branch, &format!("refs/heads/{default}")).await {
+            return Ok(MergeStatus::AlreadyUpToDate);
+        }
+
+        let main = self.ensure_main_worktree(info).await?;
+        let dir = Path::new(&main.worktree_path);
+        let msg = if message.trim().is_empty() {
+            format!("Merge {} into {default}", active.branch)
+        } else {
+            message.trim().to_string()
+        };
+        git(dir, &["merge", "--no-ff", "--no-edit", "-m", &msg, &active.branch])
+            .await
+            .with_context(|| {
+                format!(
+                    "merge of '{}' into '{default}' failed in {}",
+                    active.branch,
+                    dir.display()
+                )
+            })?;
+        let sha = git(dir, &["rev-parse", "HEAD"]).await?;
+        tracing::info!(
+            project = %info.name,
+            branch = %active.branch,
+            default = %default,
+            sha = %sha,
+            "merged worktree branch into default"
+        );
+        Ok(MergeStatus::Merged(sha))
+    }
+
+    // -----------------------------------------------------------------------
     // Low-level git operations
     // -----------------------------------------------------------------------
 
@@ -843,6 +1052,27 @@ fn name_from_url(url: &str) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or(trimmed);
     name.to_string()
+}
+
+/// Make `s` safe to use as a project name (used as a store subdirectory).
+/// Like [`sanitize_ref_component`], but it also collapses runs of illegal
+/// characters into a single dash, so a user-typed "my fork / x" becomes
+/// "my-fork-x" and stays unique/findable.
+fn sanitize_project_name(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "project".to_string()
+    } else {
+        out
+    }
 }
 
 /// Make `s` safe to embed in a git branch name / directory name.
@@ -1838,6 +2068,190 @@ mod tests {
             .lines()
             .count();
         assert_eq!(count, 2, "bare repo + one main worktree");
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicit project create / delete
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_registers_with_explicit_name_and_upstream_url() {
+        let fx = fixture().await;
+        let info = fx
+            .manager
+            .create(Some("my-fork"), &fx.remote_url)
+            .await
+            .unwrap();
+
+        assert_eq!(info.name, "my-fork");
+        assert_eq!(info.url, fx.remote_url);
+        assert_eq!(info.default_branch.as_deref(), Some("main"));
+        // Bare clone exists and is serviceable.
+        assert!(fx.manager.repo_dir("my-fork").join("HEAD").is_file());
+        // Registered.
+        assert_eq!(fx.manager.list().await.unwrap().len(), 1);
+        // The friendly name survives as the registration name.
+        assert_eq!(fx.manager.find("my-fork").await.unwrap().unwrap().name, "my-fork");
+    }
+
+    #[tokio::test]
+    async fn create_without_name_derives_from_url() {
+        let fx = fixture().await;
+        let name = Path::new(&fx.remote_url)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let info = fx.manager.create(None, &fx.remote_url).await.unwrap();
+        assert_eq!(info.name, name);
+    }
+
+    #[tokio::test]
+    async fn create_sanitizes_explicit_name_and_rejects_empty_url() {
+        let fx = fixture().await;
+        // Explicit name is sanitized into a store-safe form.
+        let info = fx
+            .manager
+            .create(Some("my  fork / x"), &fx.remote_url)
+            .await
+            .unwrap();
+        assert_eq!(info.name, "my-fork-x");
+
+        // Empty URL → rejected before touching git.
+        let err = fx.manager.create(Some("x"), "   ").await.unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn create_same_url_same_name_is_a_noop() {
+        let fx = fixture().await;
+        let first = fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        let second = fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fx.manager.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_name_taken_by_different_url_fails_cleanly() {
+        let fx = fixture().await;
+        fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        // Registering a *different* URL under the same name → rejected.
+        let remote_b = TempDir::new().unwrap();
+        init_remote(remote_b.path()).await;
+        let err = fx
+            .manager
+            .create(Some("fork"), &remote_b.path().display().to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_worktrees_repo_and_registry() {
+        let fx = fixture().await;
+        let info = fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        let active = fx.manager.activate(&info.name, "sess-1", None).await.unwrap();
+
+        fx.manager.delete("fork").await.unwrap();
+
+        // No registry entry, no bare clone, no worktree (dir or branch).
+        assert!(fx.manager.find("fork").await.unwrap().is_none());
+        assert!(!fx.manager.repo_dir("fork").exists());
+        assert!(!fx.manager.worktrees_dir("fork").exists());
+        assert!(!Path::new(&active.worktree_path).exists());
+
+        // Deleting an unregistered project fails cleanly.
+        let err = fx.manager.delete("never-registered").await.unwrap_err();
+        assert!(err.to_string().contains("not registered"), "{err:#}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge session branch into default branch
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn merge_to_default_brings_session_work_into_main() {
+        let fx = fixture().await;
+        let info = fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        let active = fx.manager.activate(&info.name, "sess-1", None).await.unwrap();
+        configure_worktree_identity(&fx.manager, &info).await;
+
+        // Commit some work in the session's isolated worktree.
+        let wt = Path::new(&active.worktree_path);
+        tokio::fs::write(wt.join("feature.txt"), "done\n").await.unwrap();
+        git(wt, &["add", "."]).await.unwrap();
+        git(wt, &["commit", "-m", "add feature"]).await.unwrap();
+
+        // Default branch is still the original commit (feature not on main).
+        let before = git(&fx.manager.repo_dir("fork"), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap();
+
+        let status = fx
+            .manager
+            .merge_to_default(&active, "Merge the feature")
+            .await
+            .unwrap();
+        let sha = match status {
+            MergeStatus::Merged(sha) => sha,
+            other => panic!("expected Merged, got {other:?}"),
+        };
+
+        // Default branch advanced to the merge commit, which is NOT the
+        // session's tip (a --no-ff merge commit was created).
+        let after = git(&fx.manager.repo_dir("fork"), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap();
+        assert_eq!(after, sha);
+        assert_ne!(before, after);
+        let session_tip = git(
+            &fx.manager.repo_dir("fork"),
+            &["rev-parse", &active.branch],
+        )
+        .await
+        .unwrap();
+        assert_ne!(after, session_tip);
+
+        // The feature is reachable from main.
+        assert!(is_ancestor(&fx.manager.repo_dir("fork"), &active.branch, "refs/heads/main").await);
+        // A fresh clone of the project sees the feature on main.
+        let main_binding = fx.manager.ensure_main_worktree(&info).await.unwrap();
+        let main_wt = Path::new(&main_binding.worktree_path);
+        assert!(main_wt.join("feature.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_to_default_reports_already_up_to_date() {
+        let fx = fixture().await;
+        let info = fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        let active = fx.manager.activate(&info.name, "sess-1", None).await.unwrap();
+        configure_worktree_identity(&fx.manager, &info).await;
+
+        // No commits on the session branch → nothing to merge.
+        let status = fx
+            .manager
+            .merge_to_default(&active, "nop")
+            .await
+            .unwrap();
+        assert_eq!(status, MergeStatus::AlreadyUpToDate);
+    }
+
+    #[tokio::test]
+    async fn merge_to_default_fails_for_missing_branch() {
+        let fx = fixture().await;
+        fx.manager.create(Some("fork"), &fx.remote_url).await.unwrap();
+        let ghost = ActiveProject {
+            project: ProjectInfo {
+                name: "fork".into(),
+                url: fx.remote_url.clone(),
+                default_branch: None,
+                created_at: Default::default(),
+            },
+            worktree_path: "/nonexistent".into(),
+            branch: "omega/never-existed".into(),
+        };
+        let err = fx.manager.merge_to_default(&ghost, "").await.unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err:#}");
     }
 
 }

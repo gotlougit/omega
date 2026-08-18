@@ -782,3 +782,305 @@ async fn rebase_page_renders_and_controls_persist_state() {
 
     drop(server);
 }
+
+/// The web control panel can create a project from an upstream URL, merge a
+/// session worktree's branch into main (making it fetchable), and delete the
+/// project — end to end over HTTP against real git smart-HTTP.
+#[tokio::test]
+async fn create_project_merge_worktree_into_main_and_delete() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+
+    // An upstream repo the server clones when the project is created.
+    let source_root = TempDir::new().unwrap();
+    let source = source_root.path().join("upstream");
+    std::fs::create_dir_all(&source).unwrap();
+    init_source_repo(&source).await;
+    let url = source.to_str().unwrap().to_string();
+    let encoded_url = url.replace('/', "%2F");
+
+    let port = free_port();
+    let server = spawn_server(store.path(), sessions.path(), port).await;
+    wait_for_server(port).await;
+
+    // The empty index carries the "New project" form.
+    let body = http_get(port, "/").await;
+    assert!(body.contains("200 OK"), "index:\n{body}");
+    assert!(body.contains("Create project"), "new project form:\n{body}");
+
+    // Create a project from the upstream URL under a friendly name.
+    let resp = http_post_form(
+        port,
+        "/projects/create",
+        &format!("name=my-fork&url={encoded_url}"),
+    )
+    .await;
+    assert!(resp.contains("303 See Other"), "create response:\n{resp}");
+
+    // The new project's summary renders with the danger zone.
+    let body = http_get(port, "/my-fork/").await;
+    assert!(body.contains("200 OK"), "new project summary:\n{body}");
+    assert!(body.contains("my-fork"), "summary shows name:\n{body}");
+    assert!(body.contains("Delete project"), "danger zone:\n{body}");
+
+    // A fresh clone of the fork works immediately (it was cloned on create).
+    let dest = TempDir::new().unwrap();
+    let out = Command::new("git")
+        .arg("clone")
+        .arg(format!("http://127.0.0.1:{port}/my-fork.git"))
+        .arg(dest.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.path().join("README.md").exists());
+
+    // Seed a session worktree + commit in it, exactly as omega-loop would.
+    let manager = omega_projects::ProjectManager::with_root(store.path());
+    let active = manager.activate("my-fork", "sess-1", None).await.unwrap();
+    let repo = manager.repo_dir("my-fork");
+    git(&repo, &["config", "user.email", "omega-test@example.com"])
+        .await
+        .unwrap();
+    git(&repo, &["config", "user.name", "Omega Test"])
+        .await
+        .unwrap();
+    git(&repo, &["config", "commit.gpgsign", "false"])
+        .await
+        .unwrap();
+    let wt = Path::new(&active.worktree_path);
+    std::fs::write(wt.join("feature.txt"), "done\n").unwrap();
+    git(wt, &["add", "."]).await.unwrap();
+    git(wt, &["commit", "-m", "add feature"]).await.unwrap();
+
+    // The feature is NOT yet on main.
+    let dest_before = TempDir::new().unwrap();
+    let out = Command::new("git")
+        .arg("clone")
+        .arg(format!("http://127.0.0.1:{port}/my-fork.git"))
+        .arg(dest_before.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!dest_before.path().join("feature.txt").exists());
+
+    // The refs page shows a "Merge into main" action for the worktree.
+    let body = http_get(port, "/my-fork/refs").await;
+    assert!(body.contains("Merge into main"), "refs merge action:\n{body}");
+
+    // Merge the session branch into main via the web action.
+    let encoded_branch = active.branch.replace('/', "%2F");
+    let resp = http_post_form(
+        port,
+        "/my-fork/merge",
+        &format!("branch={encoded_branch}&message=Merge+the+feature"),
+    )
+    .await;
+    assert!(resp.contains("303 See Other"), "merge response:\n{resp}");
+
+    // A fresh clone now sees the feature on main — shipped and fetchable.
+    let dest_after = TempDir::new().unwrap();
+    let out = Command::new("git")
+        .arg("clone")
+        .arg(format!("http://127.0.0.1:{port}/my-fork.git"))
+        .arg(dest_after.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "clone after merge failed");
+    assert!(
+        dest_after.path().join("feature.txt").exists(),
+        "feature must land on main and be fetchable"
+    );
+
+    // Delete the project via web; the repo page and clone now 404.
+    let resp = http_post_form(port, "/projects/delete", "name=my-fork").await;
+    assert!(resp.contains("303 See Other"), "delete response:\n{resp}");
+    let body = http_get(port, "/my-fork/").await;
+    assert!(body.contains("404 Not Found"), "after delete:\n{body}");
+    assert!(!manager.repo_dir("my-fork").exists(), "bare clone should be gone");
+
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Live chat bridge (web server + a mock omega-loop daemon socket)
+// ---------------------------------------------------------------------------
+
+/// GET a path and return the first chunk (for SSE streams that stay open).
+async fn http_get_stream_head(port: u16, path: &str) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    // Accumulate until we see the first SSE data frame (the body arrives in
+    // later TCP segments, after the chunked headers).
+    let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
+    for _ in 0..50 {
+        let n = tokio::time::timeout(Duration::from_millis(150), stream.read(&mut buf))
+            .await
+            .unwrap_or(Ok(0));
+        match n {
+            Ok(0) => break, // EOF
+            Ok(n) => all.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+        let text = String::from_utf8_lossy(&all);
+        // Keep reading until the mock's text delta (or an error frame) lands;
+        // the first "data:" (a cleared marker) arrives before the delta.
+        if text.contains("world") || text.contains("\"error\"") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&all).to_string()
+}
+
+/// A minimal mock omega-loop daemon on a Unix socket: it understands just
+/// enough of the wire protocol to make the web chat bridge behave. For each
+/// connection it reads newline-delimited JSON requests and replies with the
+/// events a real daemon would emit.
+async fn spawn_mock_daemon(socket: &Path) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (reader, mut writer) = stream.into_split();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let v: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let sid = v
+                        .get("session_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("mock");
+                    let mut out = String::new();
+                    match ty {
+                        "activate_project" => {
+                            out = format!(
+                                "{{\"type\":\"ProjectActive\",\"project\":{{\"name\":\"mock-proj\",\"url\":\"x\",\"created_at\":\"2025-01-01T00:00:00Z\"}},\"worktree_path\":\"/tmp/mock/wt\",\"branch\":\"omega/web-abc123\"}}\n"
+                            );
+                        }
+                        "resume_session" => {
+                            out = format!(
+                                "{{\"type\":\"SessionResumed\",\"session_id\":\"{sid}\",\"session_name\":\"{sid}\"}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"HistoryMessage\",\"session_id\":\"{sid}\",\"role\":\"user\",\"content\":\"hello\"}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"TextDelta\":\"world\"}}}}\n"
+                            );
+                        }
+                        "run" | "message" => {
+                            out = format!(
+                                "{{\"type\":\"Created\",\"session_id\":\"{sid}\",\"session_name\":\"{sid}\"}}\n"
+                            );
+                        }
+                        _ => {}
+                    }
+                    if !out.is_empty() {
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Web chat end-to-end: the web server drives the daemon to start a session,
+/// renders the live chat page, streams its output over SSE, and forwards
+/// messages + interrupts. The daemon is a mock so the test stays hermetic.
+#[tokio::test]
+async fn web_chat_start_session_stream_message_and_interrupt() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let socket = sessions.path().join("loop.sock");
+    spawn_mock_daemon(&socket).await;
+
+    // Seed a registered project + a session on disk so the live page renders.
+    let (project, worktree_branch) = seed_store(store.path()).await;
+    seed_session(sessions.path(), "web-chat-1", &worktree_branch, "Chat session").await;
+
+    let port = free_port();
+    let server = Command::new(env!("CARGO_BIN_EXE_omega-git-host"))
+        .env("OMEGA_PROJECTS_DIR", store.path())
+        .env("OMEGA_SESSION_DIR", sessions.path())
+        .env("OMEGA_LOOP_SOCKET_PATH", &socket)
+        .env("OMEGA_GIT_HOST_LISTEN", "127.0.0.1")
+        .env("OMEGA_GIT_HOST_PORT", port.to_string())
+        .env("RUST_LOG", "warn")
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn omega-git-host");
+    wait_for_server(port).await;
+
+    // The project's sessions page has the "Start session" form.
+    let body = http_get(port, &format!("/{project}/sessions")).await;
+    assert!(body.contains("200 OK"), "repo sessions:\n{body}");
+    assert!(body.contains("Start session"), "repo sessions:\n{body}");
+
+    // Start a session: the web POSTs activate_project to the daemon, which
+    // (mock) replies ProjectActive → we land on the live chat page.
+    let resp = http_post_form(port, &format!("/{project}/sessions/create"), "prompt=hi").await;
+    assert!(resp.contains("303 See Other"), "create session:\n{resp}");
+    let location = resp
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("location:"))
+        .map(|l| l.splitn(2, ':').nth(1).unwrap().trim().to_string())
+        .expect("redirect location");
+    assert!(
+        location.starts_with("/sessions/web-"),
+        "redirect to live chat: {location}"
+    );
+
+    // The live chat page renders with a message box + interrupt + stream url.
+    let body = http_get(port, "/sessions/web-chat-1/live").await;
+    assert!(body.contains("200 OK"), "live page:\n{body}");
+    assert!(body.contains("Send a message"), "live page:\n{body}");
+    assert!(body.contains("Interrupt"), "live page:\n{body}");
+    assert!(
+        body.contains("/sessions/web-chat-1/stream"),
+        "live page streams:\n{body}"
+    );
+
+    // The SSE stream opens: 200, event-stream, and the mock daemon's text
+    // delta reaches the browser as an SSE frame.
+    let head = http_get_stream_head(port, "/sessions/web-chat-1/stream").await;
+    assert!(
+        head.contains("200 OK") && head.contains("text/event-stream"),
+        "stream head:\n{head}"
+    );
+    assert!(head.contains("world"), "stream should carry the delta:\n{head}");
+
+    // Send a chat message → the web forwards run to the daemon and redirects.
+    let resp = http_post_form(
+        port,
+        "/sessions/web-chat-1/message",
+        "content=please+do+the+thing",
+    )
+    .await;
+    assert!(resp.contains("303 See Other"), "message:\n{resp}");
+
+    // Interrupt → forwarded to the daemon, redirect back.
+    let resp = http_post_form(port, "/sessions/web-chat-1/interrupt", "").await;
+    assert!(resp.contains("303 See Other"), "interrupt:\n{resp}");
+
+    drop(server);
+}

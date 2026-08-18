@@ -6,19 +6,31 @@
 
 use std::path::PathBuf;
 
+use axum::body::Body;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
+use omega_loop_client::{OutputChunk, ServerEvent};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
 
 use omega_projects::rebase::{self};
-use omega_projects::{ProjectInfo, ProjectManager};
+use omega_projects::{ActiveProject, ProjectInfo, ProjectManager};
 
+use crate::daemon;
 use crate::repo::{self, RefKind};
-use crate::sessions::{SessionIndex, SessionMeta};
+use crate::sessions::SessionIndex;
 use crate::transcript;
 use crate::{html_response, text_response, AppState};
+
+/// Minimal `/` query string for the project index: one-shot flash notices
+/// set by the project create/delete redirects.
+#[derive(Deserialize, Default)]
+pub(crate) struct NoticeQuery {
+    pub(crate) error: Option<String>,
+    pub(crate) ok: Option<String>,
+}
 
 const LOG_PER_PAGE: usize = 25;
 const SUMMARY_COMMITS: usize = 20;
@@ -174,6 +186,7 @@ pub async fn refs_page(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<NoticeQuery>,
 ) -> Response {
     let (project, repo) = match repo_for(&state.projects, &name).await {
         Ok(x) => x,
@@ -227,6 +240,8 @@ pub async fn refs_page(
     ctx["branches"] = json!(branches);
     let tags: Vec<&repo::RefInfo> = refs.iter().filter(|r| r.kind == RefKind::Tag).collect();
     ctx["tags"] = json!(tags);
+    ctx["error"] = json!(query.error);
+    ctx["ok"] = json!(query.ok);
     render(state, "refs.html", ctx)
 }
 
@@ -475,11 +490,13 @@ pub async fn clone_page(
 }
 
 /// `/{name}/sessions/` — every omega session bound to this project (its
-/// worktree branch + the chat transcript behind it).
+/// worktree branch + the chat transcript behind it), plus a form to start a
+/// brand-new session on the project.
 pub async fn repo_sessions(
     State(state): State<AppState>,
     Path(name): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<NoticeQuery>,
 ) -> Response {
     let (project, repo) = match repo_for(&state.projects, &name).await {
         Ok(x) => x,
@@ -510,6 +527,7 @@ pub async fn repo_sessions(
 
     let mut ctx = base_ctx(&name, &project, &default, &base_url(&headers), "sessions");
     ctx["sessions"] = json!(sessions_json);
+    ctx["error"] = json!(query.error);
     render(state, "repo-sessions.html", ctx)
 }
 
@@ -556,20 +574,320 @@ pub async fn sessions_index(State(state): State<AppState>) -> Response {
 }
 
 /// `/sessions/{id}` — transcript view.
+/// `/sessions/{id}` — transcript view.
 pub async fn session_page(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let dir = state.session_dir.join(&id);
-    let meta_path = dir.join("metadata.json");
-    if !meta_path.is_file() {
-        return text_response(StatusCode::NOT_FOUND, "session not found\n");
+    match transcript_context(&state, &id) {
+        TranscriptResult::NotFound => {
+            text_response(StatusCode::NOT_FOUND, "session not found\n")
+        }
+        TranscriptResult::Unreadable => {
+            text_response(StatusCode::INTERNAL_SERVER_ERROR, "unreadable session\n")
+        }
+        TranscriptResult::Found {
+            session_json,
+            messages_json,
+            truncated,
+            total,
+        } => {
+            let ctx = json!({
+                "session": session_json,
+                "messages": messages_json,
+                "truncated": truncated,
+                "total": total,
+                "nav_projects_active": false,
+                "nav_sessions_active": true,
+            });
+            render(state, "session.html", ctx)
+        }
     }
-    let meta: SessionMeta = match serde_json::from_slice(&std::fs::read(&meta_path).unwrap_or_default())
-    {
-        Ok(meta) => meta,
-        Err(e) => {
-            tracing::warn!(session = %id, error = %e, "unreadable session metadata");
+}
+
+/// `/sessions/{id}/system-prompt` — the prompt this session was started with.
+pub async fn session_system_prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let path = state.session_dir.join(&id).join("system_prompt.md");
+    let prompt = match std::fs::read_to_string(&path) {
+        Ok(p) => p,
+        Err(_) => return text_response(StatusCode::NOT_FOUND, "system prompt not found\n"),
+    };
+    let ctx = json!({
+        "session_id": id,
+        "prompt": prompt,
+        "nav_projects_active": false,
+        "nav_sessions_active": true,
+    });
+    render(state, "session-prompt.html", ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Live chat — TUI capabilities in the web UI
+// ---------------------------------------------------------------------------
+
+/// Short random suffix for a fresh web session id.
+fn rand_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{nanos:06x}")
+}
+
+fn sanitize_id(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "session".to_string()
+    } else {
+        out
+    }
+}
+
+/// Form for `POST /{name}/sessions/create`: an optional initial prompt for
+/// the brand-new session.
+#[derive(Deserialize)]
+pub(crate) struct SessionCreateForm {
+    prompt: Option<String>,
+}
+
+/// Form for `POST /sessions/{id}/message`.
+#[derive(Deserialize)]
+pub(crate) struct MessageForm {
+    content: String,
+}
+
+/// `POST /{name}/sessions/create` — start a brand-new session bound to this
+/// project (the daemon creates a dedicated git worktree). The session keeps
+/// running in the daemon even after the page is closed; the user arrives on
+/// the live chat page.
+pub async fn session_create(
+    State(_state): State<AppState>,
+    Path(name): Path<String>,
+    Form(form): Form<SessionCreateForm>,
+) -> Response {
+    let id = format!("web-{}-{}", sanitize_id(&name), &rand_suffix()[..6]);
+    match daemon::create_session_on_project(&name, &id).await {
+        Ok(Ok(())) => {
+            // Optional first prompt into the freshly-bound session.
+            if let Some(p) = form
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                let _ = daemon::send_message(&id, p, None).await;
+            }
+            Redirect::to(&format!("/sessions/{id}/live")).into_response()
+        }
+        Ok(Err(msg)) => Redirect::to(&format!(
+            "/{name}/sessions?error={}",
+            url_encode(&msg)
+        ))
+        .into_response(),
+        Err(e) => Redirect::to(&format!(
+            "/{name}/sessions?error={}",
+            url_encode(&e)
+        ))
+        .into_response(),
+    }
+}
+
+/// `GET /sessions/{id}/live` — interactive chat page: the persisted
+/// transcript plus a message box, an interrupt button, and an SSE stream that
+/// appends the agent's live output.
+pub async fn session_live(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<NoticeQuery>,
+) -> Response {
+    let ctx = match transcript_context(&state, &id) {
+        TranscriptResult::NotFound => {
+            return text_response(StatusCode::NOT_FOUND, "session not found\n");
+        }
+        TranscriptResult::Unreadable => {
             return text_response(StatusCode::INTERNAL_SERVER_ERROR, "unreadable session\n");
         }
+        TranscriptResult::Found {
+            session_json,
+            messages_json,
+            truncated,
+            total,
+        } => json!({
+            "session": session_json,
+            "messages": messages_json,
+            "truncated": truncated,
+            "total": total,
+            "live": true,
+            "stream_url": format!("/sessions/{id}/stream"),
+            "stream_error": query.error,
+            "nav_projects_active": false,
+            "nav_sessions_active": true,
+        }),
     };
+    render(state, "session.html", ctx)
+}
+
+/// `GET /sessions/{id}/stream` — SSE feed for the live chat page. Resumes the
+/// session in the daemon (attaching to its live output) and pumps events to
+/// the browser. The daemon connection stays open; it closes when the client
+/// disconnects or the daemon does.
+pub async fn session_stream(State(_state): State<AppState>, Path(id): Path<String>) -> Response {
+    let sid = id.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+    tokio::spawn(async move {
+        // Heartbeat: keep an idle (no events) stream alive through proxies.
+        let heartbeat_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                if heartbeat_tx.send(Ok(": ping\n\n".to_string())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (mut reader, _writer) = match daemon::open_stream(&sid).await {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = tx
+                    .send(Ok(format!(
+                        "data: {}\n\n",
+                        json!({ "type": "error", "message": e })
+                    )))
+                    .await;
+                return;
+            }
+        };
+        // Tells the JS to reset the live pane on (re)connect.
+        let _ = tx
+            .send(Ok(format!("data: {}\n\n", json!({ "type": "cleared" }))))
+            .await;
+        while let Ok(Some(event)) = reader.recv_event().await {
+            for payload in sse_payloads(&event) {
+                if tx
+                    .send(Ok(format!("data: {payload}\n\n")))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Convert a daemon event into one or more SSE JSON payloads for the live
+/// pane.
+fn sse_payloads(event: &ServerEvent) -> Vec<Value> {
+    match event {
+        ServerEvent::Chunk { chunk, .. } => match chunk {
+            OutputChunk::TextDelta(t) | OutputChunk::TextComplete(t) => {
+                vec![json!({ "type": "text", "text": t })]
+            }
+            OutputChunk::ThinkingDelta(t) | OutputChunk::ThinkingComplete(t) => {
+                vec![json!({ "type": "thinking", "text": t })]
+            }
+            OutputChunk::Status(s) => vec![json!({ "type": "status", "message": s })],
+            OutputChunk::Error(e) => vec![json!({ "type": "error", "message": e })],
+            OutputChunk::Done => vec![json!({ "type": "done" })],
+            _ => vec![],
+        },
+        ServerEvent::SystemMsg(msg) => vec![json!({ "type": "status", "message": msg })],
+        ServerEvent::ModelChanged { model } => {
+            vec![json!({ "type": "status", "message": format!("model: {model}") })]
+        }
+        _ => vec![],
+    }
+}
+
+/// `POST /sessions/{id}/message` — send a chat message to the (live, detached)
+/// session. The reply streams back over the SSE feed.
+pub async fn session_message(
+    State(_state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<MessageForm>,
+) -> Response {
+    let content = form.content.trim().to_string();
+    if content.is_empty() {
+        return Redirect::to(&format!("/sessions/{id}/live")).into_response();
+    }
+    match daemon::send_message(&id, &content, None).await {
+        Ok(()) => Redirect::to(&format!("/sessions/{id}/live")).into_response(),
+        Err(e) => Redirect::to(&format!(
+            "/sessions/{id}/live?error={}",
+            url_encode(&e)
+        ))
+        .into_response(),
+    }
+}
+
+/// `POST /sessions/{id}/interrupt` — stop the running turn, like the TUI's
+/// Ctrl-C.
+pub async fn session_interrupt(
+    State(_state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match daemon::interrupt(&id).await {
+        Ok(()) => Redirect::to(&format!("/sessions/{id}/live")).into_response(),
+        Err(e) => Redirect::to(&format!(
+            "/sessions/{id}/live?error={}",
+            url_encode(&e)
+        ))
+        .into_response(),
+    }
+}
+
+/// Outcome of [`transcript_context`]: either the transcript is ready to
+/// render, or the session store doesn't carry it (or has it but unreadable).
+enum TranscriptResult {
+    /// No `metadata.json` for this session.
+    NotFound,
+    /// `metadata.json` exists but couldn't be parsed.
+    Unreadable,
+    /// Everything needed to render the transcript/chat page.
+    Found {
+        session_json: Value,
+        messages_json: Value,
+        truncated: bool,
+        total: usize,
+    },
+}
+
+/// Shared transcript building for the read-only session page and the live
+/// chat page: reads `metadata.json` + `history.jsonl` and folds the raw
+/// stream into the display conversation (tool results and thinking attach to
+/// the assistant message that produced them).
+fn transcript_context(state: &AppState, id: &str) -> TranscriptResult {
+    let dir = state.session_dir.join(id);
+    let meta_path = dir.join("metadata.json");
+    if !meta_path.is_file() {
+        return TranscriptResult::NotFound;
+    }
+    let meta: crate::sessions::SessionMeta =
+        match serde_json::from_slice(&std::fs::read(&meta_path).unwrap_or_default()) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "unreadable session metadata");
+                return TranscriptResult::Unreadable;
+            }
+        };
     let info = crate::sessions::SessionInfo::from_meta(&meta);
 
     let history_path = dir.join("history.jsonl");
@@ -591,16 +909,9 @@ pub async fn session_page(State(state): State<AppState>, Path(id): Path<String>)
         .rev()
         .take(transcript::MAX_MESSAGES)
         .collect::<Vec<_>>();
-    // Fold the raw stream into the display conversation (tool results and
-    // thinking attach to the assistant message that produced them).
-    let display_msgs: Vec<transcript::Message> = shown
-        .iter()
-        .rev()
-        .map(|m| (*m).clone())
-        .collect();
+    let display_msgs: Vec<transcript::Message> = shown.iter().rev().map(|m| (*m).clone()).collect();
     let display = transcript::assemble(&display_msgs);
-
-    let messages_json: Vec<Value> = display
+    let messages_json: Value = display
         .iter()
         .map(|m| {
             json!({
@@ -618,7 +929,6 @@ pub async fn session_page(State(state): State<AppState>, Path(id): Path<String>)
             })
         })
         .collect();
-
     let session_json = json!({
         "session_id": info.session_id,
         "display_name": info.display_name,
@@ -633,34 +943,12 @@ pub async fn session_page(State(state): State<AppState>, Path(id): Path<String>)
         "project": info.project,
         "branch": info.branch,
     });
-    let ctx = json!({
-        "session": session_json,
-        "messages": messages_json,
-        "truncated": truncated,
-        "total": total,
-        "nav_projects_active": false,
-        "nav_sessions_active": true,
-    });
-    render(state, "session.html", ctx)
-}
-
-/// `/sessions/{id}/system-prompt` — the prompt this session was started with.
-pub async fn session_system_prompt(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    let path = state.session_dir.join(&id).join("system_prompt.md");
-    let prompt = match std::fs::read_to_string(&path) {
-        Ok(p) => p,
-        Err(_) => return text_response(StatusCode::NOT_FOUND, "system prompt not found\n"),
-    };
-    let ctx = json!({
-        "session_id": id,
-        "prompt": prompt,
-        "nav_projects_active": false,
-        "nav_sessions_active": true,
-    });
-    render(state, "session-prompt.html", ctx)
+    TranscriptResult::Found {
+        session_json,
+        messages_json,
+        truncated,
+        total,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +1135,131 @@ pub async fn rebase_run_now(State(state): State<AppState>) -> Response {
             )
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Project lifecycle (web control panel)
+// ---------------------------------------------------------------------------
+
+/// Form for `/projects/create`: a friendly name (optional) and the upstream
+/// git URL the project should track (and periodically rebase against).
+#[derive(Deserialize)]
+pub(crate) struct ProjectCreateForm {
+    name: Option<String>,
+    url: String,
+}
+
+/// Form for `/projects/delete`.
+#[derive(Deserialize)]
+pub(crate) struct ProjectDeleteForm {
+    name: String,
+}
+
+/// Form for `/{name}/merge`: merge one session worktree branch into the
+/// project's default branch so it becomes fetchable.
+#[derive(Deserialize)]
+pub(crate) struct MergeForm {
+    branch: String,
+    message: Option<String>,
+}
+
+/// `POST /projects/create` — register a project from an upstream repo URL,
+/// optionally under a friendly name. On success land on the new project's
+/// summary page; on failure return to the index with a flash error.
+pub async fn project_create(
+    State(state): State<AppState>,
+    Form(form): Form<ProjectCreateForm>,
+) -> Response {
+    match state.projects.create(form.name.as_deref(), &form.url).await {
+        Ok(info) => Redirect::to(&format!("/{}/", info.name)).into_response(),
+        Err(e) => {
+            tracing::warn!(url = %form.url, error = %e, "project create failed");
+            Redirect::to(&format!("/?error={}", url_encode(&format!("{e:#}")))).into_response()
+        }
+    }
+}
+
+/// `POST /projects/delete` — remove a project and everything under it.
+pub async fn project_delete(
+    State(state): State<AppState>,
+    Form(form): Form<ProjectDeleteForm>,
+) -> Response {
+    match state.projects.delete(&form.name).await {
+        Ok(()) => Redirect::to(&format!("/?ok={}", url_encode(&format!("deleted {}", form.name)))).into_response(),
+        Err(e) => {
+            tracing::warn!(project = %form.name, error = %e, "project delete failed");
+            Redirect::to(&format!("/?error={}", url_encode(&format!("{e:#}")))).into_response()
+        }
+    }
+}
+
+/// `POST /{name}/merge` — merge a session worktree branch into the project's
+/// default branch (so anyone cloning the repo can fetch it).
+pub async fn project_merge(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Form(form): Form<MergeForm>,
+) -> Response {
+    let branch = form.branch.trim().to_string();
+    if branch.is_empty() {
+        return Redirect::to(&format!(
+            "/{name}/refs?error={}",
+            url_encode("no branch given")
+        ))
+        .into_response();
+    }
+    let project = match state.projects.find(&name).await {
+        Ok(Some(p)) => p,
+        _ => {
+            return Redirect::to(&format!(
+                "/?error={}",
+                url_encode(&format!("project '{name}' not found"))
+            ))
+            .into_response()
+        }
+    };
+    // merge_to_default only needs the branch + project; the checkout dir is
+    // irrelevant to the merge itself.
+    let active = ActiveProject {
+        project,
+        worktree_path: String::new(),
+        branch: branch.clone(),
+    };
+    match state
+        .projects
+        .merge_to_default(&active, form.message.as_deref().unwrap_or(""))
+        .await
+    {
+        Ok(_) => Redirect::to(&format!(
+            "/{name}/refs?ok={}",
+            url_encode(&format!("merged {branch} into main"))
+        ))
+        .into_response(),
+        Err(e) => {
+            tracing::warn!(project = %name, branch = %branch, error = %e, "merge failed");
+            Redirect::to(&format!(
+                "/{name}/refs?error={}",
+                url_encode(&format!("{e:#}"))
+            ))
+            .into_response()
+        }
+    }
+}
+
+/// Percent-encode a string for use in a redirect query string (the sr.ht
+/// server-rendered UI has no session store, so flash notices ride the URL).
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

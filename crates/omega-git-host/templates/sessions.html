@@ -23,6 +23,7 @@
             <a href="/{{ s.project }}/tree/{{ s.branch }}">{{ s.project }} / {{ s.branch }}</a>
           {% endif %}
           {% if s.children %} &mdash; {{ s.children }} subagent(s){% endif %}
+          &mdash; <a class="ml-2" href="/sessions/{{ s.session_id }}/live">chat</a>
         </p>
       </div>
       {% endfor %}

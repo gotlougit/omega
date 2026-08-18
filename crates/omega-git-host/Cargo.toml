@@ -8,11 +8,13 @@ description = "Read-only self-hosted git forge + web UI over the omega project s
 [dependencies]
 # Workspace crates
 omega-projects = { path = "../omega-projects" }
+omega-loop-client = { path = "../omega-loop-client" }
 
 # Async runtime / HTTP
 axum = "0.8"
 http-body-util = "0.1"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full", "sync", "time"] }
+tokio-stream = "0.1"
 
 # Templating (sr.ht-style server-rendered pages)
 minijinja = "2"

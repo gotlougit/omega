@@ -63,6 +63,13 @@
       <p><span class="text-muted">disabled</span> — main is not auto-synced with upstream.</p>
       {% endif %}
       <p class="text-muted"><a href="/rebase/">manage in the rebase page</a></p>
+      <hr />
+      <h3 class="text-danger">danger zone</h3>
+      <form method="post" action="/projects/delete"
+            onsubmit="return confirm('Delete project {{ name }} and all its worktrees? This cannot be undone.');">
+        <input type="hidden" name="name" value="{{ name }}">
+        <button type="submit" class="btn btn-danger">Delete project</button>
+      </form>
     </div>
   </div>
 </div>
