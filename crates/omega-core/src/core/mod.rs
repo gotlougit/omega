@@ -19,6 +19,6 @@ pub use error::{FrameworkError, FrameworkResult};
 pub use output::{
     CacheTelemetry, InputMessage, OutputChunk, ToolInfo, ToolResult, ToolResultData,
 };
-pub use session::SessionInfo;
+pub use session::{RoleInfo, SessionInfo};
 pub use state::AgentState;
 pub use tool_runtime::ToolRuntime;

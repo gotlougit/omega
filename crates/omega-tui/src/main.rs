@@ -379,6 +379,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "List & resume sessions, newest first   (/sessions [search])"),
     ("/project", "Work on a project   (/project [name|git-url])"),
     ("/new", "Create a new session   (/new [id])"),
+    ("/roles", "List available roles   (/<role> <prompt> starts a session)"),
     ("/compact", "Compact session history"),
     ("/interrupt", "Interrupt the agent"),
     ("/clear", "Clear output"),
@@ -402,6 +403,9 @@ enum DaemonCmd {
         content: String,
         model: Option<String>,
         project: Option<ActiveProject>,
+        /// Optional role name: when set and the session is new, the daemon
+        /// creates it with the named role's alternative system prompt.
+        role: Option<String>,
     },
     SetModel {
         session_id: String,
@@ -412,6 +416,8 @@ enum DaemonCmd {
     ListSessions(Option<String>),
     /// Fetch the registered project list.
     ListProjects,
+    /// Fetch the list of available roles (named alternative system prompts).
+    ListRoles,
     /// Activate a project (name or git URL) for a session.
     ActivateProject {
         session_id: String,
@@ -468,6 +474,7 @@ async fn daemon_loop(
                     content,
                     model,
                     project,
+                    role,
                 }) => {
                     if let Err(e) = writer
                         .send_run(
@@ -476,6 +483,7 @@ async fn daemon_loop(
                             &SessionConfig::default(),
                             model.as_deref(),
                             project.as_ref(),
+                            role.as_deref(),
                         )
                         .await
                     {
@@ -504,6 +512,12 @@ async fn daemon_loop(
                 Ok(DaemonCmd::ListProjects) => {
                     if let Err(e) = writer.send_list_projects().await {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "send_list_projects failed");
+                        let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
+                    }
+                }
+                Ok(DaemonCmd::ListRoles) => {
+                    if let Err(e) = writer.send_list_roles().await {
+                        tracing::error!(target: "omega_tui::daemon", error = %e, "send_list_roles failed");
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                     }
                 }
@@ -982,6 +996,12 @@ fn handle_daemon_event(
                 }
             }
         }
+        ServerEvent::RoleList { roles } => {
+            // Available roles (alternative system prompts) — their names
+            // double as `/<role>` slash commands. Stored so `/roles`, tab
+            // completion, and the `/<role> <prompt>` handling can use them.
+            app.roles = roles.into_iter().map(|r| r.name).collect();
+        }
         ServerEvent::ProjectActive {
             project,
             worktree_path,
@@ -1193,6 +1213,9 @@ struct AppState {
     /// Sent with every `Run` so the daemon keeps the session's tools rooted
     /// in the worktree.
     project: Option<ActiveProject>,
+    /// Available roles (named alternative system prompts) fetched from the
+    /// daemon at startup. Each name doubles as a slash command (`/name …`).
+    roles: Vec<String>,
 }
 
 /// Interactive picker navigation state (shared by `/sessions` and
@@ -1240,6 +1263,7 @@ fn process_line(
             content: line.to_string(),
             model: app.model.clone(),
             project: app.project.clone(),
+            role: None,
         });
         return LineOutcome::Continue;
     }
@@ -1261,7 +1285,44 @@ fn process_line(
         "/compact",
         "/model",
         "/new",
+        "/roles",
     ];
+
+    // `/<role> <prompt>` — when the first token names a configured role
+    // (an alternative system prompt defined in NixOS), start a brand-new
+    // session using that role's prompt, with the rest of the line as the
+    // first input. This takes precedence over the "unknown slash command"
+    // fallback below.
+    if !known_commands.contains(&cmd) {
+        let role_name = cmd.trim_start_matches('/').to_string();
+        if app.roles.iter().any(|r| r == &role_name) {
+            let prompt = parts[1..].join(" ");
+            // New session (like /new) so the role's system prompt is used.
+            let new_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+            app.session_id = new_id.clone();
+            handle.clear_output();
+            let _ = cmd_tx.send(DaemonCmd::Run {
+                session_id: new_id.clone(),
+                content: prompt.clone(),
+                model: app.model.clone(),
+                project: app.project.clone(),
+                role: Some(role_name.clone()),
+            });
+            handle.print_output(StyledBlock::new(StyledText::from(Span::new(
+                format!(
+                    "New session: {new_id} — role: {role_name}{}",
+                    if prompt.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — prompt: {prompt}")
+                    }
+                ),
+                s_highlight(),
+            ))));
+            return LineOutcome::Continue;
+        }
+    }
+
     if !known_commands.contains(&cmd) {
         // Unknown slash command — treat as user text, not an error.
         handle.print_output(turn_separator());
@@ -1274,6 +1335,7 @@ fn process_line(
             content: line.to_string(),
             model: app.model.clone(),
             project: app.project.clone(),
+            role: None,
         });
         return LineOutcome::Continue;
     }
@@ -1375,11 +1437,30 @@ fn process_line(
                 content: String::new(),
                 model: app.model.clone(),
                 project: app.project.clone(),
+                role: None,
             });
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("New session: {name}"),
                 s_system(),
             ))));
+        }
+        "/roles" => {
+            if app.roles.is_empty() {
+                handle
+                    .print_output(StyledBlock::new(StyledText::from(Span::new(
+                        "No roles configured (use services.omega.roles in NixOS).",
+                        s_system(),
+                    ))));
+            } else {
+                let mut st = StyledText::from(Span::new(
+                    "Available roles (start a session with /<role> <prompt>):\n".to_string(),
+                    s_system(),
+                ));
+                for r in &app.roles {
+                    st.push(Span::new(format!("  /{r}\n"), s_assistant()));
+                }
+                handle.print_output(StyledBlock::new(st));
+            }
         }
         _ => {
             // Should not reach here due to the known_commands check above,
@@ -1398,7 +1479,7 @@ fn process_line(
 // Tab completion
 // ---------------------------------------------------------------------------
 
-fn complete(input: &str) -> Option<String> {
+fn complete(input: &str, roles: &[String]) -> Option<String> {
     if !input.starts_with('/') {
         return None;
     }
@@ -1407,7 +1488,21 @@ fn complete(input: &str) -> Option<String> {
         .filter(|(name, _)| name.starts_with(input))
         .collect();
     if candidates.is_empty() {
-        return None;
+        // Fall back to role slash commands: `/reverse…` → `/reverseengineer `.
+        let role_candidates: Vec<String> = roles
+            .iter()
+            .map(|r| format!("/{r}"))
+            .filter(|name| name.starts_with(input))
+            .collect();
+        if role_candidates.is_empty() {
+            return None;
+        }
+        let name = role_candidates[0].as_str();
+        let suffix = &name[input.len()..];
+        let mut out = input.to_string();
+        out.push_str(suffix);
+        out.push(' ');
+        return Some(out);
     }
     let (name, _) = candidates[0];
     let suffix = &name[input.len()..];
@@ -1537,7 +1632,7 @@ fn run_loop(
                 let buf = handle.get_buffer();
                 if buf.ends_with('\t') {
                     let trimmed = buf[..buf.len() - 1].to_string();
-                    if let Some(completed) = complete(&trimmed) {
+                    if let Some(completed) = complete(&trimmed, &app.roles) {
                         handle.set_buffer(completed.clone(), completed.len());
                     } else {
                         let len = trimmed.len();
@@ -1674,8 +1769,13 @@ fn main() -> Result<()> {
             content: String::new(),
             model: env_model.clone(),
             project: None,
+            role: None,
         })
         .ok();
+
+    // Fetch the available roles (alternative system prompts) from the
+    // daemon so the `/<role>` slash commands and completion can be wired up.
+    cmd_tx.send(DaemonCmd::ListRoles).ok();
 
     let model_label = env_model.clone().unwrap_or_else(|| "?".to_string());
     let mut app = AppState {
@@ -1684,6 +1784,7 @@ fn main() -> Result<()> {
         cache: CacheStats::default(),
         picker: None,
         project: None,
+        roles: Vec::new(),
     };
 
     // ── Welcome (printed immediately — no daemon round-trip) ───────────
@@ -1762,6 +1863,7 @@ mod tests {
                 cache: CacheStats::default(),
                 picker: None,
                 project: None,
+                roles: Vec::new(),
             },
             streaming: Streaming {
                 block_id: None,
@@ -1907,6 +2009,61 @@ mod tests {
         assert_eq!(count_rows_containing(&fx, "▸ /bogus"), 1);
         match fx.cmd_rx.try_recv() {
             Ok(DaemonCmd::Run { content, .. }) => assert_eq!(content, "/bogus"),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn role_invocation_starts_new_session_with_role_prompt() {
+        let mut fx = fixture();
+        fx.app.roles = vec!["reverseengineer".to_string()];
+        let old_session = fx.app.session_id.clone();
+
+        process_line(
+            "/reverseengineer analyze this binary",
+            &mut fx.app,
+            &fx.handle,
+            &fx.cmd_tx,
+        );
+        fx.handle.redraw_sync();
+
+        // A brand-new session id was chosen, and the Run carries the role
+        // name plus the rest of the line as the first input.
+        assert_ne!(fx.app.session_id, old_session, "role starts a new session");
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Run {
+                session_id,
+                content,
+                role,
+                ..
+            }) => {
+                assert_eq!(session_id, fx.app.session_id);
+                assert_eq!(content, "analyze this binary");
+                assert_eq!(role.as_deref(), Some("reverseengineer"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrecognized_role_falls_back_to_user_text() {
+        let mut fx = fixture();
+        // `reverseengineer` is NOT a configured role → treated as ordinary
+        // user text, not a role invocation.
+        fx.app.roles = Vec::new();
+        process_line(
+            "/reverseengineer analyze this binary",
+            &mut fx.app,
+            &fx.handle,
+            &fx.cmd_tx,
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(count_rows_containing(&fx, "▸ /reverseengineer analyze this binary"), 1);
+        match fx.cmd_rx.try_recv() {
+            Ok(DaemonCmd::Run { content, role, .. }) => {
+                assert_eq!(content, "/reverseengineer analyze this binary");
+                assert!(role.is_none(), "no role should be set for unknown role");
+            }
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -2231,6 +2388,7 @@ mod tests {
                 cache: CacheStats::default(),
                 picker: None,
                 project: None,
+                roles: Vec::new(),
             },
             app_tx,
             app_rx,
@@ -3254,7 +3412,7 @@ mod tests {
         // Simulate run_loop's BufferChanged handler.
         let buf = fx.handle.get_buffer();
         let trimmed = buf[..buf.len() - 1].to_string();
-        if let Some(completed) = complete(&trimmed) {
+        if let Some(completed) = complete(&trimmed, &[]) {
             fx.handle.set_buffer(completed.clone(), completed.len());
         }
         // Completion should expand "/mo" to "/model ".
@@ -3492,7 +3650,7 @@ mod tests {
         fx.handle.set_buffer(tabbed.clone(), tabbed.len());
         // Now run_loop's handler: check ends_with('\\t'), trim it, complete.
         let trimmed = tabbed[..tabbed.len() - 1].to_string();
-        if let Some(completed) = complete(&trimmed) {
+        if let Some(completed) = complete(&trimmed, &[]) {
             // Completion should have expanded "/mo" to "/model ".
             assert!(
                 completed.starts_with("/model"),
@@ -3501,7 +3659,7 @@ mod tests {
         } else {
             // If complete() returned None, the completion table is broken.
             assert!(
-                complete("/m").is_some() || complete("/mo").is_some(),
+                complete("/m", &[]).is_some() || complete("/mo", &[]).is_some(),
                 "BUG: Tab completion returned None for '/mo' — SLASH_COMMANDS has /model"
             );
         }
@@ -8479,11 +8637,12 @@ mod tests {
 
     #[test]
     fn complete_slash_expands_first_command() {
-        assert_eq!(complete("/").unwrap(), "/model ");
-        assert_eq!(complete("/mo").unwrap(), "/model ");
-        assert_eq!(complete("hello"), None);
-        assert_eq!(complete(""), None);
-        assert_eq!(complete("/nonexistent"), None);
+        assert_eq!(complete("/", &[]).unwrap(), "/model ");
+        assert_eq!(complete("/mo", &[]).unwrap(), "/model ");
+        assert_eq!(complete("/re", &["reverseengineer".into()]).unwrap(), "/reverseengineer ");
+        assert_eq!(complete("hello", &[]), None);
+        assert_eq!(complete("", &[]), None);
+        assert_eq!(complete("/nonexistent", &[]), None);
     }
 
     #[test]
@@ -9621,7 +9780,7 @@ mod tests {
         for _ in 0..2 {
             let tabbed = format!("{buf}\t");
             let trimmed = tabbed[..tabbed.len() - 1].to_string();
-            if let Some(completed) = complete(&trimmed) {
+            if let Some(completed) = complete(&trimmed, &[]) {
                 buf = completed.clone();
             } else {
                 buf = trimmed;

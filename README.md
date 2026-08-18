@@ -158,6 +158,37 @@ with sockets in `/run/omega/`. Enable it with:
 }
 ```
 
+### Roles — specialised system prompts
+
+"Roles" are named, NixOS-configured alternative system prompts. Each role
+becomes a slash command in the `omega-tui`: `/<name> <prompt>` starts a
+brand-new session using that role's system prompt, with `<prompt>` as its
+first input. This is handy for giving the agent specialised instructions
+and a task in one go (e.g. `/reverseengineer analyze this binary`).
+
+No roles are set up by default — with this empty, only the default system
+prompt (``services.omega.systemPrompt``) exists. List available roles in
+the TUI with `/roles`.
+
+```nix
+{
+  services.omega.roles = [
+    {
+      name = "reverseengineer";
+      systemPrompt = ''
+        You are a meticulous reverse-engineering analyst.
+
+        When I give you a binary, work through it systematically:
+        1. Identify the target architecture and toolchain.
+        2. Map the disassembly to high-level functions.
+        3. Reconstruct intent from cross-references and strings.
+        4. Document your findings as you go.
+      '';
+    }
+  ];
+}
+```
+
 ### Home-manager for the clanker user
 
 The module can also wire up [home-manager](https://github.com/nix-community/home-manager)

@@ -32,6 +32,10 @@ use tokio::process::Command;
 /// omega-git-host (see `rebase.rs`).
 pub mod rebase;
 
+/// Named role / alternative-system-prompt configuration, shared with
+/// omega-loop and omega-git-host (see `roles.rs`).
+pub mod roles;
+
 /// A registered project: a git repository cloned into the project store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectInfo {

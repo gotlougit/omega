@@ -85,6 +85,31 @@ let
   omegaLoopSocket = "/run/omega/omega-loop.sock";
   systemPromptPath = "/etc/omega/system-prompt.md";
   rebaseDefaultsPath = "/etc/omega/rebase-job.defaults.json";
+  rolesPath = "/etc/omega/roles.json";
+
+  # JSON payload written to `rolesPath` — the list of named role system
+  # prompts (`services.omega.roles`). The daemon reads this at startup; only
+  # the role *names* are exposed to clients so the TUI can wire up
+  # `/<role>` slash commands.
+  rolesJson = builtins.toJSON (
+    map (
+      r:
+      ({
+        name = r.name;
+      })
+      // (
+        if r.extraSystemPrompt != "" then
+          {
+            system_prompt =
+              r.systemPrompt + "\n\n" + r.extraSystemPrompt;
+          }
+        else
+          {
+            system_prompt = r.systemPrompt;
+          }
+      )
+    ) cfg.roles
+  );
 
   # Default system prompt used when the user doesn't set cfg.systemPrompt.
   defaultSystemPrompt = ''
@@ -328,6 +353,64 @@ in
       '';
     };
 
+    roles = mkOption {
+      type = types.listOf (types.submodule {
+        options = {
+          name = mkOption {
+            type = types.str;
+            example = "reverseengineer";
+            description = ''
+              The role's name.  In the TUI this becomes a slash command:
+              `/<name> <prompt>` starts a brand-new session using this
+              role's system prompt, with `<prompt>` as its first input.
+            '';
+          };
+
+          systemPrompt = mkOption {
+            type = types.str;
+            default = "";
+            description = ''
+              The role's system prompt — the alternative instructions the
+              agent uses for sessions started with this role.  For example,
+              a "reverseengineer" role could carry detailed guidance on how
+              you want the agent to approach reverse-engineering work.
+            '';
+          };
+
+          extraSystemPrompt = mkOption {
+            type = types.str;
+            default = "";
+            description = ''
+              Extra text appended to `systemPrompt` for this role (a blank
+              line is added first).  Useful for appending role-specific
+              instructions while keeping the main prompt elsewhere.
+            '';
+          };
+        };
+      });
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          {
+            name = "reverseengineer";
+            systemPrompt = "You are a meticulous reverse-engineering analyst. Follow my process: ...";
+          }
+        ]
+      '';
+      description = ''
+        Named roles — alternative system prompts the agent can be started
+        with.  Each role becomes a slash command in the omega-tui:
+        `/<name> <prompt>` starts a brand-new session using that role's
+        system prompt and `<prompt>` as its first input (useful for a
+        specialised prompt plus a task, e.g. `/reverseengineer analyze this
+        binary`).
+
+        No custom roles are set up by default — with this empty, only the
+        default system prompt (``systemPrompt``) exists.  List available
+        roles in the TUI with `/roles`.
+      '';
+    };
+
     sessionDir = mkOption {
       type = types.path;
       default = "${omegaDir}/sessions";
@@ -550,6 +633,12 @@ in
       # ----- system prompt file --------------------------------------------
       environment.etc."omega/system-prompt.md".text = systemPrompt;
 
+      # ----- named roles (services.omega.roles) ----------------------------
+      # Written to /etc/omega/roles.json and read by omega-loop at startup
+      # via OMEGA_ROLES_PATH. Kept as a (possibly empty) array — with no
+      # roles configured only the default system prompt exists.
+      environment.etc."omega/roles.json".text = rolesJson;
+
       # ----- rebase cron defaults (services.omega.rebaseJob) ---------------
       # Written when the job is enabled; omega-loop (and the git-host rebase
       # page) read it via OMEGA_REBASE_JOB_CONFIG. The imperative state file
@@ -654,6 +743,7 @@ in
             "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
             "OMEGA_SOCKET_PATH=${omegaShSocket}"
             "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
+            "OMEGA_ROLES_PATH=${rolesPath}"
             "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
             "OMEGA_SESSION_DIR=${cfg.sessionDir}"
             "RUST_LOG=${cfg.logLevel}"

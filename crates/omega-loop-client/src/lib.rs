@@ -5,7 +5,7 @@
 //! the reader to receive events.
 
 use anyhow::{Context, Result};
-use omega_core::core::SessionInfo;
+use omega_core::core::{RoleInfo, SessionInfo};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -53,6 +53,8 @@ pub enum ServerEvent {
     ModelList { models: Vec<String> },
     /// Registered projects (response to list_projects).
     ProjectList { projects: Vec<ProjectInfo> },
+    /// Named roles / alternative system prompts (response to list_roles).
+    RoleList { roles: Vec<RoleInfo> },
     /// A project was activated for the current session: the daemon created
     /// a dedicated git worktree the session will operate in.
     ProjectActive {
@@ -414,6 +416,18 @@ impl ServerEvent {
                     .unwrap_or_default();
                 Ok(ServerEvent::ProjectList { projects })
             }
+            "RoleList" => {
+                let roles = obj
+                    .get("roles")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| serde_json::from_value::<RoleInfo>(v.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(ServerEvent::RoleList { roles })
+            }
             "ProjectActive" => {
                 let project = obj
                     .get("project")
@@ -537,6 +551,9 @@ impl DaemonWriter {
     /// If `model` is `Some`, it will be applied on session creation.
     /// If `project` is `Some`, the session is bound to that project's
     /// worktree (all tool calls run inside it).
+    /// If `role` is `Some`, a *new* session is created using that role's
+    /// system prompt (the named alternative prompt configured in NixOS)
+    /// instead of the default.
     pub async fn send_run(
         &mut self,
         session_id: &str,
@@ -544,6 +561,7 @@ impl DaemonWriter {
         config: &SessionConfig,
         model: Option<&str>,
         project: Option<&ActiveProject>,
+        role: Option<&str>,
     ) -> Result<()> {
         let mut req = serde_json::json!({
             "type": "run",
@@ -560,6 +578,9 @@ impl DaemonWriter {
         }
         if let Some(p) = project {
             req["project"] = serde_json::to_value(p)?;
+        }
+        if let Some(r) = role {
+            req["role"] = serde_json::json!(r);
         }
         self.write_json(&req).await
     }
@@ -593,6 +614,15 @@ impl DaemonWriter {
     pub async fn send_list_projects(&mut self) -> Result<()> {
         let req = serde_json::json!({
             "type": "list_projects",
+        });
+        self.write_json(&req).await
+    }
+
+    /// Request the list of available roles (named alternative system
+    /// prompts) from the daemon.
+    pub async fn send_list_roles(&mut self) -> Result<()> {
+        let req = serde_json::json!({
+            "type": "list_roles",
         });
         self.write_json(&req).await
     }
@@ -753,6 +783,25 @@ mod tests {
             }
             _ => panic!("Expected SystemMsg event"),
         }
+    }
+
+    #[test]
+    fn test_parse_role_list_event() {
+        let json = r#"{"type":"RoleList","roles":[{"name":"reverseengineer"}]}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::RoleList { roles } => {
+                assert_eq!(roles.len(), 1);
+                assert_eq!(roles[0].name, "reverseengineer");
+            }
+            _ => panic!("Expected RoleList event"),
+        }
+    }
+
+    #[test]
+    fn test_send_list_roles_json_shape() {
+        let json = serde_json::json!({"type": "list_roles"});
+        assert_eq!(json["type"], "list_roles");
     }
 
     #[test]

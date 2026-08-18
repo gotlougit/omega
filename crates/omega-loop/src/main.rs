@@ -38,7 +38,9 @@ mod rebase_job;
 mod runtime;
 mod session;
 
-use omega_core::core::{InputMessage, OutputChunk, SessionInfo, ToolInfo, ToolResult, ToolRuntime};
+use omega_core::core::{
+    InputMessage, OutputChunk, RoleInfo, SessionInfo, ToolInfo, ToolResult, ToolRuntime,
+};
 use omega_llm::types::CustomTool;
 use omega_llm::{
     AuthConfig, ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider, ToolDefinition,
@@ -72,6 +74,11 @@ struct ClientRequest {
     /// Active project for a `run` request — binds the session's tools to
     /// the project's git worktree.
     project: Option<ActiveProject>,
+    /// Optional role name for a `run` request.  When a *new* session is
+    /// created, the named role's alternative system prompt is used instead
+    /// of the default (roles are configured in NixOS via
+    /// `services.omega.roles`).
+    role: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -118,6 +125,10 @@ enum ServerEvent {
     },
     ProjectList {
         projects: Vec<ProjectInfo>,
+    },
+    /// Named roles / alternative system prompts (response to list_roles).
+    RoleList {
+        roles: Vec<RoleInfo>,
     },
     /// A project was activated for a session: the daemon created (or
     /// re-created) a dedicated git worktree the session will operate in.
@@ -711,6 +722,7 @@ async fn handle_connection(
     tools: Arc<ToolRegistry>,
     runtime: AgentRuntime,
     projects: Arc<ProjectManager>,
+    roles: Vec<omega_projects::roles::Role>,
 ) {
     let (reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
@@ -814,6 +826,16 @@ async fn handle_connection(
                     });
                 }
             }
+            continue;
+        }
+
+        // list_roles doesn't need a session_id either.
+        if req.msg_type == "list_roles" {
+            let roles: Vec<RoleInfo> = omega_projects::roles::role_names(&roles)
+                .into_iter()
+                .map(|name| RoleInfo { name })
+                .collect();
+            let _ = event_tx.send(ServerEvent::RoleList { roles });
             continue;
         }
 
@@ -938,11 +960,30 @@ async fn handle_connection(
                         });
                     }
 
-                    // Read system prompt from OMEGA_SYSTEM_PROMPT_PATH file, or empty
-                    let system_prompt = env::var("OMEGA_SYSTEM_PROMPT_PATH")
-                        .ok()
-                        .and_then(|p| std::fs::read_to_string(p).ok())
-                        .unwrap_or_default();
+                    // Read system prompt from OMEGA_SYSTEM_PROMPT_PATH file, or empty.
+                    // When a role is requested for a brand-new session, use the
+                    // role's alternative system prompt instead of the default.
+                    let default_prompt = || {
+                        env::var("OMEGA_SYSTEM_PROMPT_PATH")
+                            .ok()
+                            .and_then(|p| std::fs::read_to_string(p).ok())
+                            .unwrap_or_default()
+                    };
+                    let system_prompt = if is_new {
+                        req.role
+                            .as_deref()
+                            .and_then(|name| omega_projects::roles::role_prompt(&roles, name))
+                            .unwrap_or_else(&default_prompt)
+                    } else {
+                        default_prompt()
+                    };
+                    if is_new && req.role.is_some() {
+                        tracing::info!(
+                            %session_id,
+                            role = req.role.as_deref().unwrap_or(""),
+                            "session started with custom role system prompt"
+                        );
+                    }
 
                     let session_tools = tools_for_session(
                         &tools,
@@ -1469,6 +1510,15 @@ async fn main() -> Result<()> {
     let socket_path =
         env::var("OMEGA_LOOP_SOCKET_PATH").unwrap_or_else(|_| "/tmp/omega-loop.sock".to_string());
 
+    // Named roles (alternative system prompts) from the NixOS module
+    // (`services.omega.roles`), via OMEGA_ROLES_PATH. With none configured
+    // the daemon simply has the default "no role" prompt.
+    let roles = omega_projects::roles::load_roles();
+    tracing::info!(
+        count = omega_projects::roles::role_names(&roles).len(),
+        "loaded named roles"
+    );
+
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Cannot bind to {socket_path}"))?;
@@ -1494,6 +1544,7 @@ async fn main() -> Result<()> {
                 let tools = tools.clone();
                 let runtime = runtime.clone();
                 let projects = projects.clone();
+                let roles = roles.clone();
                 tokio::spawn(handle_connection(
                     stream,
                     current_provider,
@@ -1501,6 +1552,7 @@ async fn main() -> Result<()> {
                     tools,
                     runtime,
                     projects,
+                    roles,
                 ));
             }
             Err(e) => {

@@ -2,6 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A named alternative system prompt ("role") that a client can start a
+/// session with via `/<role> <prompt>`.
+///
+/// This is the client-facing summary of a role — only the name (used as the
+/// slash-command name) is exposed to clients; the full system prompt stays
+/// server-side in the daemon / NixOS module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleInfo {
+    /// Role name — used as the slash-command name in the TUI (`/name …`).
+    pub name: String,
+}
+
 /// A lightweight, client-facing summary of a stored session.
 ///
 /// This is what the daemon returns for `list_sessions`. The list is

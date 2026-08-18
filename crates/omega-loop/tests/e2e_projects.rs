@@ -245,8 +245,8 @@ async fn activate_project_end_to_end() {
 
     // 6. A normal chat message (non-slash) is just forwarded — no LLM call
     // happens unless the agent runs tools, so this must succeed silently.
-    writer.send_run("e2e-sess", "hello", &Default::default(), None, None).await.unwrap();
-    writer.send_run("e2e-sess-2", "hello", &Default::default(), None, None).await.unwrap();
+    writer.send_run("e2e-sess", "hello", &Default::default(), None, None, None).await.unwrap();
+    writer.send_run("e2e-sess-2", "hello", &Default::default(), None, None, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Both sessions' worktrees are untouched by the other's existence.
