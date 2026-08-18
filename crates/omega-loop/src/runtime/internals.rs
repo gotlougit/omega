@@ -221,4 +221,14 @@ impl ToolRuntime for AgentInternals {
     fn is_interactive(&self) -> bool {
         self.is_interactive()
     }
+
+    fn set_session_meta(&self, key: &str, value: serde_json::Value) {
+        // Best-effort: only touches the in-memory metadata so a subsequent
+        // message save does not overwrite a freshly-persisted binding with a
+        // stale in-memory value. `try_write` avoids blocking/deadlocking if
+        // the loop happens to hold the session lock right now.
+        if let Ok(mut session) = self.session.try_write() {
+            session.set_custom(key, value);
+        }
+    }
 }

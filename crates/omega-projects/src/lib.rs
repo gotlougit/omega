@@ -174,6 +174,11 @@ impl ProjectManager {
     /// Resolve `spec` to a registered [`ProjectInfo`], cloning the
     /// repository on first use. Registered names are matched exactly; any
     /// other input is treated as a git URL.
+    ///
+    /// A git URL is matched against the registry by *URL* (not by derived
+    /// name), so a URL that derives the same name as an existing *different*
+    /// project never shadows it — the new remote is always cloneable on
+    /// first use (see [`Self::available_name`]).
     pub async fn resolve(&self, spec: &str) -> Result<ProjectInfo> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -188,10 +193,12 @@ impl ProjectManager {
             return Ok(existing);
         }
 
-        let name = name_from_url(spec);
-        if name.is_empty() {
+        let base_name = name_from_url(spec);
+        if base_name.is_empty() {
             bail!("cannot derive a project name from '{spec}'");
         }
+        let name = self.available_name(&base_name, spec).await?;
+
         let mut info = ProjectInfo {
             name,
             url: spec.to_string(),
@@ -203,6 +210,29 @@ impl ProjectManager {
         self.register(&info).await?;
         tracing::info!(project = %info.name, url = %info.url, "registered project");
         Ok(info)
+    }
+
+    /// Pick a project name for a URL whose basename derives to `base_name`.
+    ///
+    /// Reuses `base_name` when it is free, or when the project already
+    /// registered under it points at the *same* URL (the user re-activated a
+    /// project by its URL rather than its name). If `base_name` is taken by
+    /// a *different* URL, appends a numeric suffix so the new remote gets
+    /// its own clone directory instead of silently shadowing the other
+    /// project's checkout.
+    async fn available_name(&self, base_name: &str, url: &str) -> Result<String> {
+        match self.find(base_name).await? {
+            Some(existing) if existing.url == url => return Ok(existing.name),
+            None => return Ok(base_name.to_string()),
+            Some(_) => {} // taken by a different URL — disambiguate below
+        }
+        for i in 1..=1000 {
+            let candidate = format!("{base_name}-{i}");
+            if self.find(&candidate).await?.is_none() {
+                return Ok(candidate);
+            }
+        }
+        bail!("could not derive a unique project name from '{url}'")
     }
 
     /// Create a fresh worktree for `info` on its own branch, named after
@@ -887,6 +917,25 @@ mod tests {
         git(dir, &["commit", "-m", "initial commit"]).await.unwrap();
     }
 
+    /// Like [`init_remote`] but with caller-controlled README content, used
+    /// to tell two same-named remotes apart.
+    async fn init_remote_with_content(dir: &Path, readme: &str) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        git(dir, &["init", "-b", "main"]).await.unwrap();
+        git(dir, &["config", "user.email", "omega-test@example.com"])
+            .await
+            .unwrap();
+        git(dir, &["config", "user.name", "Omega Test"])
+            .await
+            .unwrap();
+        git(dir, &["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("README.md"), readme).await.unwrap();
+        git(dir, &["add", "."]).await.unwrap();
+        git(dir, &["commit", "-m", "initial commit"]).await.unwrap();
+    }
+
     /// Make commits from inside a worktree possible (identity lives in the
     /// bare clone's common config, shared by all of its worktrees).
     async fn configure_worktree_identity(manager: &ProjectManager, info: &ProjectInfo) {
@@ -1031,6 +1080,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count_lines(&list), 2, "bare repo + 1 worktree");
+    }
+
+    // -----------------------------------------------------------------------
+    // URL → name derivation & collisions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn distinct_urls_with_same_derived_name_do_not_shadow_clone() {
+        // Two different remotes whose basenames derive to the same project
+        // name. Activating the second URL must NOT silently reuse the first
+        // URL's bare clone (and rebrand it): the clone must point at the
+        // requested remote so the worktree contains that repo's history.
+        let remote_a = TempDir::new().unwrap();
+        let remote_b = TempDir::new().unwrap();
+        // Same basename in two sibling dirs → same derived name, real
+        // distinct remotes.
+        let dir_a = remote_a.path().join("widget");
+        let dir_b = remote_b.path().join("widget");
+        init_remote_with_content(&dir_a, "from-A\n").await;
+        init_remote_with_content(&dir_b, "from-B\n").await;
+
+        let store = TempDir::new().unwrap();
+        let manager = ProjectManager::with_root(store.path());
+
+        let url_a = dir_a.display().to_string();
+        let url_b = dir_b.display().to_string();
+
+        let first = manager.activate(&url_a, "sess-1", None).await.unwrap();
+        assert_eq!(first.project.name, "widget");
+
+        // Activating URL B must clone B's repo, not reuse A's. Because the
+        // derived name "widget" is already taken by a different URL, B gets
+        // its own disambiguated name so its clone is separate and complete.
+        let second = manager.activate(&url_b, "sess-2", None).await.unwrap();
+        assert_ne!(
+            second.project.name, first.project.name,
+            "same-derived-name URLs must get distinct project names"
+        );
+        assert_eq!(second.project.name, "widget-1");
+        assert_ne!(
+            second.project.url, first.project.url,
+            "the two URLs must be distinct projects"
+        );
+
+        let wt = Path::new(&second.worktree_path);
+        let readme = tokio::fs::read_to_string(wt.join("README.md")).await.unwrap();
+        assert_eq!(
+            readme.trim(),
+            "from-B",
+            "worktree for URL B must contain B's content, not A's\n{readme}"
+        );
+
+        // Both URLs must be registered distinctly so nothing is shadowed.
+        let projects = manager.list().await.unwrap();
+        assert_eq!(projects.len(), 2, "both distinct projects registered");
+    }
+
+    #[tokio::test]
+    async fn re_activating_same_url_reuses_registered_project() {
+        // `/project <url>` for a URL that is already registered (under its
+        // derived name with the same URL) must reuse that project, not create
+        // a duplicate or a new disambiguated clone.
+        let fx = fixture().await;
+        let first = fx.manager.activate(&fx.remote_url, "sess-1", None).await.unwrap();
+
+        let second = fx.manager.activate(&fx.remote_url, "sess-2", None).await.unwrap();
+        assert_eq!(
+            second.project.name, first.project.name,
+            "same URL reuses the same registered project"
+        );
+        assert_eq!(second.project.url, fx.remote_url);
+
+        // A fresh worktree is created for the new session, but no extra clone
+        // or registry entry appears.
+        let projects = fx.manager.list().await.unwrap();
+        assert_eq!(projects.len(), 1, "still one registered project");
+        assert_ne!(first.worktree_path, second.worktree_path);
     }
 
     // -----------------------------------------------------------------------

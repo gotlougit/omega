@@ -30,6 +30,13 @@ Activates directly, skipping the picker. If the name is already registered the
 existing bare clone is reused (and fetched). Any other input is treated as a
 git URL — the project is registered and cloned on first use.
 
+The project's stored name is derived from the URL's final path segment (e.g.
+`https://github.com/foo/bar.git` → `bar`). If that name is already taken by a
+*different* URL, the new repo is registered under a disambiguated name
+(`bar-1`, `bar-2`, …) so it always gets its own clone — a fresh remote you've
+never seen is always cloneable on first use, even when another project shares
+its basename.
+
 ## How it works
 
 The daemon keeps a project store (default `./projects` relative to the daemon's

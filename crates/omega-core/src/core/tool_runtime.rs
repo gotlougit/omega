@@ -87,4 +87,13 @@ pub trait ToolRuntime: Send + Sync {
     fn is_interactive(&self) -> bool {
         true
     }
+
+    /// Update a custom metadata value on the agent's owning session (in
+    /// memory only, not persisted here).
+    ///
+    /// Tools that change durable session state (e.g. rename a worktree)
+    /// persist it themselves via `session_storage`; this hook keeps the
+    /// agent's in-memory metadata in sync so a later message save does not
+    /// revert the change with a stale value. Default: no-op.
+    fn set_session_meta(&self, _key: &str, _value: serde_json::Value) {}
 }

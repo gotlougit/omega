@@ -52,17 +52,23 @@ async fn wait_for_socket(path: &str) {
 }
 
 /// Read events until one matches `predicate`.
+///
+/// Bounded: each `recv_event` is wrapped in a timeout so a daemon that goes
+/// quiet fails the test quickly instead of hanging the whole suite forever.
 async fn wait_for_event<F>(reader: &mut DaemonReader, predicate: F) -> ServerEvent
 where
     F: Fn(&ServerEvent) -> bool,
 {
     for _ in 0..200 {
-        if let Some(event) = reader.recv_event().await.expect("recv event") {
-            if predicate(&event) {
-                return event;
-            }
-        } else {
-            panic!("daemon closed the connection");
+        let event = match tokio::time::timeout(Duration::from_secs(1), reader.recv_event()).await
+        {
+            Ok(Ok(Some(event))) => event,
+            Ok(Ok(None)) => panic!("daemon closed the connection"),
+            Ok(Err(e)) => panic!("recv event failed: {e}"),
+            Err(_) => panic!("timed out waiting for daemon event"),
+        };
+        if predicate(&event) {
+            return event;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

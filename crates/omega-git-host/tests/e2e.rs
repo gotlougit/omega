@@ -67,6 +67,38 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Persist a session's active-project binding the way omega-loop does after a
+/// rename: JSON metadata under `session_dir/<id>/metadata.json`.
+fn persist_active_binding(session_dir: &Path, session_id: &str, active: &omega_projects::ActiveProject) {
+    let dir = session_dir.join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta = serde_json::json!({
+        "session_id": session_id,
+        "agent_type": "coder",
+        "name": "Coder",
+        "description": "Test agent",
+        "conversation_name": "Fix the thing",
+        "model": "gpt-test",
+        "provider": "openai",
+        "created_at": "2026-08-15T00:00:00Z",
+        "updated_at": "2026-08-16T01:00:00Z",
+        "custom": {
+            "active_project": {
+                "project": {
+                    "name": active.project.name,
+                    "url": active.project.url,
+                    "default_branch": "main",
+                    "created_at": "2026-08-15T00:00:00Z",
+                },
+                "worktree_path": active.worktree_path,
+                "branch": active.branch,
+            }
+        }
+    });
+    std::fs::write(dir.join("metadata.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    std::fs::write(dir.join("history.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+}
+
 /// Spawn the real `omega-git-host` binary against `projects_dir` (and
 /// `session_dir` for the session-backed refs page).
 /// `kill_on_drop` ensures the server dies even if a test panics.
@@ -451,6 +483,62 @@ async fn repo_pages_render_and_refs_link_worktrees_to_sessions() {
     // Unknown project → 404.
     let body = http_get(port, "/nope/").await;
     assert!(body.contains("404 Not Found"), "unknown project:\n{body}");
+
+    drop(server);
+}
+
+/// After a worktree rename, the web UI (summary + refs) must reflect the NEW
+/// branch and keep the chat session linked — never the orphaned old one.
+#[tokio::test]
+async fn worktree_rename_is_reflected_in_summary_and_refs() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+
+    // Build the store with ProjectManager, exactly like omega-loop does.
+    let source_root = TempDir::new().unwrap();
+    let source = source_root.path().join("my-project");
+    std::fs::create_dir_all(&source).unwrap();
+    init_source_repo(&source).await;
+    let manager = omega_projects::ProjectManager::with_root(store.path());
+    let active = manager
+        .activate(source.to_str().unwrap(), "sess-123", None)
+        .await
+        .unwrap();
+    let old_branch = active.branch.clone();
+    persist_active_binding(sessions.path(), "sess-123", &active);
+
+    let port = free_port();
+    let server = spawn_server(store.path(), sessions.path(), port).await;
+    wait_for_server(port).await;
+
+    // Pre-rename: old branch shown + linked to chat.
+    let body = http_get(port, &format!("/{}/refs", active.project.name)).await;
+    assert!(body.contains(&escaped_url(&old_branch)), "pre-rename refs:\n{body}");
+    assert!(body.contains("/sessions/sess-123"), "pre-rename refs:\n{body}");
+
+    // Simulate the omega-loop rename tool: rename_worktree + persist metadata.
+    let renamed = manager
+        .rename_worktree(&active, "fix-the-thing")
+        .await
+        .expect("rename");
+    persist_active_binding(sessions.path(), "sess-123", &renamed);
+
+    // Post-rename: refs must show the NEW branch, still linked to the chat,
+    // and must NOT reference the old (now gone) branch.
+    let body = http_get(port, &format!("/{}/refs", active.project.name)).await;
+    assert!(body.contains(&escaped_url(&renamed.branch)), "post-rename refs:\n{body}");
+    assert!(body.contains("/sessions/sess-123"), "post-rename refs:\n{body}");
+    assert!(!body.contains(&escaped_url(&old_branch)), "old branch leaked:\n{body}");
+
+    // Summary page likewise.
+    let body = http_get(port, &format!("/{}/", active.project.name)).await;
+    assert!(body.contains(&escaped_url(&renamed.branch)), "post-rename summary:\n{body}");
+    assert!(body.contains("/sessions/sess-123"), "post-rename summary:\n{body}");
+    assert!(!body.contains(&escaped_url(&old_branch)), "old branch in summary:\n{body}");
+
+    // The session transcript still opens.
+    let body = http_get(port, "/sessions/sess-123").await;
+    assert!(body.contains("200 OK"), "session:\n{body}");
 
     drop(server);
 }

@@ -265,9 +265,22 @@ impl SessionStorage {
     /// creations: metadata written, but the agent never produced a message).
     /// Returns the ids of the removed sessions. Harmless no-op when the store
     /// is clean.
+    ///
+    /// Sessions bound to a project (`custom["active_project"]`) are never
+    /// pruned: they own a deliberate git worktree and are live even before
+    /// the agent produces a message (e.g. `/project` without a chat yet).
+    /// Pruning them on restart would silently destroy a worktree binding the
+    /// web UI and session resume rely on.
     pub fn prune_empty_sessions(&self) -> FrameworkResult<Vec<String>> {
         let mut removed = Vec::new();
         for session_id in self.list_sessions()? {
+            let has_project_binding = self
+                .load_metadata(&session_id)
+                .map(|m| m.get_custom("active_project").is_some())
+                .unwrap_or(false);
+            if has_project_binding {
+                continue;
+            }
             let empty = match fs::read_to_string(self.history_path(&session_id)) {
                 Ok(raw) => raw.lines().all(|l| l.trim().is_empty()),
                 Err(_) => true,

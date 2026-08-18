@@ -481,6 +481,13 @@ impl Tool for RenameWorktreeTool {
             .await
             .insert(self.session_id.clone(), renamed.clone());
         persist_active_project(&self.session_storage, &self.session_id, &renamed);
+        // Keep the running agent's in-memory metadata in sync with what we
+        // just persisted. Otherwise the next message the agent emits re-saves
+        // its (stale) pre-rename binding over the new one, and the web UI
+        // keeps showing the old worktree/branch.
+        if let Ok(value) = serde_json::to_value(&renamed) {
+            rt.set_session_meta(META_ACTIVE_PROJECT, value);
+        }
 
         let _ = self.event_tx.send(ServerEvent::ProjectActive {
             project: renamed.project.clone(),
@@ -1143,7 +1150,7 @@ async fn handle_connection(
                     let mut sessions_lock = sessions.lock().await;
                     if !sessions_lock.contains_key(&session_id) {
                         // Load existing session from disk
-                        let agent_session = match crate::session::AgentSession::load_with_storage(
+                        let mut agent_session = match crate::session::AgentSession::load_with_storage(
                             &session_id,
                             SessionStorage::with_dir("./sessions"),
                         ) {
@@ -1168,9 +1175,11 @@ async fn handle_connection(
                         )
                         .await;
                         if let Some(active) = &active {
-                            let mut meta = agent_session.metadata.clone();
-                            save_active_to_metadata(&mut meta, active);
-                            if let Err(e) = session_storage.save_metadata(&meta) {
+                            // Update both the in-memory AND persisted metadata so
+                            // a later message save doesn't revert the binding to
+                            // the stale value read before reconciliation.
+                            save_active_to_metadata(&mut agent_session.metadata, active);
+                            if let Err(e) = session_storage.save_metadata(&agent_session.metadata) {
                                 tracing::warn!(%session_id, "resume save project metadata: {e}");
                             }
                         }
@@ -1289,7 +1298,7 @@ async fn handle_connection(
                     &session_id,
                     SessionStorage::with_dir("./sessions"),
                 ) {
-                    Ok(agent_session) => {
+                    Ok(mut agent_session) => {
                         // Keep the project binding across the compact.
                         let persisted = active_from_metadata(&agent_session.metadata);
                         let active = resolve_project_context(
@@ -1300,9 +1309,11 @@ async fn handle_connection(
                         )
                         .await;
                         if let Some(active) = &active {
-                            let mut meta = agent_session.metadata.clone();
-                            save_active_to_metadata(&mut meta, active);
-                            if let Err(e) = session_storage.save_metadata(&meta) {
+                            // Update both the in-memory AND persisted metadata so
+                            // a later message save doesn't revert the binding to
+                            // the stale value read before reconciliation.
+                            save_active_to_metadata(&mut agent_session.metadata, active);
+                            if let Err(e) = session_storage.save_metadata(&agent_session.metadata) {
                                 tracing::warn!(%session_id, "compact save project metadata: {e}");
                             }
                         }
@@ -1878,6 +1889,98 @@ mod tests {
             }
             other => panic!("expected ProjectActive, got {other:?}"),
         }
+    }
+
+    /// Regression: the running agent's in-memory metadata holds the pre-rename
+    /// binding. The rename tool persists the new binding to disk AND syncs the
+    /// in-memory metadata (via the runtime); a subsequent message save must
+    /// NOT revert the persisted binding to the stale pre-rename one — otherwise
+    /// the web UI keeps showing the old worktree/branch and can't open the chat.
+    #[tokio::test]
+    async fn rename_worktree_tool_survives_later_message_saves() {
+        let base = TempDir::new().unwrap();
+        let projects = ProjectManager::with_root(base.path().join("store"));
+        let active = projects
+            .activate(&init_remote_repo().await, "sess-1", None)
+            .await
+            .unwrap();
+
+        let session_projects: Arc<Mutex<HashMap<String, ActiveProject>>> = Arc::new(Mutex::new(
+            HashMap::from([("sess-1".to_string(), active.clone())]),
+        ));
+        let storage = Arc::new(crate::session::SessionStorage::with_dir(
+            base.path().join("sessions"),
+        ));
+
+        // Real agent session whose in-memory metadata holds the PRE-rename
+        // binding — exactly what the daemon stores at create_session.
+        let mut session = AgentSession::new_with_storage(
+            "sess-1",
+            "omega",
+            "omega-tui",
+            "A coding agent",
+            "system prompt",
+            (*storage).clone(),
+        )
+        .unwrap();
+        save_active_to_metadata(&mut session.metadata, &active);
+        storage.save_metadata(&session.metadata).unwrap();
+        let session = Arc::new(tokio::sync::RwLock::new(session));
+
+        // A runtime mirroring AgentInternals: set_session_meta keeps the
+        // in-memory agent session metadata in sync with the rename.
+        struct SessionMetaRuntime {
+            session: Arc<tokio::sync::RwLock<AgentSession>>,
+        }
+        impl ToolRuntime for SessionMetaRuntime {
+            fn send_output(&self, _chunk: OutputChunk) {}
+            fn is_interrupted(&self) -> bool {
+                false
+            }
+            fn set_session_meta(&self, key: &str, value: serde_json::Value) {
+                if let Ok(mut s) = self.session.try_write() {
+                    s.set_custom(key, value);
+                }
+            }
+        }
+
+        let (tx, _) = broadcast::channel(16);
+        let tool = RenameWorktreeTool {
+            projects: Arc::new(projects),
+            session_id: "sess-1".to_string(),
+            session_projects: session_projects.clone(),
+            session_storage: storage.clone(),
+            event_tx: tx,
+        };
+        let mut rt = SessionMetaRuntime {
+            session: session.clone(),
+        };
+        let result = tool
+            .execute(&serde_json::json!({ "name": "fix-tui-crash" }), &mut rt)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "rename failed: {:?}", result.content);
+
+        // The agent emits a message right after the tool (as the loop does), so
+        // its in-memory metadata would be re-saved to disk. This must preserve
+        // the renamed branch, not clobber it with the stale pre-rename value.
+        session
+            .write()
+            .await
+            .add_message(Message::assistant("done"))
+            .unwrap();
+
+        let persisted = active_from_metadata(&storage.load_metadata("sess-1").unwrap())
+            .expect("active project persisted");
+        assert_eq!(
+            persisted.branch, "omega/fix-tui-crash",
+            "a later message save must not clobber the renamed branch"
+        );
+        assert!(
+            !persisted.worktree_path.contains("sess-1"),
+            "persisted worktree must be the renamed one, got: {}",
+            persisted.worktree_path
+        );
     }
 
     #[tokio::test]
