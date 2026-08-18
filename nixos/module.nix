@@ -100,8 +100,7 @@ let
       // (
         if r.extraSystemPrompt != "" then
           {
-            system_prompt =
-              r.systemPrompt + "\n\n" + r.extraSystemPrompt;
+            system_prompt = r.systemPrompt + "\n\n" + r.extraSystemPrompt;
           }
         else
           {
@@ -193,7 +192,8 @@ let
   '';
 
   # Parse a duration string ("6h", "30m", "45s", "3600", "1d") to seconds.
-  parseInterval = interval:
+  parseInterval =
+    interval:
     let
       m = builtins.match "([0-9]+)([smhd])?" interval;
     in
@@ -203,12 +203,14 @@ let
       let
         n = builtins.fromJSON (builtins.head m);
         unit = if builtins.length m > 1 && builtins.elemAt m 1 != "" then builtins.elemAt m 1 else "s";
-        mult = {
-          s = 1;
-          m = 60;
-          h = 3600;
-          d = 86400;
-        }.${unit};
+        mult =
+          {
+            s = 1;
+            m = 60;
+            h = 3600;
+            d = 86400;
+          }
+          .${unit};
       in
       n * mult;
 
@@ -354,40 +356,42 @@ in
     };
 
     roles = mkOption {
-      type = types.listOf (types.submodule {
-        options = {
-          name = mkOption {
-            type = types.str;
-            example = "reverseengineer";
-            description = ''
-              The role's name.  In the TUI this becomes a slash command:
-              `/<name> <prompt>` starts a brand-new session using this
-              role's system prompt, with `<prompt>` as its first input.
-            '';
-          };
+      type = types.listOf (
+        types.submodule {
+          options = {
+            name = mkOption {
+              type = types.str;
+              example = "reverseengineer";
+              description = ''
+                The role's name.  In the TUI this becomes a slash command:
+                `/<name> <prompt>` starts a brand-new session using this
+                role's system prompt, with `<prompt>` as its first input.
+              '';
+            };
 
-          systemPrompt = mkOption {
-            type = types.str;
-            default = "";
-            description = ''
-              The role's system prompt — the alternative instructions the
-              agent uses for sessions started with this role.  For example,
-              a "reverseengineer" role could carry detailed guidance on how
-              you want the agent to approach reverse-engineering work.
-            '';
-          };
+            systemPrompt = mkOption {
+              type = types.str;
+              default = "";
+              description = ''
+                The role's system prompt — the alternative instructions the
+                agent uses for sessions started with this role.  For example,
+                a "reverseengineer" role could carry detailed guidance on how
+                you want the agent to approach reverse-engineering work.
+              '';
+            };
 
-          extraSystemPrompt = mkOption {
-            type = types.str;
-            default = "";
-            description = ''
-              Extra text appended to `systemPrompt` for this role (a blank
-              line is added first).  Useful for appending role-specific
-              instructions while keeping the main prompt elsewhere.
-            '';
+            extraSystemPrompt = mkOption {
+              type = types.str;
+              default = "";
+              description = ''
+                Extra text appended to `systemPrompt` for this role (a blank
+                line is added first).  Useful for appending role-specific
+                instructions while keeping the main prompt elsewhere.
+              '';
+            };
           };
-        };
-      });
+        }
+      );
       default = [ ];
       example = lib.literalExpression ''
         [
@@ -456,7 +460,10 @@ in
           projects = mkOption {
             type = types.listOf types.str;
             default = [ ];
-            example = [ "omega" "pi-omega" ];
+            example = [
+              "omega"
+              "pi-omega"
+            ];
             description = ''
               Projects (by registered name) to keep rebased on upstream
               automatically.  The web UI can also enable/disable projects
@@ -780,61 +787,63 @@ in
         '';
       };
 
-    # omega-git-host — read-only git forge + web UI (Phase 5: NixOS service)
-    systemd.services.omega-git-host = mkIf cfg.gitHost.enable {
-      description = "Omega-git-host (read-only git forge + web UI)";
-      after = [
-        "network.target"
-        "omega-loop.service"
-      ];
-      # `wants`, not `requires`: the forge is a read-only view over the store
-      # dirs and must keep serving even if the daemon is down or restarts.
-      wants = [ "omega-loop.service" ];
-      wantedBy = [ "multi-user.target" ];
-      # Unlike the NixOS systemd default PATH, make git (and the user's extra
-      # packages) available: every page and the smart-HTTP backend shells out
-      # to `git` — without this, log/refs/tree/blob/commit pages and `git
-      # clone` all fail in production.
-      path = with pkgs; [ git ] ++ cfg.packages;
+      # omega-git-host — read-only git forge + web UI (Phase 5: NixOS service)
+      systemd.services.omega-git-host = mkIf cfg.gitHost.enable {
+        description = "Omega-git-host (read-only git forge + web UI)";
+        after = [
+          "network.target"
+          "omega-loop.service"
+        ];
+        # `wants`, not `requires`: the forge is a read-only view over the store
+        # dirs and must keep serving even if the daemon is down or restarts.
+        wants = [ "omega-loop.service" ];
+        wantedBy = [ "multi-user.target" ];
+        # Unlike the NixOS systemd default PATH, make git (and the user's extra
+        # packages) available: every page and the smart-HTTP backend shells out
+        # to `git` — without this, log/refs/tree/blob/commit pages and `git
+        # clone` all fail in production.
+        path = with pkgs; [ git ] ++ cfg.packages;
 
-      serviceConfig = {
-        User = clankerUser;
-        Group = clankerGroup;
+        serviceConfig = {
+          User = clankerUser;
+          Group = clankerGroup;
 
-        Type = "simple";
-        ExecStart = "${cfg.package}/bin/omega-git-host";
-        Restart = "on-failure";
-        RestartSec = "5s";
+          Type = "simple";
+          ExecStart = "${cfg.package}/bin/omega-git-host";
+          Restart = "on-failure";
+          RestartSec = "5s";
 
-        Environment = [
-          "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
-          "OMEGA_SOCKET_PATH=${omegaShSocket}"
-          "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
-          "OMEGA_ROLES_PATH=${rolesPath}"
-          "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
-          "OMEGA_SESSION_DIR=${cfg.sessionDir}"
-          "OMEGA_GIT_HOST_LISTEN=${cfg.gitHost.listenAddress}"
-          "OMEGA_GIT_HOST_PORT=${toString cfg.gitHost.port}"
-          "RUST_LOG=${cfg.logLevel}"
-        ]
-        ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}";
+          Environment = [
+            "OMEGA_LOOP_SOCKET_PATH=${omegaLoopSocket}"
+            "OMEGA_SOCKET_PATH=${omegaShSocket}"
+            "OMEGA_SYSTEM_PROMPT_PATH=${systemPromptPath}"
+            "OMEGA_ROLES_PATH=${rolesPath}"
+            "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
+            "OMEGA_SESSION_DIR=${cfg.sessionDir}"
+            "OMEGA_GIT_HOST_LISTEN=${cfg.gitHost.listenAddress}"
+            "OMEGA_GIT_HOST_PORT=${toString cfg.gitHost.port}"
+            "RUST_LOG=${cfg.logLevel}"
+          ]
+          ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}";
 
-        # Security hardening — the forge serves read-only views of the store,
-        # but the "rebase" page is the imperative control panel for the cron,
-        # so exactly the state file + run-now marker are writable (ReadWritePaths
-        # takes precedence over the ReadOnlyPaths below for these two paths).
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ProtectHome = false; # needs to read the project store + sessions
-        ReadWritePaths = [ clankerHome ]
+          # Security hardening — the forge serves read-only views of the store,
+          # but the "rebase" page is the imperative control panel for the cron,
+          # so exactly the state file + run-now marker are writable (ReadWritePaths
+          # takes precedence over the ReadOnlyPaths below for these two paths).
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = false; # needs to read the project store + sessions
+          ReadWritePaths = [
+            clankerHome
+          ]
           ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-job.json"
           ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-now";
 
-        RuntimeDirectory = "omega";
-        RuntimeDirectoryMode = "0770";
+          RuntimeDirectory = "omega";
+          RuntimeDirectoryMode = "0770";
+        };
       };
-    };
 
       # ----- omega binaries on the system ---------------------------------
       environment.systemPackages = [
