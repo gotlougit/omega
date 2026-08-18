@@ -131,6 +131,14 @@
           background: rgba(0, 0, 0, 0.03);
           border-radius: 0.25rem;
         }
+
+        // Live stream: the running tool's progress line (replaced by the
+        // final result pane when the tool ends).
+        pre.tool-progress {
+          color: $gray-600;
+          font-style: italic;
+          margin-bottom: 0;
+        }
       }
     }
   }

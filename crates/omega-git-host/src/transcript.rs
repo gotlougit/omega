@@ -33,8 +33,9 @@ use serde_json::Value;
 use crate::templates::html_escape;
 
 /// Cap on how much of a tool result (or any block) we render, to keep pages
-/// bounded even when a tool dumps megabytes.
-const MAX_BLOCK_RENDER: usize = 10_000;
+/// bounded even when a tool dumps megabytes. Shared with the live chat SSE
+/// stream, which sends the same truncated result to the browser.
+pub(crate) const MAX_BLOCK_RENDER: usize = 10_000;
 /// Cap on messages rendered per session page.
 pub const MAX_MESSAGES: usize = 500;
 /// Length of the one-line tool-result preview shown in the tools summary.
@@ -280,7 +281,10 @@ fn render_result(content: &Option<Value>) -> String {
 }
 
 /// One-line, whitespace-collapsed preview of a tool result.
-fn preview_of(result: &str, is_error: bool) -> String {
+///
+/// `pub(crate)`: the live chat SSE stream uses it too, so the running tool
+/// summary shown in the browser matches the persisted transcript exactly.
+pub(crate) fn preview_of(result: &str, is_error: bool) -> String {
     let mut preview: String = result
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
@@ -306,7 +310,10 @@ fn pretty_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
-fn truncate(s: &str) -> String {
+/// Truncate `s` to at most [`MAX_BLOCK_RENDER`] chars, marking cuts.
+///
+/// `pub(crate)`: reused by the live chat SSE stream for tool results.
+pub(crate) fn truncate(s: &str) -> String {
     let mut out: String = s.chars().take(MAX_BLOCK_RENDER).collect();
     if s.chars().count() > MAX_BLOCK_RENDER {
         out.push_str("\n… (truncated)");

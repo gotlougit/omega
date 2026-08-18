@@ -97,6 +97,9 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/static/main.css", get(css))
+        // Live chat client (see assets/live.js): renders the SSE stream into
+        // the same per-message layout the server-rendered transcript uses.
+        .route("/static/live.js", get(live_js))
         // Project lifecycle (web control panel).
         .route("/projects/create", post(pages::project_create))
         .route("/projects/delete", post(pages::project_delete))
@@ -210,6 +213,18 @@ async fn css() -> Response {
         .header(header::CONTENT_TYPE, "text/css; charset=utf-8")
         .header("cache-control", "public, max-age=3600")
         .body(Body::from(style::MAIN_CSS))
+        .unwrap()
+}
+
+/// The live chat client script (escape-first markdown + SSE state machine).
+static LIVE_JS: &str = include_str!("../assets/live.js");
+
+async fn live_js() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+        .header("cache-control", "public, max-age=3600")
+        .body(Body::from(LIVE_JS))
         .unwrap()
 }
 

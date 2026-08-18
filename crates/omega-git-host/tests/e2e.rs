@@ -935,9 +935,10 @@ async fn http_get_stream_head(port: u16, path: &str) -> String {
             Err(_) => break,
         }
         let text = String::from_utf8_lossy(&all);
-        // Keep reading until the mock's text delta (or an error frame) lands;
-        // the first "data:" (a cleared marker) arrives before the delta.
-        if text.contains("world") || text.contains("\"error\"") {
+        // Keep reading until the mock's tool_end frame (or an error frame)
+        // lands; the first "data:" (a cleared marker) arrives before the
+        // chunks.
+        if text.contains("tool_end") || text.contains("\"error\"") {
             break;
         }
     }
@@ -980,8 +981,28 @@ async fn spawn_mock_daemon(socket: &Path) {
                             out += &format!(
                                 "{{\"type\":\"HistoryMessage\",\"session_id\":\"{sid}\",\"role\":\"user\",\"content\":\"hello\"}}\n"
                             );
+                            // A realistic in-flight turn: thinking, text, and a
+                            // tool call with progress + result, ending in Done.
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"ThinkingDelta\":\"hmm, \"}}}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"ThinkingComplete\":\"hmm, let me check\"}}}}\n"
+                            );
                             out += &format!(
                                 "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"TextDelta\":\"world\"}}}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"ToolStart\":{{\"id\":\"call_1\",\"name\":\"Bash\",\"input\":{{\"command\":\"ls\"}}}}}}}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"ToolProgress\":{{\"id\":\"call_1\",\"output\":\"reading…\"}}}}}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":{{\"ToolEnd\":{{\"id\":\"call_1\",\"name\":\"Bash\",\"input\":{{\"command\":\"ls\"}},\"result\":{{\"content\":{{\"Text\":\"file1\\nfile2\"}},\"is_error\":false}}}}}}}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"Chunk\",\"session_id\":\"{sid}\",\"chunk\":\"Done\"}}\n"
                             );
                         }
                         "run" | "message" => {
@@ -1050,7 +1071,9 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
         "redirect to live chat: {location}"
     );
 
-    // The live chat page renders with a message box + interrupt + stream url.
+    // The live chat page renders with the message box + interrupt + stream
+    // url, and loads the shared client that renders live turns with the same
+    // per-message layout as the persisted transcript.
     let body = http_get(port, "/sessions/web-chat-1/live").await;
     assert!(body.contains("200 OK"), "live page:\n{body}");
     assert!(body.contains("Send a message"), "live page:\n{body}");
@@ -1059,15 +1082,54 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
         body.contains("/sessions/web-chat-1/stream"),
         "live page streams:\n{body}"
     );
+    assert!(
+        body.contains("/static/live.js"),
+        "live page loads the client:\n{body}"
+    );
+    assert!(
+        body.contains("id=\"live-conversation\""),
+        "live page has the shared conversation container:\n{body}"
+    );
+    // The persisted transcript is server-rendered *inside* the live
+    // container too (one code path for past and future messages)…
+    assert!(
+        body.contains("please add a feature"),
+        "live page renders the persisted transcript:\n{body}"
+    );
 
-    // The SSE stream opens: 200, event-stream, and the mock daemon's text
-    // delta reaches the browser as an SSE frame.
+    // The SSE stream opens: 200, event-stream, and the mock daemon's turn
+    // arrives as *structured* frames (text + thinking + tool call) — the raw
+    // input the client folds into one assistant message, like the transcript
+    // assembler does server-side.
     let head = http_get_stream_head(port, "/sessions/web-chat-1/stream").await;
     assert!(
         head.contains("200 OK") && head.contains("text/event-stream"),
         "stream head:\n{head}"
     );
-    assert!(head.contains("world"), "stream should carry the delta:\n{head}");
+    assert!(
+        head.contains("\"type\":\"text\"") && head.contains("world"),
+        "text delta frame:\n{head}"
+    );
+    assert!(
+        head.contains("\"type\":\"thinking\""),
+        "thinking frames:\n{head}"
+    );
+    assert!(
+        head.contains("\"type\":\"thinking_complete\""),
+        "thinking complete frame:\n{head}"
+    );
+    assert!(
+        head.contains("\"type\":\"tool_start\"") && head.contains("\"name\":\"Bash\""),
+        "tool start frame:\n{head}"
+    );
+    assert!(
+        head.contains("\"type\":\"tool_end\"") && head.contains("\"preview\":\"file1 file2\""),
+        "tool end frame with server-computed preview:\n{head}"
+    );
+    assert!(
+        head.contains("\"type\":\"done\""),
+        "done frame:\n{head}"
+    );
 
     // Send a chat message → the web forwards run to the daemon and redirects.
     let resp = http_post_form(
