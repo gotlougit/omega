@@ -172,8 +172,34 @@ with sockets in `/run/omega/`. Enable it with:
   services.omega.humanUsers = [ "alice" ];
   # Optional: extra tools for the agent (added to the clanker user's PATH).
   services.omega.packages = [ pkgs.ffmpeg ];
+  # Optional: git identity for commits the agent makes (defaults shown).
+  # services.omega.gitUserName = "Clanker";
+  # services.omega.gitUserEmail = "clanker@example.com";
 }
 ```
+
+### Default git identity
+
+The agent makes commits on your behalf (project work, upstream-rebase fixes,
+...), so the clanker user needs a git identity.  It ships with a sensible
+one out of the box:
+
+- `services.omega.gitUserName` (default `"Clanker"`)
+- `services.omega.gitUserEmail` (default `"clanker@example.com"`)
+
+Both default to null-able strings — set either to `null` to disable it and
+let git fall back to its own global/elsewhere identity instead.
+
+How the identity lands in git's config depends on whether home-manager is
+in use for the clanker user (see below):
+
+- **Without home-manager** (the default): the identity is written to
+  `${homeDir}/.gitconfig` at activation time, as the clanker user.
+- **With `services.omega.homeManager.enable = true`**: it is injected into
+  home-manager's `programs.git` (enabled automatically).  An explicit
+  `homeManager.config.programs.git.userName`/`userEmail` (or
+  `homeManager.config.programs.git.enable = false`) always wins over these
+globals.
 
 ### Roles — specialised system prompts
 
@@ -211,13 +237,17 @@ the TUI with `/roles`.
 The module can also wire up [home-manager](https://github.com/nix-community/home-manager)
 for the clanker user (disabled by default), so user-scoped configuration
 such as git identity, ssh-agent, or shell setup can be written inline and
-kept together with the rest of the omega configuration:
+kept together with the rest of the omega configuration.  Setting
+`services.omega.gitUserName`/`gitUserEmail` automatically enables
+home-manager's `programs.git` for the user; anything you set explicitly in
+`config.programs.git` takes precedence over those defaults:
 
 ```nix
 {
   services.omega.homeManager = {
     enable = true;
     config = {
+      # gitUserName/gitUserEmail provide the defaults; these override them:
       programs.git = {
         enable = true;
         userName = "Clanker";

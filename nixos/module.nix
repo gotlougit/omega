@@ -191,6 +191,10 @@ let
     The user can also ask you directly to rebase at any time; treat that the same way.
   '';
 
+  # Shell single-quote escaping — `'` becomes `'\''` so arbitrary git
+  # identity values survive interpolation into an activation script.
+  shq = s: "'" + (builtins.replaceStrings [ "'" ] [ "'\\''" ] s) + "'";
+
   # Parse a duration string ("6h", "30m", "45s", "3600", "1d") to seconds.
   parseInterval =
     interval:
@@ -270,6 +274,39 @@ in
         "kvm"
       ];
       description = "Additional groups to add the clanker user to.";
+    };
+
+    gitUserName = mkOption {
+      type = types.nullOr types.str;
+      default = "Clanker";
+      example = "Clanker";
+      description = ''
+        Default git user.name for the ${clankerUser} user — the identity the
+        agent uses for commits it makes on the user's behalf (rebase fixes,
+        project work, ...).
+
+        When `services.omega.homeManager.enable` is true this is injected
+        into home-manager's `programs.git` (an explicit
+        `homeManager.config.programs.git.userName` still wins).  Otherwise it
+        is written to ${clankerHome}/.gitconfig at activation time.  Git
+        falls back to a global/elsewhere identity if this is left null — make
+        sure /etc/gitconfig or the shell environment provides one, or commits
+        will fail with "Please tell me who you are".
+      '';
+    };
+
+    gitUserEmail = mkOption {
+      type = types.nullOr types.str;
+      default = "clanker@example.com";
+      example = "clanker@example.com";
+      description = ''
+        Default git user.email for the ${clankerUser} user — the identity the
+        agent uses for commits it makes on the user's behalf.  Wired up the
+        same way as `gitUserName`: via home-manager's `programs.git` when
+        `services.omega.homeManager.enable` is true (an explicit
+        `homeManager.config.programs.git.userEmail` wins), otherwise written
+        to ${clankerHome}/.gitconfig at activation time.
+      '';
     };
 
     packages = mkOption {
@@ -853,6 +890,22 @@ in
       # ----- allow clanker to use nix build etc. ---------------------------
       nix.settings.trusted-users = [ clankerUser ];
 
+      # ----- default git identity ------------------------------------------
+      # When home-manager is not in charge of the clanker user's ~/.gitconfig,
+      # write the configured identity directly.  `git config --file` keeps
+      # this independent of $HOME and lets us re-run it idempotently on every
+      # activation (--replace-all adds missing keys / replaces duplicates).
+      # Skipped when home-manager is enabled — its programs.git module already
+      # generates ~/.gitconfig (including the identity injected below).
+      system.activationScripts.omegaGitIdentity = lib.stringAfter [ "users" ] ''
+        ${lib.optionalString (!cfg.homeManager.enable && cfg.gitUserName != null) ''
+          ${pkgs.util-linux}/bin/runuser -u ${clankerUser} -- ${pkgs.git}/bin/git config --file ${clankerHome}/.gitconfig --replace-all user.name ${shq cfg.gitUserName}
+        ''}
+        ${lib.optionalString (!cfg.homeManager.enable && cfg.gitUserEmail != null) ''
+          ${pkgs.util-linux}/bin/runuser -u ${clankerUser} -- ${pkgs.git}/bin/git config --file ${clankerHome}/.gitconfig --replace-all user.email ${shq cfg.gitUserEmail}
+        ''}
+      '';
+
     }
     // optionalAttrs (home-manager != null) {
       # ----- optional home-manager for the clanker user -------------------
@@ -874,6 +927,17 @@ in
             };
           }
           cfg.homeManager.config
+          # Default git identity from services.omega.gitUserName/gitUserEmail.
+          # mkDefault so an explicit homeManager.config.programs.git setting
+          # (including `enable = false`) always wins.  Setting either identity
+          # option enables home-manager's programs.git automatically.
+          (mkIf (cfg.gitUserName != null || cfg.gitUserEmail != null) {
+            programs.git = {
+              enable = mkDefault true;
+              userName = mkDefault cfg.gitUserName;
+              userEmail = mkDefault cfg.gitUserEmail;
+            };
+          })
         ];
       };
     }
