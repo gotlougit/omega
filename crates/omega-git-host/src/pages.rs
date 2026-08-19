@@ -794,19 +794,60 @@ pub async fn session_stream(State(_state): State<AppState>, Path(id): Path<Strin
 }
 
 /// Convert a daemon event into one or more SSE JSON payloads for the live
-/// pane.
+/// chat page.
+///
+/// The payloads mirror the [`transcript::DisplayMessage`] model the
+/// read-only session page is built from (body text, thinking trace, tool
+/// calls), so the client-side renderer can build the *same* per-message
+/// layout the server-rendered transcript uses — one assistant block with its
+/// own thinking `<details>` and tool `<details>`, instead of a single
+/// undifferentiated text dump. Tool events (previously dropped!) are
+/// forwarded so live tool calls show up exactly like persisted ones.
 fn sse_payloads(event: &ServerEvent) -> Vec<Value> {
     match event {
         ServerEvent::Chunk { chunk, .. } => match chunk {
-            OutputChunk::TextDelta(t) | OutputChunk::TextComplete(t) => {
-                vec![json!({ "type": "text", "text": t })]
+            OutputChunk::TextDelta(t) => vec![json!({ "type": "text", "text": t })],
+            // Carries the authoritative full text block (empty when the
+            // deltas already covered it, e.g. joined at block start).
+            OutputChunk::TextComplete(t) => {
+                vec![json!({ "type": "text_complete", "text": t })]
             }
-            OutputChunk::ThinkingDelta(t) | OutputChunk::ThinkingComplete(t) => {
-                vec![json!({ "type": "thinking", "text": t })]
+            OutputChunk::ThinkingDelta(t) => vec![json!({ "type": "thinking", "text": t })],
+            OutputChunk::ThinkingComplete(t) => {
+                vec![json!({ "type": "thinking_complete", "text": t })]
+            }
+            OutputChunk::ToolStart { id, name, input } => {
+                vec![json!({ "type": "tool_start", "id": id, "name": name, "input": input })]
+            }
+            OutputChunk::ToolProgress { id, output } => {
+                vec![json!({ "type": "tool_progress", "id": id, "output": output })]
+            }
+            OutputChunk::ToolEnd {
+                id,
+                name,
+                input,
+                result,
+            } => {
+                // Send the same truncated result + one-line preview the
+                // persisted transcript renders, so live and saved tool calls
+                // look identical (and the browser never renders megabytes).
+                let text = transcript::truncate(&result.text);
+                let preview = transcript::preview_of(&text, result.is_error);
+                vec![json!({
+                    "type": "tool_end",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                    "result": text,
+                    "is_error": result.is_error,
+                    "preview": preview,
+                })]
             }
             OutputChunk::Status(s) => vec![json!({ "type": "status", "message": s })],
             OutputChunk::Error(e) => vec![json!({ "type": "error", "message": e })],
             OutputChunk::Done => vec![json!({ "type": "done" })],
+            // Cache telemetry, permission requests, and unknown chunks carry
+            // no chat content — the live pane has no cache bar (yet).
             _ => vec![],
         },
         ServerEvent::SystemMsg(msg) => vec![json!({ "type": "status", "message": msg })],
@@ -1273,5 +1314,127 @@ fn render(state: AppState, template: &str, ctx: Value) -> Response {
             tracing::error!(template, error = %format!("{e:#}"), "template render failed");
             text_response(StatusCode::INTERNAL_SERVER_ERROR, "template error\n")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omega_loop_client::OutputChunk;
+
+    /// Build a `ServerEvent::Chunk` for the given chunk (session id is
+    /// irrelevant to `sse_payloads`).
+    fn chunk(c: OutputChunk) -> ServerEvent {
+        ServerEvent::Chunk {
+            session_id: "sess".to_string(),
+            chunk: c,
+        }
+    }
+
+    #[test]
+    fn text_deltas_and_complete_are_distinct_events() {
+        let payloads = sse_payloads(&chunk(OutputChunk::TextDelta("hel".into())));
+        assert_eq!(payloads[0]["type"], "text");
+        assert_eq!(payloads[0]["text"], "hel");
+        let payloads = sse_payloads(&chunk(OutputChunk::TextComplete("hello".into())));
+        assert_eq!(payloads[0]["type"], "text_complete");
+        assert_eq!(payloads[0]["text"], "hello");
+    }
+
+    #[test]
+    fn thinking_maps_to_thinking_events() {
+        let payloads = sse_payloads(&chunk(OutputChunk::ThinkingDelta("hmm".into())));
+        assert_eq!(payloads[0]["type"], "thinking");
+        let payloads = sse_payloads(&chunk(OutputChunk::ThinkingComplete("hmm".into())));
+        assert_eq!(payloads[0]["type"], "thinking_complete");
+    }
+
+    #[test]
+    fn tools_are_forwarded_with_preview_and_truncated_result() {
+        let big = "x".repeat(transcript::MAX_BLOCK_RENDER + 50);
+        let input = serde_json::json!({ "command": "ls" });
+        let start = sse_payloads(&chunk(OutputChunk::ToolStart {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: input.clone(),
+        }));
+        assert_eq!(start[0]["type"], "tool_start");
+        assert_eq!(start[0]["id"], "t1");
+        assert_eq!(start[0]["name"], "Bash");
+        assert_eq!(start[0]["input"]["command"], "ls");
+
+        let progress = sse_payloads(&chunk(OutputChunk::ToolProgress {
+            id: "t1".into(),
+            output: "building\ncompiling".into(),
+        }));
+        assert_eq!(progress[0]["type"], "tool_progress");
+        assert_eq!(progress[0]["output"], "building\ncompiling");
+
+        let end = sse_payloads(&chunk(OutputChunk::ToolEnd {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input,
+            result: omega_loop_client::ToolResultWire {
+                text: big.clone(),
+                is_error: false,
+                content: None,
+            },
+        }));
+        assert_eq!(end[0]["type"], "tool_end");
+        assert_eq!(end[0]["is_error"], false);
+        assert!(
+            end[0]["result"].as_str().unwrap().contains("(truncated)"),
+            "result must be truncated: {}",
+            end[0]["result"]
+        );
+        let preview = end[0]["preview"].as_str().unwrap();
+        assert!(
+            preview.starts_with("xxx") && preview.ends_with('…'),
+            "preview is one truncated line: {preview:?}"
+        );
+        assert!(!preview.contains('\n') && !preview.contains(' '), "preview collapses whitespace: {preview:?}");
+    }
+
+    #[test]
+    fn tool_result_error_is_marked_and_previewed() {
+        let end = sse_payloads(&chunk(OutputChunk::ToolEnd {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({}),
+            result: omega_loop_client::ToolResultWire {
+                text: String::new(),
+                is_error: true,
+                content: None,
+            },
+        }));
+        assert_eq!(end[0]["is_error"], true);
+        assert_eq!(end[0]["preview"], "error");
+    }
+
+    #[test]
+    fn done_and_status_pass_through() {
+        let done = sse_payloads(&chunk(OutputChunk::Done));
+        assert_eq!(done[0]["type"], "done");
+        let st = sse_payloads(&chunk(OutputChunk::Status("retrying".into())));
+        assert_eq!(st[0]["type"], "status");
+        assert_eq!(st[0]["message"], "retrying");
+        let sys = sse_payloads(&ServerEvent::SystemMsg("hello".into()));
+        assert_eq!(sys[0]["type"], "status");
+    }
+
+    #[test]
+    fn non_chat_chunks_are_dropped() {
+        assert!(
+            sse_payloads(&chunk(OutputChunk::CacheTelemetry {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 1,
+                cache_creation_tokens: 1,
+            }))
+            .is_empty()
+        );
+        assert!(sse_payloads(&chunk(OutputChunk::Unknown)).is_empty());
+        // Session events without chat content produce nothing either.
+        assert!(sse_payloads(&ServerEvent::ModelList { models: vec![] }).is_empty());
     }
 }

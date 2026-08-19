@@ -53,6 +53,13 @@
     <p class="text-muted">Showing the last {{ messages|length }} of {{ total }} messages.</p>
     {% endif %}
 
+    {# The transcript loop is the SAME for the read-only page and the live
+       chat page. On the live page it sits inside #live-conversation and the
+       client-side live.js renders *live* turns into the same markup (same
+       CSS classes), so a streamed assistant reply looks exactly like a
+       persisted one. #}
+    {% if live %}<div id="live-conversation" data-stream-url="{{ stream_url | safe }}">{% endif %}
+
     {% for m in messages %}
     <div class="session-message {{ m.role }}">
       <div class="message-role">{{ "assistant" if m.role == "assistant" else "user" }}</div>
@@ -100,19 +107,11 @@
     <p class="text-muted">No messages yet.</p>
     {% endif %}
 
+    {% if live %}</div>{% endif %}
+
     {% if live %}
-    <hr />
-    <h3>live</h3>
     {% if stream_error %}<p class="text-danger">{{ stream_error }}</p>{% endif %}
-    <div id="live-log" class="session-message">
-      <div class="message-role">agent</div>
-      <div id="live-body" class="message-body markdown"></div>
-      <div id="live-status" class="text-muted"></div>
-    </div>
-    <details id="live-thinking" class="thinking" open>
-      <summary>thinking <small class="text-muted" id="live-thinking-count"></small></summary>
-      <pre id="live-thinking-body"></pre>
-    </details>
+    <p class="text-muted" id="live-status"></p>
     <form method="post" action="/sessions/{{ session.session_id }}/message">
       <div class="form-group">
         <label for="chat-input">Send a message</label>
@@ -123,43 +122,7 @@
       <button type="submit" formaction="/sessions/{{ session.session_id }}/interrupt"
               class="btn btn-danger">Interrupt</button>
     </form>
-    <script>
-      (function () {
-        var body = document.getElementById('live-body');
-        var status = document.getElementById('live-status');
-        var th = document.getElementById('live-thinking-body');
-        var rt;
-        var es = new EventSource('{{ stream_url | safe }}');
-        es.onmessage = function (ev) {
-          var m;
-          try { m = JSON.parse(ev.data); } catch (e) { return; }
-          if (m.type === 'text' && m.text) {
-            body.appendChild(document.createTextNode(m.text));
-          } else if (m.type === 'thinking' && m.text) {
-            th.appendChild(document.createTextNode(m.text));
-          } else if (m.type === 'status' && m.message) {
-            status.textContent = m.message;
-          } else if (m.type === 'error' && m.message) {
-            status.textContent = '⚠ ' + m.message;
-          } else if (m.type === 'done') {
-            status.textContent = '✓ done';
-          } else if (m.type === 'cleared') {
-            body.textContent = ''; th.textContent = ''; status.textContent = '';
-          }
-        };
-        // EventSource auto-reconnects; on a blip we show a hint and, if the
-        // stream stays down, reload to re-sync the persisted transcript.
-        es.onerror = function () {
-          status.textContent = '⏻ reconnecting…';
-          clearTimeout(rt);
-          rt = setTimeout(function () { location.reload(); }, 4000);
-        };
-        es.onopen = function () {
-          clearTimeout(rt);
-          status.textContent = '';
-        };
-      })();
-    </script>
+    <script src="/static/live.js" defer></script>
     {% endif %}
   </div>
 </div>
