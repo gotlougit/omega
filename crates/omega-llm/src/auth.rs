@@ -15,6 +15,7 @@
 //!     Ok(AuthConfig {
 //!         api_key: jwt,
 //!         base_url: Some("https://proxy.example.com/v1/completions".into()),
+//!         account_id: None,
 //!     })
 //! });
 //! ```
@@ -31,6 +32,8 @@ pub struct AuthConfig {
     pub api_key: String,
     /// Optional custom base URL (overrides default API endpoint)
     pub base_url: Option<String>,
+    /// Optional ChatGPT account ID used with Codex OAuth credentials.
+    pub account_id: Option<String>,
 }
 
 impl AuthConfig {
@@ -39,6 +42,7 @@ impl AuthConfig {
         Self {
             api_key: api_key.into(),
             base_url: None,
+            account_id: None,
         }
     }
 
@@ -47,7 +51,14 @@ impl AuthConfig {
         Self {
             api_key: api_key.into(),
             base_url: Some(base_url.into()),
+            account_id: None,
         }
+    }
+
+    /// Attach the ChatGPT account ID associated with a Codex OAuth token.
+    pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
     }
 }
 
@@ -67,6 +78,18 @@ pub trait AuthProvider: Send + Sync {
     /// Called before each API request. Implementations should handle caching
     /// and refresh logic internally.
     fn get_auth(&self) -> AuthFuture<'_>;
+
+    /// Force a credential refresh after an authentication rejection.
+    ///
+    /// Providers without refresh support return their current credentials.
+    fn refresh_auth(&self) -> AuthFuture<'_> {
+        self.get_auth()
+    }
+
+    /// Whether the provider can exchange its current credentials for new ones.
+    fn supports_refresh(&self) -> bool {
+        false
+    }
 }
 
 /// Wrapper to implement AuthProvider for async closures
@@ -125,6 +148,22 @@ impl AuthSource {
         match self {
             AuthSource::Static(config) => Ok(config.clone()),
             AuthSource::Dynamic(provider) => provider.get_auth().await,
+        }
+    }
+
+    /// Force dynamic credentials to refresh after a 401 response.
+    pub(crate) async fn refresh_auth(&self) -> Result<AuthConfig> {
+        match self {
+            AuthSource::Static(config) => Ok(config.clone()),
+            AuthSource::Dynamic(provider) => provider.refresh_auth().await,
+        }
+    }
+
+    /// Whether this source can refresh rejected credentials.
+    pub(crate) fn supports_refresh(&self) -> bool {
+        match self {
+            AuthSource::Static(_) => false,
+            AuthSource::Dynamic(provider) => provider.supports_refresh(),
         }
     }
 }

@@ -271,8 +271,16 @@ When using OpenAI, disable prompt caching (it's an Anthropic-specific feature) a
 ```bash
 export OPENAI_API_KEY="sk-..."
 export OPENAI_MODEL="gpt-4o"
-# Optional: custom endpoint (proxy, Azure, etc.)
-# export OPENAI_BASE_URL="https://my-proxy.example.com/v1/responses"
+# To opt into the Responses API:
+# export OPENAI_API_TYPE="responses"
+# export OPENAI_RESPONSES_ACCESS_TOKEN="..." # Codex access_token
+# export OPENAI_RESPONSES_ACCOUNT_ID="..."    # Codex account_id
+# export OPENAI_RESPONSES_REFRESH_TOKEN="..." # optional automatic refresh
+# export OPENAI_RESPONSES_ENV_FILE="/var/lib/clanker/omega/.env" # NixOS sets this
+# export OPENAI_MODEL="your-codex-model"
+# export OPENAI_REASONING_EFFORT="medium"
+# Optional; defaults to the Codex ChatGPT backend:
+# export OPENAI_RESPONSES_BASE_URL="https://chatgpt.com/backend-api/codex/responses"
 ```
 ```rust
 let config = AgentConfig::new().with_prompt_caching(false);

@@ -735,9 +735,15 @@ impl StandardAgent {
                                         cache_control: None,
                                     });
                                     text_accum.clear();
-                                } else if !thinking_accum.is_empty() {
-                                    // Send thinking complete signal to CLI
-                                    internals.send_thinking_complete(&thinking_accum);
+                                } else if !thinking_accum.is_empty()
+                                    || !thinking_signature.is_empty()
+                                {
+                                    // A Responses API reasoning item can carry only an
+                                    // opaque continuation signature and no visible summary.
+                                    // Preserve that item without emitting an empty UI event.
+                                    if !thinking_accum.is_empty() {
+                                        internals.send_thinking_complete(&thinking_accum);
+                                    }
                                     content_blocks.push(ContentBlock::Thinking {
                                         thinking: thinking_accum.clone(),
                                         signature: thinking_signature.clone(),

@@ -1,16 +1,16 @@
-//! OpenAI Chat Completions API client
+//! OpenAI API client
 //!
-//! Implements the `LlmProvider` trait for OpenAI's Chat Completions API,
-//! handling translation between the internal message types and OpenAI's
-//! wire format.
+//! Implements the `LlmProvider` trait for OpenAI's Chat Completions and
+//! Responses APIs. Chat Completions remains the default; set
+//! `OPENAI_API_TYPE=responses` to use the Responses API.
 //!
 //! # Authentication
 //!
 //! ```ignore
-//! // From environment (OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL)
+//! // From environment (including OPENAI_API_TYPE)
 //! let llm = OpenAIProvider::from_env()?;
 //!
-//! // With explicit key
+//! // With an explicit Chat Completions API key
 //! let llm = OpenAIProvider::new("sk-...")
 //!     .with_model("gpt-4o");
 //!
@@ -30,11 +30,14 @@ use serde_json::{json, Value};
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio_util::io::StreamReader;
 
 use super::auth::{auth_provider, AuthConfig, AuthSource};
+use super::codex_auth::CodexOAuthAuthProvider;
+use super::openai_responses;
 use super::provider::LlmProvider;
 use super::types::{
     CacheControl, ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent,
@@ -43,7 +46,77 @@ use super::types::{
     ThinkingConfig, ToolChoice, ToolDefinition, Usage,
 };
 
-const DEFAULT_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+const DEFAULT_CHAT_COMPLETIONS_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+
+/// OpenAI endpoint family used by [`OpenAIProvider`].
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum OpenAIApiType {
+    /// The legacy-compatible Chat Completions API.
+    #[default]
+    ChatCompletions,
+    /// The OpenAI Responses API.
+    Responses,
+}
+
+/// Reasoning effort sent by the OpenAI Responses API.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OpenAIReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl OpenAIReasoningEffort {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl FromStr for OpenAIReasoningEffort {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            other => anyhow::bail!(
+                "unsupported OPENAI_REASONING_EFFORT '{other}'; expected one of: \
+                 none, minimal, low, medium, high, xhigh, max"
+            ),
+        }
+    }
+}
+
+impl FromStr for OpenAIApiType {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat-completions" | "chat_completions" | "chat" => Ok(Self::ChatCompletions),
+            "responses" => Ok(Self::Responses),
+            other => anyhow::bail!(
+                "unsupported OPENAI_API_TYPE '{other}'; expected 'chat-completions' or 'responses'"
+            ),
+        }
+    }
+}
 
 // ============================================================================
 // OpenAI Wire Types
@@ -257,43 +330,134 @@ struct OpenAIStreamFunction {
 // OpenAIProvider
 // ============================================================================
 
-/// OpenAI LLM provider using the Chat Completions API
+/// OpenAI LLM provider using Chat Completions or Responses.
 pub struct OpenAIProvider {
-    client: Client,
-    auth: AuthSource,
-    model: String,
-    max_tokens: Option<u32>,
+    pub(crate) client: Client,
+    pub(crate) auth: AuthSource,
+    pub(crate) model: String,
+    pub(crate) max_tokens: Option<u32>,
+    pub(crate) reasoning_effort: Option<OpenAIReasoningEffort>,
+    api_type: OpenAIApiType,
 }
 
 impl OpenAIProvider {
     /// Create from environment variables
     ///
     /// Reads from:
-    /// - `OPENAI_API_KEY` (required)
+    /// - `OPENAI_API_TYPE` (optional: `chat-completions` or `responses`)
+    /// - `OPENAI_API_KEY` (required for Chat Completions)
     /// - `OPENAI_MODEL` (optional, defaults to `gpt-4o`)
-    /// - `OPENAI_BASE_URL` (optional, defaults to OpenAI API)
+    /// - `OPENAI_REASONING_EFFORT` (optional Responses reasoning effort)
+    /// - `OPENAI_BASE_URL` (optional Chat Completions endpoint)
+    /// - `OPENAI_RESPONSES_ACCESS_TOKEN` (required for Responses)
+    /// - `OPENAI_RESPONSES_REFRESH_TOKEN` (optional automatic OAuth refresh)
+    /// - `OPENAI_RESPONSES_ACCOUNT_ID` (required for Responses)
+    /// - `OPENAI_RESPONSES_BASE_URL` (optional Responses endpoint)
+    /// - `OPENAI_RESPONSES_ENV_FILE` (optional refreshed-token persistence)
     /// - `OPENAI_MAX_TOKENS` (optional, defaults to no limit)
     pub fn from_env() -> Result<Self> {
         tracing::info!("Creating OpenAI provider from environment");
 
-        let api_key =
-            env::var("OPENAI_API_KEY").context("OPENAI_API_KEY environment variable not set")?;
+        let api_type = Self::api_type_from_env()?;
+        let auth = match api_type {
+            OpenAIApiType::ChatCompletions => {
+                AuthSource::Static(Self::auth_config_from_env(api_type)?)
+            }
+            OpenAIApiType::Responses => {
+                AuthSource::Dynamic(Arc::new(CodexOAuthAuthProvider::from_env()?))
+            }
+        };
+        let (model, max_tokens) = Self::model_config_from_env();
+        let reasoning_effort = Self::reasoning_effort_from_env()?;
 
-        let base_url = env::var("OPENAI_BASE_URL").ok();
-        let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-        let max_tokens = env::var("OPENAI_MAX_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok());
-
-        tracing::info!("Using model: {}", model);
+        tracing::info!("Using model: {} ({:?} API)", model, api_type);
         tracing::info!("Max tokens: {:?}", max_tokens);
+        tracing::info!("Reasoning effort: {:?}", reasoning_effort);
 
         Ok(Self {
             client: Client::new(),
-            auth: AuthSource::Static(AuthConfig { api_key, base_url }),
+            auth,
             model,
             max_tokens,
+            reasoning_effort,
+            api_type,
         })
+    }
+
+    /// Create from environment with dynamic authentication.
+    ///
+    /// Chat Completions credentials are read for each request. Responses
+    /// credentials are loaded into a concurrency-safe OAuth refresh manager.
+    pub fn from_env_with_dynamic_auth() -> Result<Self> {
+        let api_type = Self::api_type_from_env()?;
+        let (model, max_tokens) = Self::model_config_from_env();
+        let reasoning_effort = Self::reasoning_effort_from_env()?;
+        let auth = match api_type {
+            OpenAIApiType::ChatCompletions => {
+                AuthSource::Dynamic(Arc::new(auth_provider(move || async move {
+                    Self::auth_config_from_env(api_type)
+                })))
+            }
+            OpenAIApiType::Responses => {
+                AuthSource::Dynamic(Arc::new(CodexOAuthAuthProvider::from_env()?))
+            }
+        };
+        Ok(Self {
+            client: Client::new(),
+            auth,
+            model,
+            max_tokens,
+            reasoning_effort,
+            api_type,
+        })
+    }
+
+    fn api_type_from_env() -> Result<OpenAIApiType> {
+        env::var("OPENAI_API_TYPE")
+            .ok()
+            .as_deref()
+            .unwrap_or("chat-completions")
+            .parse()
+    }
+
+    fn auth_config_from_env(api_type: OpenAIApiType) -> Result<AuthConfig> {
+        match api_type {
+            OpenAIApiType::ChatCompletions => {
+                let api_key = env::var("OPENAI_API_KEY")
+                    .context("OPENAI_API_KEY environment variable not set")?;
+                Ok(match env::var("OPENAI_BASE_URL").ok() {
+                    Some(base_url) => AuthConfig::with_base_url(api_key, base_url),
+                    None => AuthConfig::new(api_key),
+                })
+            }
+            OpenAIApiType::Responses => {
+                let access_token = env::var("OPENAI_RESPONSES_ACCESS_TOKEN")
+                    .context("OPENAI_RESPONSES_ACCESS_TOKEN environment variable not set")?;
+                let account_id = env::var("OPENAI_RESPONSES_ACCOUNT_ID")
+                    .context("OPENAI_RESPONSES_ACCOUNT_ID environment variable not set")?;
+                let auth = match env::var("OPENAI_RESPONSES_BASE_URL").ok() {
+                    Some(base_url) => AuthConfig::with_base_url(access_token, base_url),
+                    None => AuthConfig::new(access_token),
+                };
+                Ok(auth.with_account_id(account_id))
+            }
+        }
+    }
+
+    fn model_config_from_env() -> (String, Option<u32>) {
+        let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+        let max_tokens = env::var("OPENAI_MAX_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        (model, max_tokens)
+    }
+
+    fn reasoning_effort_from_env() -> Result<Option<OpenAIReasoningEffort>> {
+        env::var("OPENAI_REASONING_EFFORT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.parse())
+            .transpose()
     }
 
     /// Create with an explicit API key
@@ -303,6 +467,8 @@ impl OpenAIProvider {
             auth: AuthSource::Static(AuthConfig::new(api_key)),
             model: String::new(),
             max_tokens: None,
+            reasoning_effort: None,
+            api_type: OpenAIApiType::ChatCompletions,
         }
     }
 
@@ -317,7 +483,46 @@ impl OpenAIProvider {
             auth: AuthSource::Dynamic(Arc::new(auth_provider(provider))),
             model: String::new(),
             max_tokens: None,
+            reasoning_effort: None,
+            api_type: OpenAIApiType::ChatCompletions,
         }
+    }
+
+    /// Select the OpenAI endpoint family.
+    pub fn with_api_type(mut self, api_type: OpenAIApiType) -> Self {
+        self.api_type = api_type;
+        self
+    }
+
+    /// Get the configured OpenAI endpoint family.
+    pub fn api_type(&self) -> OpenAIApiType {
+        self.api_type
+    }
+
+    /// Override the request endpoint for statically configured authentication.
+    ///
+    /// The URL must point directly to the Chat Completions or Responses request
+    /// endpoint selected by [`Self::api_type`]. Dynamic auth providers should
+    /// return the endpoint in [`AuthConfig`].
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        match &mut self.auth {
+            AuthSource::Static(config) => config.base_url = Some(base_url.into()),
+            AuthSource::Dynamic(_) => tracing::warn!(
+                "with_base_url() has no effect with dynamic auth; return the URL in AuthConfig"
+            ),
+        }
+        self
+    }
+
+    /// Set the ChatGPT account ID for statically configured Codex OAuth auth.
+    pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
+        match &mut self.auth {
+            AuthSource::Static(config) => config.account_id = Some(account_id.into()),
+            AuthSource::Dynamic(_) => tracing::warn!(
+                "with_account_id() has no effect with dynamic auth; return it in AuthConfig"
+            ),
+        }
+        self
     }
 
     /// Set the model
@@ -332,9 +537,31 @@ impl OpenAIProvider {
         self
     }
 
+    /// Set the reasoning effort for Responses requests.
+    ///
+    /// This overrides the effort inferred from [`ThinkingConfig`].
+    pub fn with_reasoning_effort(mut self, effort: OpenAIReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
     /// Get current model
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    fn models_request(&self, models_url: &str, auth: &AuthConfig) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .get(models_url)
+            .header("Authorization", format!("Bearer {}", auth.api_key));
+        if let Some(account_id) = auth.account_id.as_deref() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if self.api_type == OpenAIApiType::Responses {
+            request = request.header("originator", openai_responses::ORIGINATOR);
+        }
+        request
     }
 
     /// Create a variant with a different model, sharing auth.
@@ -352,6 +579,8 @@ impl OpenAIProvider {
             auth: self.auth.clone(),
             model: model.into(),
             max_tokens: max_tokens.or(self.max_tokens),
+            reasoning_effort: self.reasoning_effort,
+            api_type: self.api_type,
         }
     }
 
@@ -374,7 +603,10 @@ impl OpenAIProvider {
             .get_auth()
             .await
             .context("Failed to get authentication credentials")?;
-        let api_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
+        let api_url = auth_config
+            .base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_CHAT_COMPLETIONS_API_URL);
 
         let mut req_body = serde_json::to_value(request)?;
         req_body["stream"] = json!(true);
@@ -692,8 +924,21 @@ impl LlmProvider for OpenAIProvider {
         tools: Vec<ToolDefinition>,
         tool_choice: Option<ToolChoice>,
         thinking: Option<ThinkingConfig>,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        if self.api_type == OpenAIApiType::Responses {
+            return openai_responses::stream_with_tools_and_system(
+                self,
+                messages,
+                system,
+                tools,
+                tool_choice,
+                thinking,
+                session_id,
+            )
+            .await;
+        }
+
         if thinking.is_some() {
             tracing::debug!(
                 "OpenAI Chat Completions has no extended-thinking request field; \
@@ -721,7 +966,7 @@ impl LlmProvider for OpenAIProvider {
             prompt_cache_retention: None,
         };
 
-        self.send_streaming_request(request, _session_id).await
+        self.send_streaming_request(request, session_id).await
     }
 
     fn model(&self) -> String {
@@ -738,22 +983,41 @@ impl LlmProvider for OpenAIProvider {
         //   https://api.openai.com/v1/models
         // while the chat completions endpoint is at:
         //   https://api.openai.com/v1/chat/completions
-        let auth_config = self
+        let mut auth_config = self
             .auth
             .get_auth()
             .await
             .context("Failed to get authentication credentials")?;
 
-        let base_url = auth_config.base_url.as_deref().unwrap_or(DEFAULT_API_URL);
+        let base_url = auth_config
+            .base_url
+            .as_deref()
+            .unwrap_or(match self.api_type {
+                OpenAIApiType::ChatCompletions => DEFAULT_CHAT_COMPLETIONS_API_URL,
+                OpenAIApiType::Responses => openai_responses::DEFAULT_API_URL,
+            });
         let models_url = derive_models_url(base_url);
 
-        let response = self
-            .client
-            .get(&models_url)
-            .header("Authorization", format!("Bearer {}", auth_config.api_key))
+        let mut response = self
+            .models_request(&models_url, &auth_config)
             .send()
             .await
             .with_context(|| format!("Failed to send request to {models_url}"))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.auth.supports_refresh() {
+            drop(response);
+            auth_config = self
+                .auth
+                .refresh_auth()
+                .await
+                .context("Failed to refresh rejected Codex OAuth credentials")?;
+            response = self
+                .models_request(&models_url, &auth_config)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("Failed to retry {models_url} after refreshing Codex OAuth")
+                })?;
+        }
 
         let status = response.status();
         let body = response
@@ -1058,21 +1322,25 @@ fn convert_tool_choice_to_openai(choice: &Option<ToolChoice>) -> Option<Value> {
     }
 }
 
-/// Derive the models list URL from the chat completions base URL.
+/// Derive the models list URL from an OpenAI request endpoint.
 ///
 /// For standard OpenAI: `https://api.openai.com/v1/chat/completions` → `https://api.openai.com/v1/models`
+/// or `https://api.openai.com/v1/responses` → `https://api.openai.com/v1/models`.
 /// For a custom proxy: `https://proxy.example.com/v1/chat/completions` → `https://proxy.example.com/v1/models`
-fn derive_models_url(chat_url: &str) -> String {
+fn derive_models_url(api_url: &str) -> String {
     // If the URL ends with /chat/completions, replace it with /models
-    if let Some(base) = chat_url.strip_suffix("/chat/completions") {
+    if let Some(base) = api_url.strip_suffix("/chat/completions") {
         return format!("{}/models", base);
     }
     // If the URL ends with /v1/chat/completions (alternate), same logic
-    if let Some(base) = chat_url.strip_suffix("chat/completions") {
+    if let Some(base) = api_url.strip_suffix("chat/completions") {
         return format!("{}models", base);
     }
+    if let Some(base) = api_url.strip_suffix("/responses") {
+        return format!("{}/models", base);
+    }
     // Otherwise, try appending /models to the base (stripping trailing slash)
-    let trimmed = chat_url.trim_end_matches('/');
+    let trimmed = api_url.trim_end_matches('/');
     format!("{}/models", trimmed)
 }
 
@@ -1259,7 +1527,10 @@ mod tests {
             delta.reasoning_content.as_deref(),
             Some("let me think about this")
         );
-        assert!(delta.content.is_none(), "reasoning must not land in content");
+        assert!(
+            delta.content.is_none(),
+            "reasoning must not land in content"
+        );
     }
 
     #[test]
@@ -1307,10 +1578,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(content.as_deref(), Some("final answer"));
-                assert_eq!(
-                    reasoning_content.as_deref(),
-                    Some("hmm, step one...")
-                );
+                assert_eq!(reasoning_content.as_deref(), Some("hmm, step one..."));
                 assert!(tool_calls.is_none());
             }
             _ => panic!("Expected Assistant message"),
@@ -1608,14 +1876,14 @@ mod tests {
         // must inherit the current provider's cap (e.g. from
         // OPENAI_MAX_TOKENS) instead of silently dropping it, otherwise a
         // configured output limit would be lost on every model switch.
-        let base = OpenAIProvider::with_auth_provider(|| async {
-            Ok(AuthConfig::new("test-key"))
-        })
-        .with_model("base-model")
-        .with_max_tokens(Some(65536));
+        let base = OpenAIProvider::with_auth_provider(|| async { Ok(AuthConfig::new("test-key")) })
+            .with_model("base-model")
+            .with_api_type(OpenAIApiType::Responses)
+            .with_max_tokens(Some(65536));
 
         // Explicit override wins.
         let explicit = base.with_model_and_tokens_override("new-model", Some(128));
+        assert_eq!(explicit.api_type(), OpenAIApiType::Responses);
         let json = serde_json::to_value(OpenAIRequest {
             model: explicit.model().to_string(),
             messages: vec![],
@@ -1764,8 +2032,40 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_models_url_responses() {
+        let url = derive_models_url("https://api.openai.com/v1/responses");
+        assert_eq!(url, "https://api.openai.com/v1/models");
+    }
+
+    #[test]
     fn test_derive_models_url_no_trailing_path() {
         let url = derive_models_url("https://api.openai.com/v1");
         assert_eq!(url, "https://api.openai.com/v1/models");
+    }
+
+    #[test]
+    fn test_api_type_parsing() {
+        assert_eq!(
+            "responses".parse::<OpenAIApiType>().unwrap(),
+            OpenAIApiType::Responses
+        );
+        assert_eq!(
+            "chat-completions".parse::<OpenAIApiType>().unwrap(),
+            OpenAIApiType::ChatCompletions
+        );
+        assert!("completions".parse::<OpenAIApiType>().is_err());
+    }
+
+    #[test]
+    fn test_reasoning_effort_parsing() {
+        assert_eq!(
+            "medium".parse::<OpenAIReasoningEffort>().unwrap(),
+            OpenAIReasoningEffort::Medium
+        );
+        assert_eq!(
+            "MAX".parse::<OpenAIReasoningEffort>().unwrap(),
+            OpenAIReasoningEffort::Max
+        );
+        assert!("extreme".parse::<OpenAIReasoningEffort>().is_err());
     }
 }

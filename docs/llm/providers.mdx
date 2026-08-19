@@ -67,62 +67,100 @@ let llm = GeminiProvider::new("api-key")?
 
 ## OpenAIProvider
 
-Uses the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses).
+Supports both OpenAI Chat Completions and the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses). Chat Completions is the default; set `OPENAI_API_TYPE=responses` to opt into Responses.
 
 ```rust
-use picrust::llm::OpenAIProvider;
+use picrust::llm::{OpenAIApiType, OpenAIProvider};
 
-// From env vars (OPENAI_API_KEY, OPENAI_MODEL)
+// From env vars (including OPENAI_API_TYPE)
 let llm = OpenAIProvider::from_env()?;
 
-// Explicit key and model
-let llm = OpenAIProvider::new("sk-...")?
-    .with_model("gpt-4o")
-    .with_max_tokens(4096);
+// Explicit Responses API provider using Codex OAuth credentials
+let llm = OpenAIProvider::new("codex-oauth-access-token")
+    .with_api_type(OpenAIApiType::Responses)
+    .with_account_id("chatgpt-account-id")
+    .with_model("your-codex-model")
+    .with_max_tokens(Some(4096));
 ```
 
 ### Environment Variables
 
 | Variable | Required | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | — |
-| `OPENAI_MODEL` | Yes | — |
-| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1/responses` |
-| `OPENAI_MAX_TOKENS` | No | `32000` |
+| `OPENAI_API_TYPE` | No | `chat-completions` |
+| `OPENAI_API_KEY` | Chat Completions only | — |
+| `OPENAI_MODEL` | No | `gpt-4o` |
+| `OPENAI_REASONING_EFFORT` | No | Inferred from the request, or upstream default |
+| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1/chat/completions` |
+| `OPENAI_RESPONSES_ACCESS_TOKEN` | Responses only | — |
+| `OPENAI_RESPONSES_ACCOUNT_ID` | Responses only | — |
+| `OPENAI_RESPONSES_REFRESH_TOKEN` | No | Automatic refresh disabled |
+| `OPENAI_RESPONSES_ENV_FILE` | No | Refreshed tokens remain in memory only |
+| `OPENAI_RESPONSES_OAUTH_CLIENT_ID` | No | Codex OAuth client ID |
+| `OPENAI_RESPONSES_OAUTH_TOKEN_URL` | No | `https://auth.openai.com/oauth/token` |
+| `OPENAI_RESPONSES_BASE_URL` | No | `https://chatgpt.com/backend-api/codex/responses` |
+| `OPENAI_MAX_TOKENS` | No | Upstream default |
 
-### Custom Base URL
+### Codex Credentials and Custom Base URL
 
-The base URL is configurable, which makes it easy to point the provider at a local proxy, Azure OpenAI, or any OpenAI-compatible endpoint:
+Responses mode authenticates with the OAuth access token and ChatGPT account ID
+from Codex credentials. Pass the values to `omega-loop`; the crate does not read
+the Codex credentials file itself. The access token is sent as a bearer token and
+the account ID is sent in `ChatGPT-Account-ID`.
+
+When a refresh token is configured, omega refreshes an access token within five
+minutes of its JWT expiry or after a `401 Unauthorized` response, then retries the
+request once. The current tokens are updated in memory immediately. If
+`OPENAI_RESPONSES_ENV_FILE` is set, access and rotated refresh tokens are also
+written back atomically while preserving the file's permissions:
 
 ```bash
-export OPENAI_BASE_URL="https://my-proxy.example.com/v1/responses"
+export OPENAI_API_TYPE="responses"
+export OPENAI_RESPONSES_ACCESS_TOKEN="..."
+export OPENAI_RESPONSES_ACCOUNT_ID="..."
+export OPENAI_RESPONSES_REFRESH_TOKEN="..."
+export OPENAI_RESPONSES_ENV_FILE="/var/lib/clanker/omega/.env"
+export OPENAI_MODEL="your-codex-model"
+export OPENAI_REASONING_EFFORT="medium"
+# Optional override:
+export OPENAI_RESPONSES_BASE_URL="https://chatgpt.com/backend-api/codex/responses"
 ```
+
+The env file and its parent directory must be writable by `omega-loop` for
+atomic replacement. Keep it mode `0600` and outside the Nix store. Do not let
+another Codex process refresh a stale copy of the same rotating refresh token;
+use this env file as the authoritative credential store once omega owns refresh.
 
 Or in code:
 
 ```rust
-let llm = OpenAIProvider::new("sk-...")?
-    .with_model("gpt-4o")
-    .with_base_url("https://my-proxy.example.com/v1/responses");
+let llm = OpenAIProvider::new("codex-oauth-access-token")
+    .with_api_type(OpenAIApiType::Responses)
+    .with_account_id("chatgpt-account-id")
+    .with_model("your-codex-model");
 ```
 
-### Dynamic Auth (Proxy / JWT)
+### Dynamic Auth (Codex OAuth / Proxy / JWT)
 
 ```rust
-use picrust::llm::{OpenAIProvider, AuthConfig};
+use picrust::llm::{AuthConfig, OpenAIApiType, OpenAIProvider};
 
 let llm = OpenAIProvider::with_auth_provider(|| async {
     let token = my_auth_service.get_fresh_token().await?;
+    let account_id = my_auth_service.chatgpt_account_id().await?;
     Ok(AuthConfig::with_base_url(
         token,
-        "https://my-proxy.example.com/v1/responses",
-    ))
-});
+        "https://chatgpt.com/backend-api/codex/responses",
+    )
+    .with_account_id(account_id))
+})
+.with_api_type(OpenAIApiType::Responses);
 ```
 
 ### Notes
 
-- **Thinking / reasoning**: `ThinkingConfig` is fully supported. The budget maps to OpenAI's `reasoning.effort` parameter (`low`, `medium`, `high`) and reasoning summaries are streamed as thinking blocks. See [Extended Thinking](#extended-thinking) for budget-to-effort mapping.
+- **Thinking / reasoning**: In Responses mode, `ThinkingConfig` maps to `reasoning.effort` (`low`, `medium`, `high`) and reasoning summaries are streamed as thinking blocks. Chat Completions continues to surface compatible `reasoning_content` deltas when a gateway emits them.
+- **Explicit effort**: `OPENAI_REASONING_EFFORT` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` and overrides the effort inferred from `ThinkingConfig`. Model support varies.
 - **Prompt caching**: OpenAI does not use Anthropic-style prompt caching. Disable it in `AgentConfig` to avoid unnecessary overhead:
   ```rust
   let config = AgentConfig::new().with_prompt_caching(false);

@@ -340,16 +340,41 @@ in
         Put any environment variables omega-loop needs here, for example:
 
           OPENAI_API_KEY=sk-...
-          OPENAI_BASE_URL=https://api.openai.com/v1
           OPENAI_MODEL=gpt-4o
+          # Chat Completions is the default. To use the Responses API:
+          OPENAI_API_TYPE=responses
+          # Codex OAuth credentials passed directly to omega-loop. An API key
+          # is not used in responses mode:
+          OPENAI_RESPONSES_ACCESS_TOKEN=...
+          # Optional: enables automatic access-token refresh. The module passes
+          # this envFile path to omega-loop so rotated credentials are written
+          # back atomically for the next service restart.
+          OPENAI_RESPONSES_REFRESH_TOKEN=...
+          OPENAI_RESPONSES_ACCOUNT_ID=...
+          # For example, replace OPENAI_MODEL above and select Responses effort:
+          # OPENAI_MODEL=gpt-5.6-sol
+          # OPENAI_REASONING_EFFORT=medium
+          # Optional; this is the default Responses endpoint:
+          OPENAI_RESPONSES_BASE_URL=https://chatgpt.com/backend-api/codex/responses
+          # For a custom Chat Completions endpoint instead:
+          # OPENAI_BASE_URL=https://api.openai.com/v1/chat/completions
           # Output token cap sent with every request. Leave unset to let the
           # upstream apply its own default (often ~8k even for 1M-context
           # models). Set to the model's real output limit to avoid
-          # finish_reason="length" truncation.
+          # finish_reason="length" / incomplete responses.
           OPENAI_MAX_TOKENS=65536
 
-        If null, env vars must be provided by other means
-        (e.g. sops-nix, agenix, or environment: directives).
+        When this option is set, its path is also passed to omega-loop as
+        OPENAI_RESPONSES_ENV_FILE. If a Responses refresh token is configured,
+        omega-loop atomically replaces this file with refreshed access and
+        rotated refresh tokens. The file and its parent directory must therefore
+        be writable by services.omega.user; keep it mode 0600, outside the Nix
+        store, and manage its initial contents with an appropriate secret tool.
+        Do not share its rotating refresh token with another Codex process.
+
+        If null, env vars must be provided by other means (e.g. sops-nix,
+        agenix, or environment: directives), and refreshed credentials remain
+        in memory unless OPENAI_RESPONSES_ENV_FILE is set separately.
       '';
     };
 
@@ -792,7 +817,8 @@ in
             "OMEGA_SESSION_DIR=${cfg.sessionDir}"
             "RUST_LOG=${cfg.logLevel}"
           ]
-          ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}";
+          ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}"
+          ++ optional (cfg.envFile != null) "OPENAI_RESPONSES_ENV_FILE=${toString cfg.envFile}";
 
           # Security hardening
           NoNewPrivileges = true;

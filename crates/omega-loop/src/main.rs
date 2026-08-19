@@ -43,7 +43,7 @@ use omega_core::core::{
 };
 use omega_llm::types::CustomTool;
 use omega_llm::{
-    AuthConfig, ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider, ToolDefinition,
+    ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider, ToolDefinition,
     ToolInputSchema,
 };
 use omega_tools::{Tool, ToolRegistry};
@@ -292,22 +292,8 @@ fn list_sessions_filtered(
 // Shared infrastructure
 // ---------------------------------------------------------------------------
 
-fn create_llm_provider() -> Arc<dyn LlmProvider> {
-    Arc::new(
-        OpenAIProvider::with_auth_provider(|| async {
-            let api_key = env::var("OPENAI_API_KEY")
-                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
-            let base_url = env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
-            Ok(AuthConfig::with_base_url(api_key, base_url))
-        })
-        .with_model(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()))
-        .with_max_tokens(
-            env::var("OPENAI_MAX_TOKENS")
-                .ok()
-                .and_then(|s| s.parse().ok()),
-        ),
-    )
+fn create_llm_provider() -> Result<Arc<dyn LlmProvider>> {
+    Ok(Arc::new(OpenAIProvider::from_env_with_dynamic_auth()?))
 }
 
 fn create_tools() -> Result<Arc<ToolRegistry>> {
@@ -1442,7 +1428,7 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let llm = create_llm_provider();
+    let llm = create_llm_provider()?;
     let tools = create_tools()?;
     let runtime = AgentRuntime::new();
 
