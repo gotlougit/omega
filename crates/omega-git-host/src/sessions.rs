@@ -42,6 +42,17 @@ pub struct SessionMeta {
     pub custom: HashMap<String, serde_json::Value>,
 }
 
+impl SessionMeta {
+    /// The project binding persisted by omega-loop, if it is present and
+    /// structurally valid. Callers which use the contained path must still
+    /// validate it against the configured project store (see `changes`).
+    pub fn active_project(&self) -> Option<omega_projects::ActiveProject> {
+        self.custom
+            .get("active_project")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+}
+
 /// What the web UI needs to know about a session.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
@@ -62,10 +73,7 @@ pub struct SessionInfo {
 
 impl SessionInfo {
     pub fn from_meta(meta: &SessionMeta) -> Self {
-        let active = meta
-            .custom
-            .get("active_project")
-            .and_then(|v| serde_json::from_value::<omega_projects::ActiveProject>(v.clone()).ok());
+        let active = meta.active_project();
         Self {
             display_name: meta
                 .conversation_name

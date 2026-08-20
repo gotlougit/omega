@@ -169,6 +169,32 @@ impl SessionStorage {
         Ok(())
     }
 
+    /// Atomically replace a session history.
+    ///
+    /// Compaction must never leave a half-written transcript if the process
+    /// exits mid-write. The temporary file lives beside the destination so
+    /// the final rename is atomic on the session filesystem.
+    pub fn replace_messages(&self, session_id: &str, messages: &[Message]) -> FrameworkResult<()> {
+        self.ensure_session_dir(session_id)?;
+        let path = self.history_path(session_id);
+        let temporary = self
+            .session_dir(session_id)
+            .join("history.jsonl.compacting");
+
+        {
+            let file = File::create(&temporary)?;
+            let mut writer = BufWriter::new(file);
+            for message in messages {
+                let json = serde_json::to_string(message)?;
+                writeln!(writer, "{}", json)?;
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        fs::rename(temporary, path)?;
+        Ok(())
+    }
+
     /// Check if a session exists
     pub fn session_exists(&self, session_id: &str) -> bool {
         self.metadata_path(session_id).exists()
@@ -402,7 +428,9 @@ mod tests {
         storage
             .save_metadata(&SessionMetadata::new("real", "coder", "R", ""))
             .unwrap();
-        storage.append_message("real", &Message::user("hi")).unwrap();
+        storage
+            .append_message("real", &Message::user("hi"))
+            .unwrap();
 
         let removed = storage.prune_empty_sessions().unwrap();
         assert_eq!(removed.len(), 2);

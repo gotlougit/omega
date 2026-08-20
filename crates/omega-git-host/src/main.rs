@@ -1,6 +1,7 @@
 //! # omega-git-host
 //!
-//! Read-only self-hosted git forge over the omega project store (SELFGIT.md).
+//! Fetch-only self-hosted git forge and management UI over the omega project
+//! store (SELFGIT.md).
 //!
 //! Phase 1: serve every registered project's bare clone as a fetchable smart
 //! HTTP remote via `git http-backend`. Phase 2: sourcehut-style web UI shell
@@ -19,10 +20,12 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
+use omega_projects::mirror::MirrorManager;
 use omega_projects::rebase::{self, RebaseDefaults};
 use omega_projects::ProjectManager;
 use tracing::info;
 
+mod changes;
 mod daemon;
 mod git;
 mod pages;
@@ -38,9 +41,9 @@ const ENV_PROJECTS_DIR: &str = "OMEGA_PROJECTS_DIR";
 /// Directory where omega-loop stores sessions (metadata.json, history.jsonl).
 /// Used by the refs page to link worktree branches to their chat sessions.
 const ENV_SESSION_DIR: &str = "OMEGA_SESSION_DIR";
-/// Bind address. Defaults to loopback on purpose: the forge is read-only
-/// today, but it will serve full session transcripts (possibly sensitive)
-/// from Phase 4 on — do not expose casually.
+/// Bind address. Defaults to loopback on purpose: the forge serves full
+/// session transcripts and mutation controls (including write-only GitHub
+/// credentials) — do not expose it without an authenticated boundary.
 const ENV_LISTEN: &str = "OMEGA_GIT_HOST_LISTEN";
 /// TCP port (default 8080).
 const ENV_PORT: &str = "OMEGA_GIT_HOST_PORT";
@@ -56,6 +59,8 @@ pub struct AppState {
     /// `None` when running without the module. The imperative state file in
     /// the project store is read on demand.
     pub rebase_defaults: Option<RebaseDefaults>,
+    /// Per-project GitHub mirror configuration and safe push mechanics.
+    pub mirrors: MirrorManager,
 }
 
 #[tokio::main]
@@ -72,7 +77,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| ProjectManager::default_root());
     let listen = env::var(ENV_LISTEN).unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let port: u16 = match env::var(ENV_PORT) {
-        Ok(p) => p.parse().with_context(|| format!("{ENV_PORT} must be a TCP port"))?,
+        Ok(p) => p
+            .parse()
+            .with_context(|| format!("{ENV_PORT} must be a TCP port"))?,
         Err(_) => DEFAULT_PORT,
     };
 
@@ -88,6 +95,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("sessions"));
 
     let state = AppState {
+        mirrors: MirrorManager::from_env(projects.clone()),
         projects,
         templates: Arc::new(templates::Templates::new()?),
         session_dir,
@@ -104,6 +112,9 @@ async fn main() -> Result<()> {
         .route("/projects/create", post(pages::project_create))
         .route("/projects/delete", post(pages::project_delete))
         .route("/{name}/merge", post(pages::project_merge))
+        .route("/{name}/mirror/configure", post(pages::mirror_configure))
+        .route("/{name}/mirror/push", post(pages::mirror_push))
+        .route("/{name}/mirror/remove", post(pages::mirror_remove))
         // Repo pages (param routes; more specific than the git wildcard).
         .route("/{name}", get(pages::summary))
         .route("/{name}/", get(pages::summary))
@@ -123,18 +134,25 @@ async fn main() -> Result<()> {
         .route("/rebase/", get(pages::rebase_page))
         .route("/rebase/toggle", post(pages::rebase_toggle))
         .route("/rebase/interval", post(pages::rebase_interval))
+        .route("/rebase/configure", post(pages::rebase_configure))
         .route("/rebase/run", post(pages::rebase_run_now))
         // Session transcript pages (Phase 4).
         .route("/sessions", get(pages::sessions_index))
         .route("/sessions/", get(pages::sessions_index))
         .route("/sessions/{id}", get(pages::session_page))
-        .route("/sessions/{id}/system-prompt", get(pages::session_system_prompt))
+        .route("/sessions/{id}/changes", get(pages::session_changes))
+        .route(
+            "/sessions/{id}/system-prompt",
+            get(pages::session_system_prompt),
+        )
         // Live chat (TUI capabilities in the web UI): start a session on a
         // project, message it, interrupt it, and stream output over SSE.
         .route("/sessions/{id}/live", get(pages::session_live))
         .route("/sessions/{id}/stream", get(pages::session_stream))
         .route("/sessions/{id}/message", post(pages::session_message))
         .route("/sessions/{id}/interrupt", post(pages::session_interrupt))
+        .route("/sessions/{id}/model", post(pages::session_set_model))
+        .route("/sessions/{id}/compact", post(pages::session_compact))
         .route("/{name}/sessions/create", post(pages::session_create))
         // Smart-HTTP git endpoints live at /{name}.git/info/refs,
         // /{name}.git/git-upload-pack, etc. — handled by the fallback (the
@@ -174,7 +192,10 @@ async fn index(
         Ok(projects) => projects,
         Err(e) => {
             tracing::error!(error = %e, "failed to list projects");
-            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to list projects\n");
+            return text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to list projects\n",
+            );
         }
     };
 
@@ -222,7 +243,10 @@ static LIVE_JS: &str = include_str!("../assets/live.js");
 async fn live_js() -> Response {
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+        .header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
         .header("cache-control", "public, max-age=3600")
         .body(Body::from(LIVE_JS))
         .unwrap()

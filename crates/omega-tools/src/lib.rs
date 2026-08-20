@@ -17,6 +17,50 @@ pub use tool::Tool;
 // Re-export common tools for convenience
 pub use common::{BashTool, EditTool, ReadTool, TransferTool, WriteTool};
 
+use omega_llm::{types::CustomTool, ToolDefinition};
+
+/// Convert a canonical `ToolDef` into a `ToolDefinition` for the LLM.
+///
+/// This is the single conversion point used by both native tool
+/// implementations and proxy tools.
+pub fn def_to_tool_definition(def: &omega_tool_defs::ToolDef) -> ToolDefinition {
+    ToolDefinition::Custom(CustomTool {
+        name: def.name.to_string(),
+        description: Some(def.description.to_string()),
+        input_schema: serde_json::from_str(def.input_schema_json)
+            .expect("invalid ToolInputSchema in ToolDef"),
+        tool_type: None,
+        cache_control: None,
+    })
+}
+
+/// Register all default in-process tools into the given registry.
+///
+/// These tools run directly in the agent process and don't need
+/// an external executor like omega-sh.
+pub fn register_default_tools(registry: &mut ToolRegistry) {
+    // In-process tools that don't need omega-sh
+    registry.register(TransferTool::new());
+
+    // Auto-register any future native tools from the canonical defs.
+    // Native tools that need special runtime access (like Transfer)
+    // are registered above; the loop catches any that
+    // don't need special setup but are marked Native in omega-tool-defs.
+    for &def in omega_tool_defs::ALL {
+        if def.kind == omega_tool_defs::ToolKind::Native {
+            // Check if already registered by name to avoid duplicates.
+            if registry.get(def.name).is_none() {
+                // TODO: create a generic NativeTool wrapper for tools
+                // whose execute() lives in omega-tools.
+                tracing::warn!(
+                    "Native tool '{}' is defined in omega-tool-defs but has no in-process implementation yet",
+                    def.name
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,49 +202,5 @@ mod tests {
             registry.get("Transfer").is_some(),
             "Transfer should have been added"
         );
-    }
-}
-
-use omega_llm::{types::CustomTool, ToolDefinition};
-
-/// Convert a canonical `ToolDef` into a `ToolDefinition` for the LLM.
-///
-/// This is the single conversion point used by both native tool
-/// implementations and proxy tools.
-pub fn def_to_tool_definition(def: &omega_tool_defs::ToolDef) -> ToolDefinition {
-    ToolDefinition::Custom(CustomTool {
-        name: def.name.to_string(),
-        description: Some(def.description.to_string()),
-        input_schema: serde_json::from_str(def.input_schema_json)
-            .expect("invalid ToolInputSchema in ToolDef"),
-        tool_type: None,
-        cache_control: None,
-    })
-}
-
-/// Register all default in-process tools into the given registry.
-///
-/// These tools run directly in the agent process and don't need
-/// an external executor like omega-sh.
-pub fn register_default_tools(registry: &mut ToolRegistry) {
-    // In-process tools that don't need omega-sh
-    registry.register(TransferTool::new());
-
-    // Auto-register any future native tools from the canonical defs.
-    // Native tools that need special runtime access (like Transfer)
-    // are registered above; the loop catches any that
-    // don't need special setup but are marked Native in omega-tool-defs.
-    for &def in omega_tool_defs::ALL {
-        if def.kind == omega_tool_defs::ToolKind::Native {
-            // Check if already registered by name to avoid duplicates.
-            if registry.get(def.name).is_none() {
-                // TODO: create a generic NativeTool wrapper for tools
-                // whose execute() lives in omega-tools.
-                tracing::warn!(
-                    "Native tool '{}' is defined in omega-tool-defs but has no in-process implementation yet",
-                    def.name
-                );
-            }
-        }
     }
 }

@@ -5,485 +5,22 @@
 //! the reader to receive events.
 
 use anyhow::{Context, Result};
-use omega_core::core::{RoleInfo, SessionInfo};
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+/// Re-export core so UI crates can construct canonical chunk fixtures without
+/// adding a second direct protocol dependency.
+pub use omega_core;
 
 /// Re-exported project types so clients only need to depend on this crate.
 pub use omega_projects::{ActiveProject, ProjectInfo};
 
-// ---------------------------------------------------------------------------
-// Wire types (deserialization of server → client events)
-// ---------------------------------------------------------------------------
-
-/// An event received from the agent daemon.
-#[derive(Debug)]
-pub enum ServerEvent {
-    /// A new session was created.
-    Created {
-        session_id: String,
-        session_name: String,
-    },
-    /// A chunk of streaming output from a session.
-    Chunk {
-        session_id: String,
-        chunk: OutputChunk,
-    },
-    /// List of available sessions (response to list_sessions), sorted
-    /// most-recently-updated first by the daemon.
-    SessionList { sessions: Vec<SessionInfo> },
-    /// A session was resumed.
-    SessionResumed {
-        session_id: String,
-        session_name: String,
-    },
-    /// A historical message replayed when resuming a session, rendered
-    /// exactly like a live user/assistant turn.
-    HistoryMessage {
-        session_id: String,
-        role: String,
-        content: String,
-    },
-    /// Model was changed.
-    ModelChanged { model: String },
-    /// Session was compacted.
-    SessionCompacted { session_id: String },
-    /// A list of available models from the daemon.
-    ModelList { models: Vec<String> },
-    /// Registered projects (response to list_projects).
-    ProjectList { projects: Vec<ProjectInfo> },
-    /// Named roles / alternative system prompts (response to list_roles).
-    RoleList { roles: Vec<RoleInfo> },
-    /// A project was activated for the current session: the daemon created
-    /// a dedicated git worktree the session will operate in.
-    ProjectActive {
-        project: ProjectInfo,
-        worktree_path: String,
-        branch: String,
-    },
-    /// A system message from the daemon.
-    SystemMsg(String),
-    /// An unrecognised variant (forward-compatibility).
-    Unknown(Value),
-}
-
-/// A decoded output chunk from the agent daemon, mirroring the relevant
-/// variants of `omega::core::OutputChunk`.
-#[derive(Debug)]
-pub enum OutputChunk {
-    TextDelta(String),
-    TextComplete(String),
-    ThinkingDelta(String),
-    ThinkingComplete(String),
-    ToolStart {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    ToolProgress {
-        id: String,
-        output: String,
-    },
-    ToolEnd {
-        id: String,
-        name: String,
-        input: Value,
-        result: ToolResultWire,
-    },
-    PermissionRequest {
-        tool_name: String,
-        action: String,
-        input: String,
-        details: Option<String>,
-    },
-    Status(String),
-    Error(String),
-    Done,
-    /// Prompt caching telemetry from the last LLM call
-    CacheTelemetry {
-        input_tokens: u32,
-        output_tokens: u32,
-        cache_read_tokens: u32,
-        cache_creation_tokens: u32,
-    },
-    Unknown,
-}
-
-#[derive(Debug)]
-pub struct ToolResultWire {
-    pub text: String,
-    pub is_error: bool,
-    pub content: Option<Vec<ContentBlockWire>>,
-}
-
-#[derive(Debug)]
-pub struct ContentBlockWire {
-    pub block_type: String,
-    pub text: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Custom JSON deserialization
-// ---------------------------------------------------------------------------
-
-fn parse_chunk(val: &Value) -> OutputChunk {
-    match val {
-        Value::String(s) if s == "Done" => OutputChunk::Done,
-        Value::Object(map) => {
-            // Externally tagged serde representation uses the variant name as key.
-            // Find the first key that matches a known variant.
-            if let Some((key, inner)) = map.iter().next() {
-                return match key.as_str() {
-                    "TextDelta" => inner
-                        .as_str()
-                        .map(|s| OutputChunk::TextDelta(s.to_string()))
-                        .unwrap_or(OutputChunk::Unknown),
-                    "TextComplete" => inner
-                        .as_str()
-                        .map(|s| OutputChunk::TextComplete(s.to_string()))
-                        .unwrap_or(OutputChunk::Unknown),
-                    "ThinkingDelta" => inner
-                        .as_str()
-                        .map(|s| OutputChunk::ThinkingDelta(s.to_string()))
-                        .unwrap_or(OutputChunk::Unknown),
-                    "ThinkingComplete" => inner
-                        .as_str()
-                        .map(|s| OutputChunk::ThinkingComplete(s.to_string()))
-                        .unwrap_or(OutputChunk::Unknown),
-                    "ToolStart" => {
-                        let id = inner
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = inner
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input = inner.get("input").cloned().unwrap_or(Value::Null);
-                        OutputChunk::ToolStart { id, name, input }
-                    }
-                    "ToolProgress" => {
-                        let id = inner
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let output = inner
-                            .get("output")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        OutputChunk::ToolProgress { id, output }
-                    }
-                    "ToolEnd" => {
-                        let id = inner
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = inner
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input = inner.get("input").cloned().unwrap_or(Value::Null);
-                        let result = parse_tool_result(inner.get("result")).unwrap_or_else(|| {
-                            ToolResultWire {
-                                text: String::new(),
-                                is_error: false,
-                                content: None,
-                            }
-                        });
-                        OutputChunk::ToolEnd {
-                            id,
-                            name,
-                            input,
-                            result,
-                        }
-                    }
-                    "PermissionRequest" => {
-                        let tool_name = inner
-                            .get("tool_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let action = inner
-                            .get("action")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input = inner
-                            .get("input")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let details = inner
-                            .get("details")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        OutputChunk::PermissionRequest {
-                            tool_name,
-                            action,
-                            input,
-                            details,
-                        }
-                    }
-                    "Status" => inner
-                        .as_str()
-                        .map(|s| OutputChunk::Status(s.to_string()))
-                        .unwrap_or(OutputChunk::Unknown),
-                    "Error" => inner
-                        .as_str()
-                        .map(|s| OutputChunk::Error(s.to_string()))
-                        .unwrap_or(OutputChunk::Unknown),
-                    "CacheTelemetry" => {
-                        let input_tokens = inner
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        let output_tokens = inner
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        let cache_read_tokens = inner
-                            .get("cache_read_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        let cache_creation_tokens = inner
-                            .get("cache_creation_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                            as u32;
-                        OutputChunk::CacheTelemetry {
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            cache_creation_tokens,
-                        }
-                    }
-                    "StateChange" => OutputChunk::Unknown,
-                    _ => OutputChunk::Unknown,
-                };
-            }
-            OutputChunk::Unknown
-        }
-        _ => OutputChunk::Unknown,
-    }
-}
-
-fn parse_tool_result(val: Option<&Value>) -> Option<ToolResultWire> {
-    let val = val?;
-    let is_error = val
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // Extract text from the serde externally-tagged ToolResultData::Text variant.
-    let text = val
-        .get("content")
-        .and_then(|c| c.as_object())
-        .and_then(|obj| {
-            if let Some(text_val) = obj.get("Text") {
-                text_val.as_str().map(|s| s.to_string())
-            } else if let Some(_img) = obj.get("Image") {
-                Some("[Image]".to_string())
-            } else if let Some(doc) = obj.get("Document") {
-                doc.get("description")
-                    .and_then(|d| d.as_str())
-                    .map(|d| format!("[Document: {d}]"))
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    Some(ToolResultWire {
-        text,
-        is_error,
-        content: None,
-    })
-}
-
-impl ServerEvent {
-    /// Parse a line of JSON received from the daemon.
-    pub fn from_json_line(line: &str) -> Result<Self> {
-        let val: Value = serde_json::from_str(line)?;
-        let obj = val
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Server event is not a JSON object"))?;
-        let type_name = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match type_name {
-            "Created" => Ok(ServerEvent::Created {
-                session_id: obj
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                session_name: obj
-                    .get("session_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }),
-            "Chunk" => {
-                let session_id = obj
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let chunk_val = obj.get("chunk").cloned().unwrap_or(Value::Null);
-                let chunk = parse_chunk(&chunk_val);
-                Ok(ServerEvent::Chunk { session_id, chunk })
-            }
-            "SessionList" => {
-                let sessions = obj
-                    .get("sessions")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| serde_json::from_value::<SessionInfo>(v.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(ServerEvent::SessionList { sessions })
-            }
-            "SessionResumed" => Ok(ServerEvent::SessionResumed {
-                session_id: obj
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                session_name: obj
-                    .get("session_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }),
-            "HistoryMessage" => Ok(ServerEvent::HistoryMessage {
-                session_id: obj
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                role: obj
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                content: obj
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }),
-            "ModelChanged" => Ok(ServerEvent::ModelChanged {
-                model: obj
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }),
-            "SessionCompacted" => Ok(ServerEvent::SessionCompacted {
-                session_id: obj
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }),
-            "ModelList" => Ok(ServerEvent::ModelList {
-                models: obj
-                    .get("models")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }),
-            "ProjectList" => {
-                let projects = obj
-                    .get("projects")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| serde_json::from_value::<ProjectInfo>(v.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(ServerEvent::ProjectList { projects })
-            }
-            "RoleList" => {
-                let roles = obj
-                    .get("roles")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| serde_json::from_value::<RoleInfo>(v.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(ServerEvent::RoleList { roles })
-            }
-            "ProjectActive" => {
-                let project = obj
-                    .get("project")
-                    .and_then(|v| serde_json::from_value::<ProjectInfo>(v.clone()).ok())
-                    .unwrap_or_else(|| ProjectInfo {
-                        name: String::new(),
-                        url: String::new(),
-                        default_branch: None,
-                        created_at: Default::default(),
-                    });
-                Ok(ServerEvent::ProjectActive {
-                    project,
-                    worktree_path: obj
-                        .get("worktree_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    branch: obj
-                        .get("branch")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                })
-            }
-            "SystemMsg" => Ok(ServerEvent::SystemMsg(
-                obj.get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            )),
-            _ => Ok(ServerEvent::Unknown(val)),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Client
-// ---------------------------------------------------------------------------
-
-/// Session configuration sent with a `run` request.
-#[derive(Debug, Clone)]
-pub struct SessionConfig {
-    pub stream: bool,
-    pub think: bool,
-    pub no_cache: bool,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            stream: true,
-            think: false,
-            no_cache: false,
-        }
-    }
-}
+// Canonical wire types are shared with the daemon.  Re-export them so UI
+// crates retain the omega-loop-client-only dependency surface.
+pub use omega_core::core::OutputChunk;
+pub use omega_protocol::daemon::{
+    tool_result_text, ClientRequest, ServerEvent, SessionConfig, WireChunk,
+};
 
 /// Read half of a daemon connection — reads events from the socket.
 pub struct DaemonReader {
@@ -563,26 +100,14 @@ impl DaemonWriter {
         project: Option<&ActiveProject>,
         role: Option<&str>,
     ) -> Result<()> {
-        let mut req = serde_json::json!({
-            "type": "run",
-            "session_id": session_id,
-            "content": content,
-            "config": {
-                "stream": config.stream,
-                "think": config.think,
-                "no_cache": config.no_cache,
-            },
-        });
-        if let Some(m) = model {
-            req["model"] = serde_json::json!(m);
-        }
-        if let Some(p) = project {
-            req["project"] = serde_json::to_value(p)?;
-        }
-        if let Some(r) = role {
-            req["role"] = serde_json::json!(r);
-        }
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("run");
+        request.session_id = Some(session_id.to_string());
+        request.content = Some(content.to_string());
+        request.config = Some(config.clone());
+        request.model = model.map(str::to_string);
+        request.project = project.cloned();
+        request.role = role.map(str::to_string);
+        self.write_request(&request).await
     }
 
     /// Request the list of available sessions from the daemon.
@@ -591,61 +116,46 @@ impl DaemonWriter {
     /// the daemon against session id / name / conversation name / last
     /// message. The result is sorted most-recently-updated first.
     pub async fn send_list_sessions(&mut self, query: Option<&str>) -> Result<()> {
-        let mut req = serde_json::json!({
-            "type": "list_sessions",
-        });
-        if let Some(q) = query {
-            if !q.trim().is_empty() {
-                req["query"] = serde_json::json!(q.trim());
-            }
-        }
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("list_sessions");
+        request.query = query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_string);
+        self.write_request(&request).await
     }
 
     /// Request the list of available models from the daemon.
     pub async fn send_list_models(&mut self) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "list_models",
-        });
-        self.write_json(&req).await
+        self.write_request(&ClientRequest::new("list_models")).await
     }
 
     /// Request the list of registered projects from the daemon.
     pub async fn send_list_projects(&mut self) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "list_projects",
-        });
-        self.write_json(&req).await
+        self.write_request(&ClientRequest::new("list_projects"))
+            .await
     }
 
     /// Request the list of available roles (named alternative system
     /// prompts) from the daemon.
     pub async fn send_list_roles(&mut self) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "list_roles",
-        });
-        self.write_json(&req).await
+        self.write_request(&ClientRequest::new("list_roles")).await
     }
 
     /// Activate a project for a session: `spec` is a registered project
     /// name or a git URL. The daemon clones the repo if needed and creates
     /// a dedicated git worktree for the session.
     pub async fn send_activate_project(&mut self, session_id: &str, spec: &str) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "activate_project",
-            "session_id": session_id,
-            "spec": spec,
-        });
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("activate_project");
+        request.session_id = Some(session_id.to_string());
+        request.spec = Some(spec.to_string());
+        self.write_request(&request).await
     }
 
     /// Resume an existing session by ID.
     pub async fn send_resume_session(&mut self, session_id: &str) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "resume_session",
-            "session_id": session_id,
-        });
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("resume_session");
+        request.session_id = Some(session_id.to_string());
+        self.write_request(&request).await
     }
 
     /// Change the model for a session. A `max_tokens` of `Some(n)` overrides
@@ -657,35 +167,29 @@ impl DaemonWriter {
         model: &str,
         max_tokens: Option<u32>,
     ) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "set_model",
-            "session_id": session_id,
-            "model": model,
-            "max_tokens": max_tokens,
-        });
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("set_model");
+        request.session_id = Some(session_id.to_string());
+        request.model = Some(model.to_string());
+        request.max_tokens = max_tokens;
+        self.write_request(&request).await
     }
 
     /// Compact the current session (summarize/trim history).
     pub async fn send_compact(&mut self, session_id: &str) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "compact",
-            "session_id": session_id,
-        });
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("compact");
+        request.session_id = Some(session_id.to_string());
+        self.write_request(&request).await
     }
 
     /// Interrupt the current LLM response.
     pub async fn send_interrupt(&mut self, session_id: &str) -> Result<()> {
-        let req = serde_json::json!({
-            "type": "interrupt",
-            "session_id": session_id,
-        });
-        self.write_json(&req).await
+        let mut request = ClientRequest::new("interrupt");
+        request.session_id = Some(session_id.to_string());
+        self.write_request(&request).await
     }
 
-    async fn write_json(&mut self, value: &Value) -> Result<()> {
-        let json = serde_json::to_string(value)?;
+    async fn write_request(&mut self, request: &ClientRequest) -> Result<()> {
+        let json = serde_json::to_string(request)?;
         self.writer.write_all(json.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
         Ok(())
@@ -766,7 +270,21 @@ mod tests {
         let json = r#"{"type":"ModelChanged","model":"gpt-4o"}"#;
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
-            ServerEvent::ModelChanged { model } => {
+            ServerEvent::ModelChanged { session_id, model } => {
+                assert!(session_id.is_empty());
+                assert_eq!(model, "gpt-4o");
+            }
+            _ => panic!("Expected ModelChanged event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_changed_event_with_session_identity() {
+        let json = r#"{"type":"ModelChanged","session_id":"sess1","model":"gpt-4o"}"#;
+        let event = ServerEvent::from_json_line(json).unwrap();
+        match event {
+            ServerEvent::ModelChanged { session_id, model } => {
+                assert_eq!(session_id, "sess1");
                 assert_eq!(model, "gpt-4o");
             }
             _ => panic!("Expected ModelChanged event"),
@@ -778,8 +296,8 @@ mod tests {
         let json = r#"{"type":"SystemMsg","message":"Hello world"}"#;
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
-            ServerEvent::SystemMsg(msg) => {
-                assert_eq!(msg, "Hello world");
+            ServerEvent::SystemMsg { message } => {
+                assert_eq!(message, "Hello world");
             }
             _ => panic!("Expected SystemMsg event"),
         }
@@ -800,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_send_list_roles_json_shape() {
-        let json = serde_json::json!({"type": "list_roles"});
+        let json = serde_json::to_value(ClientRequest::new("list_roles")).unwrap();
         assert_eq!(json["type"], "list_roles");
     }
 
@@ -809,12 +327,7 @@ mod tests {
         let json = r#"{"type":"UnknownType","foo":"bar"}"#;
         let event = ServerEvent::from_json_line(json).unwrap();
         match event {
-            ServerEvent::Unknown(val) => {
-                assert_eq!(
-                    val.get("type").and_then(|v| v.as_str()),
-                    Some("UnknownType")
-                );
-            }
+            ServerEvent::Unknown => {}
             _ => panic!("Expected Unknown event"),
         }
     }
@@ -855,20 +368,18 @@ mod tests {
     #[test]
     fn test_output_chunk_parse_text_delta() {
         let json = r#"{"TextDelta":"Hello"}"#;
-        let val: serde_json::Value = serde_json::from_str(json).unwrap();
-        let chunk = parse_chunk(&val);
+        let chunk: WireChunk = serde_json::from_str(json).unwrap();
         match chunk {
-            OutputChunk::TextDelta(s) => assert_eq!(s, "Hello"),
+            WireChunk::Known(OutputChunk::TextDelta(s)) => assert_eq!(s, "Hello"),
             _ => panic!("Expected TextDelta"),
         }
     }
 
     #[test]
     fn test_output_chunk_parse_done() {
-        let val = serde_json::Value::String("Done".to_string());
-        let chunk = parse_chunk(&val);
+        let chunk: WireChunk = serde_json::from_str(r#""Done""#).unwrap();
         match chunk {
-            OutputChunk::Done => {}
+            WireChunk::Known(OutputChunk::Done) => {}
             _ => panic!("Expected Done"),
         }
     }
@@ -889,16 +400,11 @@ mod tests {
 
     #[test]
     fn test_send_run_json_shape() {
-        let json = serde_json::json!({
-            "type": "run",
-            "session_id": "sess-1",
-            "content": "Hello",
-            "config": {
-                "stream": true,
-                "think": false,
-                "no_cache": false,
-            },
-        });
+        let mut request = ClientRequest::new("run");
+        request.session_id = Some("sess-1".into());
+        request.content = Some("Hello".into());
+        request.config = Some(SessionConfig::default());
+        let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["type"], "run");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["content"], "Hello");
@@ -918,19 +424,20 @@ mod tests {
             worktree_path: "/tmp/wt/omega/sess-1".into(),
             branch: "omega/sess-1-abc123".into(),
         };
-        let json = serde_json::to_value(&active).unwrap();
-        assert_eq!(json["project"]["name"], "omega");
-        assert_eq!(json["worktree_path"], "/tmp/wt/omega/sess-1");
-        assert_eq!(json["branch"], "omega/sess-1-abc123");
+        let mut request = ClientRequest::new("run");
+        request.project = Some(active);
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["project"]["project"]["name"], "omega");
+        assert_eq!(json["project"]["worktree_path"], "/tmp/wt/omega/sess-1");
+        assert_eq!(json["project"]["branch"], "omega/sess-1-abc123");
     }
 
     #[test]
     fn test_send_activate_project_json_shape() {
-        let json = serde_json::json!({
-            "type": "activate_project",
-            "session_id": "sess-1",
-            "spec": "https://example.com/omega.git",
-        });
+        let mut request = ClientRequest::new("activate_project");
+        request.session_id = Some("sess-1".into());
+        request.spec = Some("https://example.com/omega.git".into());
+        let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["type"], "activate_project");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["spec"], "https://example.com/omega.git");
@@ -938,41 +445,41 @@ mod tests {
 
     #[test]
     fn test_send_list_projects_json_shape() {
-        let json = serde_json::json!({"type": "list_projects"});
+        let json = serde_json::to_value(ClientRequest::new("list_projects")).unwrap();
         assert_eq!(json["type"], "list_projects");
     }
 
     #[test]
     fn test_send_list_sessions_json_shape() {
-        let json = serde_json::json!({"type": "list_sessions"});
+        let json = serde_json::to_value(ClientRequest::new("list_sessions")).unwrap();
         assert_eq!(json["type"], "list_sessions");
     }
 
     #[test]
     fn test_send_list_sessions_with_query() {
-        let json = serde_json::json!({"type": "list_sessions", "query": "build"});
+        let mut request = ClientRequest::new("list_sessions");
+        request.query = Some("build".into());
+        let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["type"], "list_sessions");
         assert_eq!(json["query"], "build");
     }
 
     #[test]
     fn test_send_resume_session_json_shape() {
-        let json = serde_json::json!({
-            "type": "resume_session",
-            "session_id": "sess-1",
-        });
+        let mut request = ClientRequest::new("resume_session");
+        request.session_id = Some("sess-1".into());
+        let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["type"], "resume_session");
         assert_eq!(json["session_id"], "sess-1");
     }
 
     #[test]
     fn test_send_set_model_json_shape() {
-        let json = serde_json::json!({
-            "type": "set_model",
-            "session_id": "sess-1",
-            "model": "claude-3.5",
-            "max_tokens": 8192,
-        });
+        let mut request = ClientRequest::new("set_model");
+        request.session_id = Some("sess-1".into());
+        request.model = Some("claude-3.5".into());
+        request.max_tokens = Some(8192);
+        let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["type"], "set_model");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["model"], "claude-3.5");
@@ -981,10 +488,9 @@ mod tests {
 
     #[test]
     fn test_send_compact_json_shape() {
-        let json = serde_json::json!({
-            "type": "compact",
-            "session_id": "sess-1",
-        });
+        let mut request = ClientRequest::new("compact");
+        request.session_id = Some("sess-1".into());
+        let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["type"], "compact");
         assert_eq!(json["session_id"], "sess-1");
     }

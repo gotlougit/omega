@@ -3,7 +3,7 @@ name = "omega-git-host"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Read-only self-hosted git forge + web UI over the omega project store"
+description = "Fetch-only self-hosted git forge + management UI over the omega project store"
 
 [dependencies]
 # Workspace crates

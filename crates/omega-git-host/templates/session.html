@@ -7,6 +7,8 @@
 {% block content %}
 <div class="row">
   <div class="col-md-8">
+    {% if error %}<p class="text-danger" role="alert">{{ error | e }}</p>{% endif %}
+    {% if ok %}<p class="text-success" role="status">{{ ok | e }}</p>{% endif %}
     <h3>{{ session.display_name }}</h3>
     {% if session.description %}<p class="text-muted">{{ session.description }}</p>{% endif %}
     <dl>
@@ -18,7 +20,7 @@
       {% endif %}
       {% if session.model %}
       <dt>model</dt>
-      <dd>{{ session.model }}</dd>
+      <dd id="session-model">{{ session.model | e }}</dd>
       {% endif %}
       {% if session.provider %}
       <dt>provider</dt>
@@ -45,9 +47,34 @@
         (<a href="/{{ session.project }}/log/{{ session.branch }}">log</a>)
       </dd>
       {% endif %}
+      <dt>changes so far</dt>
+      <dd>
+        <a href="/sessions/{{ session.session_id }}/changes">view committed and worktree diff</a>
+      </dd>
       <dt>system prompt</dt>
       <dd><a href="/sessions/{{ session.session_id }}/system-prompt">view</a></dd>
     </dl>
+
+    <div class="session-controls">
+      <h4>Session controls</h4>
+      <form method="post" action="/sessions/{{ session.session_id | e }}/model" class="form-inline">
+        <div class="form-group">
+          <label for="session-model-select">Model</label>
+          <select class="form-control" id="session-model-select" name="model"{% if not models %} disabled{% endif %}>
+            {% for model in models %}
+            <option value="{{ model | e }}"{% if model == session.model %} selected{% endif %}>{{ model | e }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <button type="submit" class="btn btn-default"{% if not models %} disabled{% endif %}>Change model</button>
+      </form>
+      {% if models_error %}<p class="text-danger"><small>Models unavailable: {{ models_error | e }}</small></p>{% endif %}
+      <form method="post" action="/sessions/{{ session.session_id | e }}/compact"
+            onsubmit="return window.confirm('Compact this session now? Its existing transcript will be replaced by a shorter continuation summary.');">
+        <button type="submit" class="btn btn-warning">Compact session…</button>
+        <span class="text-muted">Only idle sessions can be compacted.</span>
+      </form>
+    </div>
 
     {% if truncated %}
     <p class="text-muted">Showing the last {{ messages|length }} of {{ total }} messages.</p>
@@ -58,7 +85,7 @@
        client-side live.js renders *live* turns into the same markup (same
        CSS classes), so a streamed assistant reply looks exactly like a
        persisted one. #}
-    {% if live %}<div id="live-conversation" data-stream-url="{{ stream_url | safe }}">{% endif %}
+    {% if live %}<div id="live-conversation" data-stream-url="{{ stream_url | e }}" data-session-id="{{ session.session_id | e }}">{% endif %}
 
     {% for m in messages %}
     <div class="session-message {{ m.role }}">
@@ -110,7 +137,6 @@
     {% if live %}</div>{% endif %}
 
     {% if live %}
-    {% if stream_error %}<p class="text-danger">{{ stream_error }}</p>{% endif %}
     <p class="text-muted" id="live-status"></p>
     <form method="post" action="/sessions/{{ session.session_id }}/message">
       <div class="form-group">

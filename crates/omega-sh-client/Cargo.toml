@@ -8,6 +8,7 @@ license = "AGPL-3.0-or-later"
 # Workspace crates
 omega-core = { path = "../omega-core" }
 omega-llm = { path = "../omega-llm" }
+omega-protocol = { path = "../omega-protocol" }
 omega-tools = { path = "../omega-tools" }
 omega-tool-defs = { path = "../omega-tool-defs" }
 
@@ -15,7 +16,6 @@ omega-tool-defs = { path = "../omega-tool-defs" }
 tokio = { version = "1.0", features = ["full", "net", "io-util"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Base64

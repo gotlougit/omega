@@ -1,0 +1,117 @@
+{% extends "layout.html" %}
+
+{% block title %}
+<title>{{ page.session.display_name | e }} changes - omega-git-host</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col-md-12">
+    <div class="d-flex flex-wrap align-items-start justify-content-between mb-3">
+      <div>
+        <h3>{{ page.session.display_name | e }}: changes so far</h3>
+        <p class="text-muted mb-0">
+          A live snapshot of the session branch, index, worktree, and untracked files.
+          Generated {{ page.generated_at | date | e }} UTC.
+        </p>
+      </div>
+      <div class="changes-actions">
+        <a class="btn btn-primary" href="/sessions/{{ page.session.session_id | e }}/changes">Refresh now</a>
+        <a class="btn btn-default" href="/sessions/{{ page.session.session_id | e }}">Transcript</a>
+        <a class="btn btn-default" href="/sessions/{{ page.session.session_id | e }}/live">Live chat</a>
+      </div>
+    </div>
+
+    {% if page.unavailable %}
+    <div class="alert alert-warning">
+      <strong>Changes unavailable.</strong> {{ page.unavailable | e }}
+      Refresh after the worktree or session metadata is repaired.
+    </div>
+    {% elif page.changes %}
+    <dl class="changes-metadata">
+      <dt>project</dt>
+      <dd><a href="/{{ page.changes.project | e }}/">{{ page.changes.project | e }}</a></dd>
+      <dt>branch</dt>
+      <dd><code>{{ page.changes.branch | e }}</code></dd>
+      <dt>compared with</dt>
+      <dd><code>{{ page.changes.default_branch | e }}</code>{% if page.changes.merge_base %} at merge base <code>{{ page.changes.merge_base | e }}</code>{% endif %}</dd>
+      <dt>worktree HEAD</dt>
+      <dd><code>{{ page.changes.head | e }}</code></dd>
+    </dl>
+
+    {% if page.changes.truncated %}
+    <div class="alert alert-warning">
+      <strong>This snapshot was truncated.</strong>
+      The notices below identify each reached output or file limit. Refreshing will reread the worktree but will not raise those safety limits.
+    </div>
+    {% endif %}
+
+    {% for section in page.changes.sections %}
+    <section class="change-section">
+      <h4>{{ section.label | e }}</h4>
+      <p class="text-muted">{{ section.description | e }}</p>
+      {% if section.error %}
+      <div class="alert alert-warning">{{ section.error | e }}</div>
+      {% else %}
+        {% if section.stat %}
+        <div class="event-list mb-3">
+          <div class="event diff"><pre>{{ section.stat | diff }}</pre></div>
+        </div>
+        {% endif %}
+        {% for file in section.files %}
+        <div class="change-file">
+          <pre class="change-file-header mb-0 bg-transparent p-0"><strong>{{ file.header | e }}</strong></pre>
+          {% if file.patch %}
+          <div class="event-list mb-3">
+            <div class="event diff"><pre>{{ file.patch | diff }}</pre></div>
+          </div>
+          {% endif %}
+        </div>
+        {% endfor %}
+        {% if not section.stat and not section.files %}
+        <p class="text-muted">No changes in this layer.</p>
+        {% endif %}
+      {% endif %}
+      {% if section.truncation_notice %}
+      <div class="alert alert-warning">{{ section.truncation_notice | e }}</div>
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    <section class="change-section">
+      <h4>Untracked files</h4>
+      <p class="text-muted">
+        Files Git does not track yet. Small regular text files include a new-file patch;
+        binary, symlink, special, and oversized files are listed without reading their content.
+      </p>
+      {% if page.changes.untracked.files %}
+      <div class="event-list mb-3 untracked-list">
+        {% for file in page.changes.untracked.files %}
+        <div class="event">
+          <code>{{ file.path | e }}</code>
+          {% if file.size is not none %}<small class="text-muted">({{ file.size | e }} bytes)</small>{% endif %}
+          {% if file.omission %}<span class="pull-right text-muted">{{ file.omission | e }}</span>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% for file in page.changes.untracked.files %}
+        {% if file.patch %}
+        <div class="change-file">
+          <pre class="change-file-header mb-0 bg-transparent p-0"><strong>new {{ file.path | e }}</strong></pre>
+          <div class="event-list mb-3">
+            <div class="event diff"><pre>{{ file.patch | diff }}</pre></div>
+          </div>
+        </div>
+        {% endif %}
+      {% endfor %}
+      {% else %}
+      <p class="text-muted">No untracked files.</p>
+      {% endif %}
+      {% if page.changes.untracked.truncation_notice %}
+      <div class="alert alert-warning">{{ page.changes.untracked.truncation_notice | e }}</div>
+      {% endif %}
+    </section>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

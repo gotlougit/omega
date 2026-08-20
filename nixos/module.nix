@@ -159,7 +159,7 @@ let
   # omega-projects/src/rebase.rs `DEFAULT_UPDATE_INSTRUCTION` — keep in sync.
   defaultRebaseUpdatePrompt = ''
     Keep your checkout up to date with upstream. Before starting work in this project,
-    update your checkout: run `git fetch origin` (if your worktree predates the latest
+    update your checkout: run `git fetch upstream` (if your worktree predates the latest
     upstream), then rebase your worktree branch onto the project's up-to-date main branch
     so the worktree is on top of the latest upstream changes. The project's main branch is
     kept in sync with upstream by a periodic job, so a simple `git rebase {branch}` is
@@ -178,8 +178,8 @@ let
     can't add) on top of the upstream history.
 
     When you are woken (by the periodic rebase job or by the user), do this:
-    1. Run `git fetch origin` so the upstream refs are current.
-    2. Rebase the main branch onto the latest upstream (`git rebase origin/{branch}` in
+    1. Run `git fetch upstream` so the upstream refs are current.
+    2. Rebase the main branch onto the latest upstream (`git rebase upstream/{branch}` in
        your worktree). The worktree is your sole writer of the main branch.
     3. If the rebase stops on conflicts, resolve them yourself: keep the intent of
        upstream's changes AND preserve the local-only functionality. When in doubt, keep
@@ -572,15 +572,15 @@ in
     };
 
     # -------------------------------------------------------------------
-    # omega-git-host — read-only git forge + web UI over the project store
+    # omega-git-host — fetch-only git forge + management UI over the project store
     # -------------------------------------------------------------------
     gitHost = mkOption {
       type = types.submodule {
         options = {
           enable = mkEnableOption ''
-            omega-git-host, the read-only git forge + web UI over the
+            omega-git-host, the git forge + web UI over the
             project store (git clone /{name}.git, repo pages, session
-            transcripts)
+            transcripts, rebase controls, and safe GitHub mirror pushes)
           '';
 
           port = mkOption {
@@ -594,18 +594,45 @@ in
             default = "127.0.0.1";
             description = ''
               Address to bind.  Defaults to loopback on purpose: the forge
-              serves full session transcripts (possibly sensitive) and is
-              read-only — expose it deliberately (SSH tunnel, reverse
+              serves full session transcripts (possibly sensitive) and a
+              management UI that can mutate repositories and credentials —
+              expose it deliberately (SSH tunnel, authenticated reverse
               proxy, tailscale) rather than binding it openly.
+            '';
+          };
+
+          mirrorCredentialsDir = mkOption {
+            type = types.path;
+            default = "${omegaDir}/mirror-credentials";
+            defaultText = literalExpression ''"/persist/clanker/omega/mirror-credentials"'';
+            description = ''
+              Private directory for per-project GitHub mirror credentials
+              entered through the web UI. Files are created mode 0600 and
+              the directory is mode 0700. This is separate from the
+              non-secret project-store JSON.
+            '';
+          };
+
+          githubTokenFile = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "/run/secrets/omega-github-token";
+            description = ''
+              Optional absolute path to a default GitHub PAT credential.
+              systemd loads it with LoadCredential for omega-loop and
+              omega-git-host; token content is never copied into the Nix
+              store or an Environment value. A per-project token entered in
+              the web UI takes precedence.
             '';
           };
         };
       };
       default = { };
       description = ''
-        Read-only git hosting + web UI for everything omega works on
-        (SELFGIT.md).  Serves every registered project as a smart-HTTP
-        remote, session worktrees as branches, and session transcripts.
+        Fetch-only git hosting + management UI for everything omega works on
+        (SELFGIT.md). Serves every registered project as a smart-HTTP remote,
+        session worktrees as branches, and session transcripts; the control
+        panel manages projects, rebases, chats, and distinct GitHub mirrors.
       '';
     };
 
@@ -682,6 +709,19 @@ in
             and configure the clanker user there instead.
           '';
         }
+        {
+          assertion =
+            cfg.gitHost.githubTokenFile == null
+            || (
+              lib.hasPrefix "/" cfg.gitHost.githubTokenFile
+              && !lib.hasPrefix "/nix/store/" cfg.gitHost.githubTokenFile
+            );
+          message = ''
+            services.omega.gitHost.githubTokenFile must be an absolute
+            runtime secret path outside /nix/store (for example
+            /run/secrets/omega-github-token).
+          '';
+        }
       ];
 
       # ----- users & groups -------------------------------------------------
@@ -726,6 +766,7 @@ in
       systemd.tmpfiles.rules = [
         "d /run/omega 0770 ${clankerUser} ${clankerGroup} -"
         "d ${omegaDir} 0770 ${clankerUser} ${clankerGroup} -"
+        "d ${cfg.gitHost.mirrorCredentialsDir} 0700 ${clankerUser} ${clankerGroup} -"
       ];
 
       # ----- systemd services ----------------------------------------------
@@ -815,8 +856,10 @@ in
             "OMEGA_ROLES_PATH=${rolesPath}"
             "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
             "OMEGA_SESSION_DIR=${cfg.sessionDir}"
+            "OMEGA_MIRROR_CREDENTIALS_DIR=${cfg.gitHost.mirrorCredentialsDir}"
             "RUST_LOG=${cfg.logLevel}"
           ]
+          ++ optional (cfg.gitHost.githubTokenFile != null) "OMEGA_GITHUB_TOKEN_FILE=%d/omega-github-token"
           ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}"
           ++ optional (cfg.envFile != null) "OPENAI_RESPONSES_ENV_FILE=${toString cfg.envFile}";
 
@@ -825,7 +868,13 @@ in
           PrivateTmp = true;
           ProtectSystem = "full";
           ProtectHome = false;
-          ReadWritePaths = [ clankerHome ];
+          ReadWritePaths = [
+            clankerHome
+            cfg.gitHost.mirrorCredentialsDir
+          ];
+
+          LoadCredential = optional (cfg.gitHost.githubTokenFile != null)
+            "omega-github-token:${cfg.gitHost.githubTokenFile}";
 
           RuntimeDirectory = "omega";
           RuntimeDirectoryMode = "0770";
@@ -850,15 +899,15 @@ in
         '';
       };
 
-      # omega-git-host — read-only git forge + web UI (Phase 5: NixOS service)
+      # omega-git-host — git forge + web UI (Phase 5: NixOS service)
       systemd.services.omega-git-host = mkIf cfg.gitHost.enable {
-        description = "Omega-git-host (read-only git forge + web UI)";
+        description = "Omega-git-host (git forge + web UI)";
         after = [
           "network.target"
           "omega-loop.service"
         ];
-        # `wants`, not `requires`: the forge is a read-only view over the store
-        # dirs and must keep serving even if the daemon is down or restarts.
+        # `wants`, not `requires`: browsing/fetching and project/mirror controls
+        # remain useful even if the loop daemon is down or restarts.
         wants = [ "omega-loop.service" ];
         wantedBy = [ "multi-user.target" ];
         # Unlike the NixOS systemd default PATH, make git (and the user's extra
@@ -883,28 +932,35 @@ in
             "OMEGA_ROLES_PATH=${rolesPath}"
             "OMEGA_PROJECTS_DIR=${cfg.projectsDir}"
             "OMEGA_SESSION_DIR=${cfg.sessionDir}"
+            "OMEGA_MIRROR_CREDENTIALS_DIR=${cfg.gitHost.mirrorCredentialsDir}"
             "OMEGA_GIT_HOST_LISTEN=${cfg.gitHost.listenAddress}"
             "OMEGA_GIT_HOST_PORT=${toString cfg.gitHost.port}"
             "RUST_LOG=${cfg.logLevel}"
           ]
+          ++ optional (cfg.gitHost.githubTokenFile != null) "OMEGA_GITHUB_TOKEN_FILE=%d/omega-github-token"
           ++ optional cfg.rebaseJob.enable "OMEGA_REBASE_JOB_CONFIG=${rebaseDefaultsPath}";
 
-          # Security hardening — the forge serves read-only views of the store,
-          # but the "rebase" page is the imperative control panel for the cron,
-          # so exactly the state file + run-now marker are writable (ReadWritePaths
-          # takes precedence over the ReadOnlyPaths below for these two paths).
+          # Security hardening. The control panel intentionally manages
+          # projects and atomically updates rebase state (state temp + lock
+          # files live beside it), so the configured project store is its
+          # bounded writable data root.
           NoNewPrivileges = true;
           PrivateTmp = true;
           ProtectSystem = "strict";
           ProtectHome = false; # needs to read the project store + sessions
           ReadWritePaths = [
             clankerHome
+            cfg.projectsDir
+            cfg.gitHost.mirrorCredentialsDir
           ]
           ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-job.json"
           ++ optional cfg.rebaseJob.enable "${cfg.projectsDir}/rebase-now";
 
           RuntimeDirectory = "omega";
           RuntimeDirectoryMode = "0770";
+
+          LoadCredential = optional (cfg.gitHost.githubTokenFile != null)
+            "omega-github-token:${cfg.gitHost.githubTokenFile}";
         };
       };
 

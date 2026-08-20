@@ -315,30 +315,12 @@ impl StandardAgent {
             // Process tool use blocks and execute tools
             let mut tool_results: Vec<(String, ToolResult)> = Vec::new();
 
-            // Track recent tool calls for loop detection
-            let mut tool_call_set = std::collections::HashSet::new();
-
             for (index, block) in content_blocks.iter().enumerate() {
                 if let ContentBlock::ToolUse {
                     id, name, input, ..
                 } = block
                 {
                     tracing::info!("[StandardAgent] Tool use: {} ({})", name, id);
-
-                    // Loop detection: Check if this exact tool call was already made in this turn
-                    let call_signature = format!("{}:{}", name, input);
-                    if !tool_call_set.insert(call_signature) {
-                        tracing::warn!(
-                            "[StandardAgent] Loop detected: duplicate tool call {} with same args",
-                            name
-                        );
-                        internals.send_error(format!(
-                            "Loop detected: tool '{}' called multiple times with identical arguments in same turn",
-                            name
-                        ));
-                        // Stop processing further tools and exit the turn
-                        return Ok(());
-                    }
 
                     // Execute tool (if tools configured)
                     let result = if let Some(ref tools) = self.config.tools {
@@ -590,12 +572,12 @@ impl StandardAgent {
         // 3. Stamp last 2 user/assistant messages from the end
         let mut final_stamped = 0;
         for msg in messages.iter_mut().rev() {
-            if msg.role == "user" || msg.role == "assistant" {
-                if stamp_message_end(&marker, msg) {
-                    final_stamped += 1;
-                    if final_stamped >= 2 {
-                        break;
-                    }
+            if (msg.role == "user" || msg.role == "assistant")
+                && stamp_message_end(&marker, msg)
+            {
+                final_stamped += 1;
+                if final_stamped >= 2 {
+                    break;
                 }
             }
         }

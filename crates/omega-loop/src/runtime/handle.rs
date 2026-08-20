@@ -6,7 +6,10 @@
 //! - Subscribe to streaming output
 //! - Request interrupt or shutdown
 
-use omega_core::core::{FrameworkError, FrameworkResult, InputMessage};
+use std::sync::Arc;
+
+use omega_core::core::{AgentState, FrameworkError, FrameworkResult, InputMessage};
+use tokio::sync::RwLock;
 
 use super::channels::{InputSender, OutputReceiver, OutputSender};
 
@@ -24,6 +27,10 @@ pub struct AgentHandle {
 
     /// Sender for output (for subscribing)
     output_tx: OutputSender,
+
+    /// Shared runtime state, used by control-plane operations to reject
+    /// destructive session recreation while a turn is still active.
+    state: Arc<RwLock<AgentState>>,
 }
 
 impl AgentHandle {
@@ -34,11 +41,13 @@ impl AgentHandle {
         session_id: impl Into<String>,
         input_tx: InputSender,
         output_tx: OutputSender,
+        state: Arc<RwLock<AgentState>>,
     ) -> Self {
         Self {
             session_id: session_id.into(),
             input_tx,
             output_tx,
+            state,
         }
     }
 
@@ -84,6 +93,11 @@ impl AgentHandle {
     pub fn subscribe(&self) -> OutputReceiver {
         self.output_tx.subscribe()
     }
+
+    /// Snapshot the agent's current state.
+    pub async fn state(&self) -> AgentState {
+        self.state.read().await.clone()
+    }
 }
 
 impl std::fmt::Debug for AgentHandle {
@@ -104,7 +118,12 @@ mod tests {
     fn create_test_handle() -> (AgentHandle, InputReceiver) {
         let (input_tx, input_rx) = tokio::sync::mpsc::channel(32);
         let (output_tx, _) = tokio::sync::broadcast::channel(256);
-        let handle = AgentHandle::new("test-session", input_tx, output_tx);
+        let handle = AgentHandle::new(
+            "test-session",
+            input_tx,
+            output_tx,
+            Arc::new(RwLock::new(AgentState::Idle)),
+        );
         (handle, input_rx)
     }
 

@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 omega-core = { path = "../omega-core" }
 omega-llm = { path = "../omega-llm" }
 omega-projects = { path = "../omega-projects" }
+omega-protocol = { path = "../omega-protocol" }
 omega-sh-client = { path = "../omega-sh-client" }
 omega-tools = { path = "../omega-tools" }
 

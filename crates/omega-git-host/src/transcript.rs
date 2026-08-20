@@ -382,7 +382,7 @@ fn start_tag(out: &mut String, tag: &Tag) {
         Tag::BlockQuote(_) => out.push_str("<blockquote>\n"),
         Tag::CodeBlock(kind) => {
             let lang = match kind {
-                CodeBlockKind::Fenced(l) => sanitize_code_lang(&l),
+                CodeBlockKind::Fenced(l) => sanitize_code_lang(l),
                 CodeBlockKind::Indented => String::new(),
             };
             if lang.is_empty() {
@@ -583,9 +583,8 @@ mod tests {
     #[test]
     fn truncates_long_tool_output() {
         let big = "x".repeat(MAX_BLOCK_RENDER + 100);
-        let line = format!(
-            r#"{{"role":"assistant","content":[{{"type":"tool_use","id":"c","name":"Bash","input":{{"command":"y"}}}}]}}"#
-        );
+        let line =
+            r#"{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"Bash","input":{"command":"y"}}]}"#;
         let result = format!(
             r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"c","content":"{big}"}}]}}"#
         );

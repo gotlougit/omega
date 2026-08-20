@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -34,51 +33,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
-// ---------------------------------------------------------------------------
-// Wire protocol
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct OmegaRequest {
-    id: String,
-    tool: String,
-    args: Value,
-    #[serde(default)]
-    session: Option<String>,
-    #[serde(default)]
-    dir: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct OmegaResponse {
-    id: String,
-    result: OmegaToolResult,
-}
-
-#[derive(Debug, Serialize)]
-struct OmegaToolResult {
-    #[serde(flatten)]
-    content: OmegaContent,
-    is_error: bool,
-}
-
-/// Serializable form of ToolResultData — binary payloads are base64-encoded.
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-enum OmegaContent {
-    Text {
-        data: String,
-    },
-    Image {
-        data: String,
-        media_type: String,
-    },
-    Document {
-        data: String,
-        media_type: String,
-        description: String,
-    },
-}
+use omega_protocol::sh::{OmegaContent, OmegaRequest, OmegaResponse, OmegaToolResult};
 
 /// Extract the most interesting parameter from tool args for logging.
 fn log_param(tool: &str, args: &Value) -> String {

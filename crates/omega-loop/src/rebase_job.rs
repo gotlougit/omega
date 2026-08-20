@@ -6,8 +6,8 @@
 //!
 //! Per scheduled run, for every cron-jobbable project:
 //!
-//! 1. `git fetch origin` and classify the local default branch against
-//!    `origin/<default>` ([`omega_projects::DefaultBranchStatus`]):
+//! 1. `git fetch upstream` and classify the local default branch against
+//!    `upstream/<default>` ([`omega_projects::DefaultBranchStatus`]):
 //!    - strictly behind  → mechanical fast-forward (no LLM involved),
 //!    - up to date / ahead-only (local-only commits) → nothing,
 //!    - **diverged** (both sides moved) → wake the project's dedicated
@@ -17,26 +17,27 @@
 //!
 //! Configuration comes from the NixOS defaults file
 //! (`OMEGA_REBASE_JOB_CONFIG`, see [`omega_projects::rebase`]) overlaid with
-//! the imperative state file the web UI edits (`rebase-job.json` in the
-//! project store). A `rebase-now` marker file in the store root triggers an
-//! immediate run ("run now" from the web UI).
+//! per-project settings and durable manual requests in `rebase-job.json`.
 //!
 //! The rebaser chats are real persistent sessions (just like any other),
 //! bound to the project's dedicated `main` worktree, so the user can also
 //! wake them by hand from the TUI and read their transcripts in the web UI.
-//! The cron creates one per cron-jobbable project (idle until woken) so
-//! they are ready to be called into at any time.
+//! A rebaser chat is created lazily when a conflict actually needs one.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use chrono::Utc;
+use omega_core::core::OutputChunk;
 use omega_llm::LlmProvider;
-use omega_projects::rebase::{
-    self, EffectiveConfig, RebaseDefaults, RebaseState,
+use omega_projects::mirror::MirrorManager;
+use omega_projects::rebase::{self, EffectiveProjectConfig, RebaseDefaults};
+use omega_projects::{
+    ActiveProject, DefaultBranchRebaseStatus, DefaultBranchStatus, ProjectInfo, ProjectManager,
 };
-use omega_projects::{ActiveProject, DefaultBranchStatus, ProjectInfo, ProjectManager};
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
 
@@ -46,10 +47,20 @@ use crate::session::{AgentSession, SessionStorage};
 
 /// How often the loop wakes to check the interval / "run now" marker.
 const POLL: Duration = Duration::from_secs(5);
+const CONFLICT_RECONCILE_SECONDS: i64 = 60;
 
 /// Wake messages start with this so the rebaser (and a human skimming the
 /// transcript) can tell a scheduled wake from a user message.
 const WAKE_HINT: &str = "⏰ upstream-rebaser job:";
+
+struct DivergedRebase {
+    local: String,
+    upstream: String,
+    ahead: usize,
+    behind: usize,
+    upstream_ref: String,
+    conflict_detail: String,
+}
 
 /// The rebaser session id is deterministic per project so resumes and the
 /// web UI can find it again.
@@ -74,6 +85,7 @@ pub struct RebaseJob {
     provider: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>>,
     session_storage: Arc<SessionStorage>,
     defaults: Option<RebaseDefaults>,
+    mirrors: MirrorManager,
     /// Live rebaser handles (session_id → handle), kept for the lifetime of
     /// the daemon so a wake is just a message.
     rebasers: Arc<Mutex<HashMap<String, AgentHandle>>>,
@@ -88,117 +100,272 @@ impl RebaseJob {
         session_storage: Arc<SessionStorage>,
         defaults: Option<RebaseDefaults>,
     ) -> Self {
+        let mirrors = MirrorManager::from_env(projects.as_ref().clone());
         Self {
             projects,
             runtime,
             provider,
             session_storage,
             defaults,
+            mirrors,
             rebasers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Run forever: every `POLL` seconds, run the job when the interval is
-    /// due or a `rebase-now` marker exists. Each cron-jobbable project also
-    /// gets its dedicated upstream-rebaser chat (idle) so the user can wake
-    /// it by hand at any time.
+    /// Run forever: every `POLL` seconds, atomically claim durable manual
+    /// requests and independently due per-project schedules.
     pub async fn run(self) {
-        let mut next_run: Option<Instant> = None;
-        let mut last_ensured: String = String::new();
+        match rebase::update_state(self.projects.root(), |state| {
+            Ok(rebase::recover_interrupted_runs(state, Utc::now()))
+        }) {
+            Ok(recovered) if !recovered.is_empty() => {
+                tracing::warn!(?recovered, "requeued interrupted upstream rebase runs")
+            }
+            Err(e) => tracing::warn!(error = %e, "could not recover interrupted rebase runs"),
+            _ => {}
+        }
+
         loop {
-            // Reload state each tick so a web-UI toggle / interval change /
-            // run-now request takes effect promptly.
+            // Cadence and pending manual runs are persisted, so neither a
+            // web/loop race nor a daemon restart loses or resets a trigger.
+            let state = rebase::load_state(self.projects.root());
+            self.reconcile_conflicted_runs(&state).await;
             let state = rebase::load_state(self.projects.root());
             let eff = rebase::resolve_effective(self.defaults.as_ref(), &state);
-            let run_now = rebase::run_now_path(self.projects.root());
+            let now = Utc::now();
+            let mut candidates: BTreeMap<String, EffectiveProjectConfig> = BTreeMap::new();
 
-            // (Re)create idle rebaser chats when the project set changes,
-            // so a project freshly enabled from the web UI gets its chat.
-            let sig = eff.projects.join(",");
-            if sig != last_ensured {
-                for name in &eff.projects {
-                    if let Err(e) = self.ensure_rebaser_for(name).await {
-                        tracing::warn!(
-                            project = %name,
-                            error = %e,
-                            "could not prepare upstream rebaser chat"
-                        );
-                    }
+            for project in &eff.projects {
+                let run = state.project_runs.get(&project.name);
+                let last = run.and_then(|r| r.last_started_at);
+                if !rebase::run_blocks_schedule(run)
+                    && rebase::project_is_due(now, last, project.interval_seconds)
+                {
+                    candidates.insert(project.name.clone(), project.clone());
                 }
-                last_ensured = sig;
+            }
+            // Manual runs are allowed even while the automatic schedule is
+            // disabled. Resolve their cadence/prompt from stored overrides.
+            for (name, run) in &state.project_runs {
+                if run.pending_since.is_some() {
+                    candidates.entry(name.clone()).or_insert_with(|| {
+                        rebase::resolve_project(self.defaults.as_ref(), &state, name, false)
+                    });
+                }
             }
 
-            let due = next_run.is_some_and(|n| Instant::now() >= n);
-            let marked = eff.is_active() && run_now.is_file();
-            if due || marked {
-                if marked {
-                    let _ = tokio::fs::remove_file(&run_now).await;
+            for (_, project) in candidates {
+                if let Some((trigger, claimed)) = self.claim_run(&project).await {
+                    tracing::info!(
+                        project = %project.name,
+                        interval_seconds = project.interval_seconds,
+                        %trigger,
+                        "upstream rebase run"
+                    );
+                    let result = self.run_project(&claimed).await;
+                    self.finish_run(&claimed.name, &trigger, result).await;
                 }
-                let interval = eff.interval_seconds;
-                tracing::info!(
-                    projects = ?eff.projects,
-                    interval_seconds = interval,
-                    triggered = if due { "schedule" } else { "run-now" },
-                    "rebase cron run"
-                );
-                self.run_once(&eff, &state).await;
-                next_run = Some(Instant::now() + Duration::from_secs(interval));
             }
             tokio::time::sleep(POLL).await;
         }
     }
 
-    /// One full run: for each cron-jobbable project, sync main with upstream
-    /// and wake the rebaser on divergence. Records a summary in the
-    /// imperative state file (`last_run`) for the web UI.
-    async fn run_once(&self, eff: &EffectiveConfig, _state: &RebaseState) {
-        let mut per_project = serde_json::Map::new();
-        for name in &eff.projects {
-            let info = match self.projects.find(name).await {
-                Ok(Some(info)) => info,
-                Ok(None) => {
-                    tracing::warn!(project = %name, "cron-jobbable project is not registered");
-                    per_project.insert(
-                        name.clone(),
-                        json!({ "status": "missing", "detail": "not registered" }),
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(project = %name, error = %e, "cron project lookup failed");
-                    per_project.insert(
-                        name.clone(),
-                        json!({ "status": "error", "detail": format!("{e:#}") }),
-                    );
-                    continue;
-                }
+    async fn claim_run(
+        &self,
+        requested: &EffectiveProjectConfig,
+    ) -> Option<(String, EffectiveProjectConfig)> {
+        let now = Utc::now();
+        let result = rebase::update_state(self.projects.root(), |state| {
+            let current =
+                rebase::resolve_project(self.defaults.as_ref(), state, &requested.name, false);
+            let run = state
+                .project_runs
+                .entry(requested.name.clone())
+                .or_default();
+            let trigger = if run.pending_since.take().is_some() {
+                Some(
+                    run.pending_trigger
+                        .take()
+                        .unwrap_or_else(|| "manual".to_string()),
+                )
+            } else {
+                (current.enabled
+                    && !rebase::run_blocks_schedule(Some(run))
+                    && rebase::project_is_due(now, run.last_started_at, current.interval_seconds))
+                .then_some("schedule".to_string())
             };
-
-            per_project.insert(
-                name.clone(),
-                match self.sync_project(&info).await {
-                    ProjectSync::Ok(entry) => entry,
-                    ProjectSync::Skipped(entry) => entry,
-                    ProjectSync::Err(entry) => entry,
-                },
-            );
+            let Some(trigger) = trigger else {
+                return Ok(None);
+            };
+            run.last_started_at = Some(now);
+            run.last_finished_at = None;
+            run.last_trigger = Some(trigger.clone());
+            run.result = Some(json!({ "status": "running" }));
+            Ok(Some((trigger, current)))
+        });
+        match result {
+            Ok(trigger) => trigger,
+            Err(e) => {
+                tracing::warn!(project = %requested.name, error = %e, "could not claim rebase run");
+                None
+            }
         }
+    }
 
-        // Persist `last_run` so the web UI shows what happened. Reload the
-        // state first (a web-UI toggle may have landed while we ran) so we
-        // don't clobber it with the tick's stale copy.
-        let mut merged = rebase::load_state(self.projects.root());
-        merged.last_run = Some(json!({
-            "at": chrono::Utc::now().to_rfc3339(),
-            "per_project": serde_json::Value::Object(per_project),
-        }));
-        if let Err(e) = rebase::save_state(self.projects.root(), &merged) {
-            tracing::warn!(error = %e, "could not persist rebase last_run");
+    /// Reconcile conflict outcomes from Git itself. This survives losing the
+    /// in-memory output subscriber and never wakes an unresolved conflict;
+    /// it only promotes a run after Git has no rebase state and local main
+    /// is verifiably based on upstream.
+    async fn reconcile_conflicted_runs(&self, snapshot: &rebase::RebaseState) {
+        let now = Utc::now();
+        let candidates: Vec<String> = snapshot
+            .project_runs
+            .iter()
+            .filter(|(_, run)| {
+                rebase::conflict_reconciliation_is_due(run, now, CONFLICT_RECONCILE_SECONDS)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        for project in candidates {
+            let claimed = rebase::update_state(self.projects.root(), |state| {
+                let Some(run) = state.project_runs.get_mut(&project) else {
+                    return Ok(false);
+                };
+                if !rebase::conflict_reconciliation_is_due(run, now, CONFLICT_RECONCILE_SECONDS) {
+                    return Ok(false);
+                }
+                run.last_reconciled_at = Some(now);
+                Ok(true)
+            });
+            if !matches!(claimed, Ok(true)) {
+                continue;
+            }
+
+            let info = match self.projects.find(&project).await {
+                Ok(Some(info)) => info,
+                _ => continue,
+            };
+            match self.projects.default_branch_rebase_in_progress(&info).await {
+                Ok(true) | Err(_) => continue,
+                Ok(false) => {}
+            }
+            let verified = self.projects.update_default_branch(&info).await;
+            if !matches!(
+                verified,
+                Ok(Some(
+                    DefaultBranchStatus::UpToDate
+                        | DefaultBranchStatus::AheadOnly
+                        | DefaultBranchStatus::FastForwarded(_, _)
+                ))
+            ) {
+                continue;
+            }
+
+            // Conflict resolution completed outside the original scheduler
+            // call. Reuse the same configured auto-push hook rather than a
+            // second polling/scheduling mechanism.
+            let _ = self.mirrors.auto_push(&info).await;
+
+            let _ = rebase::update_state(self.projects.root(), |state| {
+                let Some(run) = state.project_runs.get_mut(&project) else {
+                    return Ok(());
+                };
+                if rebase::run_status(run) != Some("conflicted") {
+                    return Ok(());
+                }
+                let session = run
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("session"))
+                    .cloned();
+                run.last_finished_at = Some(Utc::now());
+                run.result = Some(json!({
+                    "status": "completed",
+                    "outcome": "conflicts-resolved",
+                    "session": session,
+                    "reconciled": true,
+                }));
+                Ok(())
+            });
+        }
+    }
+
+    async fn run_project(&self, project: &EffectiveProjectConfig) -> serde_json::Value {
+        let info = match self.projects.find(&project.name).await {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                return json!({
+                    "status": "failed", "outcome": "missing", "detail": "not registered"
+                })
+            }
+            Err(e) => {
+                return json!({
+                    "status": "failed", "outcome": "lookup-error", "detail": format!("{e:#}")
+                })
+            }
+        };
+        let mut value = match self.sync_project(project, &info).await {
+            ProjectSync::Ok(entry) | ProjectSync::Skipped(entry) | ProjectSync::Err(entry) => entry,
+        };
+        let mut completed = false;
+        if let Some(object) = value.as_object_mut() {
+            let outcome = object
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let status = match outcome.as_str() {
+                "conflicts" => "conflicted",
+                "error" | "missing" | "skipped" => "failed",
+                _ => "completed",
+            };
+            object.insert("outcome".into(), json!(outcome));
+            object.insert("status".into(), json!(status));
+            completed = status == "completed";
+        }
+        if completed {
+            if let Some(push) = self.mirrors.auto_push(&info).await {
+                let mirror = match push {
+                    Ok(outcome) => json!({ "status": outcome.status }),
+                    Err(_) => json!({ "status": "failed" }),
+                };
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("mirror_push".into(), mirror);
+                }
+            }
+        }
+        value
+    }
+
+    async fn finish_run(&self, project: &str, trigger: &str, result: serde_json::Value) {
+        let finished = Utc::now();
+        let save = rebase::update_state(self.projects.root(), |state| {
+            let run = state.project_runs.entry(project.to_string()).or_default();
+            run.last_finished_at = Some(finished);
+            run.last_trigger = Some(trigger.to_string());
+            run.result = Some(result.clone());
+            // Maintain the old summary field for backwards-compatible API/
+            // UI readers while the structured project_runs map is canonical.
+            let mut per_project = serde_json::Map::new();
+            per_project.insert(project.to_string(), result.clone());
+            state.last_run = Some(json!({
+                "at": finished.to_rfc3339(),
+                "per_project": per_project,
+            }));
+            Ok(())
+        });
+        if let Err(e) = save {
+            tracing::warn!(project, error = %e, "could not persist rebase result");
         }
     }
 
     /// Sync one project's main branch with upstream; may wake the rebaser.
-    async fn sync_project(&self, info: &ProjectInfo) -> ProjectSync {
+    async fn sync_project(
+        &self,
+        config: &EffectiveProjectConfig,
+        info: &ProjectInfo,
+    ) -> ProjectSync {
         match self.projects.update_default_branch(info).await {
             Ok(Some(status)) => match status {
                 DefaultBranchStatus::UpToDate => {
@@ -227,7 +394,33 @@ impl RebaseJob {
                     upstream,
                     ahead,
                     behind,
-                } => self.handle_diverged(info, local, upstream, ahead, behind).await,
+                } => match self.projects.rebase_default_branch(info).await {
+                    Ok(DefaultBranchRebaseStatus::Rebased { old, new }) => ProjectSync::Ok(json!({
+                        "status": "rebased",
+                        "from": old,
+                        "to": new,
+                        "ahead": ahead,
+                        "behind": behind,
+                    })),
+                    Ok(DefaultBranchRebaseStatus::Conflicts {
+                        upstream_ref,
+                        detail,
+                    }) => {
+                        self.handle_diverged(config, info, DivergedRebase {
+                            local,
+                            upstream,
+                            ahead,
+                            behind,
+                            upstream_ref,
+                            conflict_detail: detail,
+                        })
+                        .await
+                    }
+                    Err(e) => ProjectSync::Err(json!({
+                        "status": "error",
+                        "detail": format!("could not start rebase: {e:#}"),
+                    })),
+                },
             },
             Ok(None) => {
                 tracing::warn!(project = %info.name, "main sync: no default branch to track");
@@ -244,17 +437,18 @@ impl RebaseJob {
     /// upstream-rebaser chat, which fixes the conflicts itself.
     async fn handle_diverged(
         &self,
+        config: &EffectiveProjectConfig,
         info: &ProjectInfo,
-        local: String,
-        upstream: String,
-        ahead: usize,
-        behind: usize,
+        divergence: DivergedRebase,
     ) -> ProjectSync {
-        let default = self
-            .projects
-            .default_branch(info)
-            .await
-            .unwrap_or_else(|| "main".to_string());
+        let DivergedRebase {
+            local,
+            upstream,
+            ahead,
+            behind,
+            upstream_ref,
+            conflict_detail,
+        } = divergence;
         let main_active = match self.projects.ensure_main_worktree(info).await {
             Ok(active) => active,
             Err(e) => {
@@ -271,20 +465,27 @@ impl RebaseJob {
         };
 
         let session_id = session_id_for(&info.name);
-        match self.ensure_rebaser(info, &main_active).await {
+        match self
+            .ensure_rebaser(info, &main_active, &config.prompt)
+            .await
+        {
             Ok(handle) => {
+                let mut output = handle.subscribe();
                 let wake = format!(
-                    "{WAKE_HINT} upstream moved for '{project}': origin/{default} has {behind} new \
-                     commit(s) and local main has {ahead} local-only commit(s). Rebase main onto \
-                     origin/{default} in your worktree (branch {branch}), resolve any conflicts \
-                     yourself — preserve the local-only functionality — finish the rebase, and \
-                     verify the tree. Report what you did.\n\
-                     Main was at {local}; upstream is at {upstream}.",
+                    "{WAKE_HINT} upstream moved for '{project}': {upstream_ref} has {behind} new \
+                     commit(s) and local main has {ahead} local-only commit(s). Git has already \
+                     started the rebase in your worktree (branch {branch}) and stopped for \
+                     conflicts. Resolve them, continue the rebase to completion, verify the tree, \
+                     and report what you did.\n\
+                     Main was at {local}; upstream is at {upstream}.\n\
+                     Git reported: {conflict_detail}\n\n\
+                     <configured-conflict-resolution-prompt>\n{prompt}\n\
+                     </configured-conflict-resolution-prompt>",
                     project = info.name,
-                    default = default,
                     branch = main_active.branch,
                     local = &local[..local.len().min(12)],
                     upstream = &upstream[..upstream.len().min(12)],
+                    prompt = config.prompt,
                 );
                 if let Err(e) = handle.send_input(wake.clone()).await {
                     tracing::warn!(
@@ -305,12 +506,79 @@ impl RebaseJob {
                     behind,
                     "woke upstream rebaser for diverged main"
                 );
+                // The immediate run status is `conflicted`. Follow the
+                // dedicated session until a turn actually leaves main based
+                // on upstream, then promote it to completed. If another user
+                // turn was already ahead of this wake, its `Done` will still
+                // leave the repository diverged and this monitor keeps
+                // waiting for the queued rebaser turn.
+                let projects = Arc::clone(&self.projects);
+                let info_for_monitor = info.clone();
+                let root = self.projects.root().to_path_buf();
+                let monitored_session_id = session_id.clone();
+                let mirrors = self.mirrors.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match output.recv().await {
+                            Ok(OutputChunk::Done) => {
+                                let verified =
+                                    projects.update_default_branch(&info_for_monitor).await;
+                                let completed = matches!(
+                                    verified,
+                                    Ok(Some(
+                                        DefaultBranchStatus::UpToDate
+                                            | DefaultBranchStatus::AheadOnly
+                                            | DefaultBranchStatus::FastForwarded(_, _)
+                                    ))
+                                );
+                                if !completed {
+                                    continue;
+                                }
+                                let _ = mirrors.auto_push(&info_for_monitor).await;
+                                let _ = rebase::update_state(&root, |state| {
+                                    let run = state
+                                        .project_runs
+                                        .entry(info_for_monitor.name.clone())
+                                        .or_default();
+                                    run.last_finished_at = Some(Utc::now());
+                                    run.result = Some(json!({
+                                        "status": "completed",
+                                        "outcome": "conflicts-resolved",
+                                        "session": &monitored_session_id,
+                                    }));
+                                    Ok(())
+                                });
+                                break;
+                            }
+                            Ok(OutputChunk::Error(error)) => {
+                                let _ = rebase::update_state(&root, |state| {
+                                    let run = state
+                                        .project_runs
+                                        .entry(info_for_monitor.name.clone())
+                                        .or_default();
+                                    run.last_finished_at = Some(Utc::now());
+                                    run.result = Some(json!({
+                                        "status": "failed",
+                                        "outcome": "rebaser-error",
+                                        "detail": error,
+                                        "session": &monitored_session_id,
+                                    }));
+                                    Ok(())
+                                });
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                });
                 ProjectSync::Ok(json!({
-                    "status": "diverged",
+                    "status": "conflicts",
                     "ahead": ahead,
                     "behind": behind,
                     "session": session_id,
                     "rebaser_woken": true,
+                    "detail": conflict_detail,
                 }))
             }
             Err(e) => {
@@ -327,20 +595,6 @@ impl RebaseJob {
         }
     }
 
-    /// Get (creating if needed) the dedicated upstream-rebaser chat for a
-    /// cron-jobbable project by name: resolves the project, ensures its main
-    /// worktree exists, then ensures the session. Used by the idle-prep pass
-    /// so every enabled project has a chat the user can wake by hand.
-    async fn ensure_rebaser_for(&self, name: &str) -> anyhow::Result<AgentHandle> {
-        let info = self
-            .projects
-            .find(name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("project '{name}' is not registered"))?;
-        let main_active = self.projects.ensure_main_worktree(&info).await?;
-        self.ensure_rebaser(&info, &main_active).await
-    }
-
     /// Get (creating if needed) the dedicated upstream-rebaser chat for
     /// `info`, bound to the project's `main` worktree, and keep its handle
     /// for the daemon's lifetime so a wake is just a message.
@@ -348,6 +602,7 @@ impl RebaseJob {
         &self,
         info: &ProjectInfo,
         main_active: &ActiveProject,
+        configured_prompt: &str,
     ) -> anyhow::Result<AgentHandle> {
         let session_id = session_id_for(&info.name);
         {
@@ -365,11 +620,6 @@ impl RebaseJob {
 
         // System prompt: configured rebaser prompt (NixOS) or the built-in
         // default, plus a project header so the agent knows the repo.
-        let agent_prompt = self
-            .defaults
-            .as_ref()
-            .map(|d| d.agent_prompt.clone())
-            .unwrap_or_else(|| omega_projects::rebase::DEFAULT_REBASER_PROMPT.to_string());
         let system_prompt = format!(
             "{agent_prompt}\n\n\
              You are bound to the project '{name}'.\n\
@@ -381,13 +631,17 @@ impl RebaseJob {
             url = info.url,
             branch = main_active.branch,
             worktree = main_active.worktree_path,
+            agent_prompt = configured_prompt,
         )
         .replace("{default-branch}", &default);
 
         // Reuse an existing session (keeps transcript history); otherwise
         // create one, seeded with a bootstrap exchange so it survives the
         // daemon's empty-session pruning.
-        let mut session = match AgentSession::load_with_storage(&session_id, self.session_storage.as_ref().clone()) {
+        let mut session = match AgentSession::load_with_storage(
+            &session_id,
+            self.session_storage.as_ref().clone(),
+        ) {
             Ok(s) => s,
             Err(_) => {
                 let mut s = AgentSession::new_with_storage(
@@ -426,12 +680,21 @@ impl RebaseJob {
             &self.session_storage,
             &event_tx,
         );
-        let tools = crate::create_tools_for_dir(Path::new(&main_active.worktree_path), &session_id, rename_tool);
+        let tools = crate::create_tools_for_dir(
+            Path::new(&main_active.worktree_path),
+            &session_id,
+            rename_tool,
+        );
 
         let provider = self.provider.read().unwrap().clone();
-        let agent_cfg = AgentConfig::new().with_tools(tools).with_prompt_caching(true);
+        let agent_cfg = AgentConfig::new()
+            .with_tools(tools)
+            .with_prompt_caching(true);
         let agent = StandardAgent::new(agent_cfg, provider);
-        let handle = self.runtime.spawn(session, |internals| agent.run(internals)).await?;
+        let handle = self
+            .runtime
+            .spawn(session, |internals| agent.run(internals))
+            .await?;
 
         self.rebasers
             .lock()

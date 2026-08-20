@@ -1386,6 +1386,7 @@ dependencies = [
  "omega-llm",
  "omega-loop-client",
  "omega-projects",
+ "omega-protocol",
  "omega-sh-client",
  "omega-tools",
  "regex",
@@ -1404,7 +1405,7 @@ dependencies = [
  "anyhow",
  "omega-core",
  "omega-projects",
- "serde",
+ "omega-protocol",
  "serde_json",
  "tokio",
 ]
@@ -1424,12 +1425,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-protocol"
+version = "0.1.0"
+dependencies = [
+ "omega-core",
+ "omega-projects",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omega-sh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
- "serde",
+ "omega-protocol",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1446,9 +1457,9 @@ dependencies = [
  "base64 0.23.0",
  "omega-core",
  "omega-llm",
+ "omega-protocol",
  "omega-tool-defs",
  "omega-tools",
- "serde",
  "serde_json",
  "tokio",
  "tracing",

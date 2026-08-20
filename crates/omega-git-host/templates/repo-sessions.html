@@ -48,6 +48,14 @@
       </p>
       <form method="post" action="/{{ name }}/sessions/create">
         <div class="form-group">
+          <label for="session-model-new">Model</label>
+          <select class="form-control" id="session-model-new" name="model"{% if not models %} disabled{% endif %}>
+            <option value="">daemon default</option>
+            {% for model in models %}<option value="{{ model | e }}">{{ model | e }}</option>{% endfor %}
+          </select>
+          {% if models_error %}<p class="text-danger"><small>Models unavailable: {{ models_error | e }}</small></p>{% endif %}
+        </div>
+        <div class="form-group">
           <label for="session-prompt">Initial prompt (optional)</label>
           <textarea class="form-control" id="session-prompt" name="prompt" rows="3"
                     placeholder="e.g. add a feature that …"></textarea>

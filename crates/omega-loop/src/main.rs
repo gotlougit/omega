@@ -24,8 +24,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use omega_projects::{ActiveProject, ProjectInfo, ProjectManager};
-use serde::{Deserialize, Serialize};
+use futures::StreamExt;
+use omega_projects::{ActiveProject, ProjectManager};
+#[cfg(test)]
+use omega_projects::ProjectInfo;
+use omega_protocol::daemon::{ClientRequest, ServerEvent, WireChunk};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -38,13 +41,13 @@ mod rebase_job;
 mod runtime;
 mod session;
 
-use omega_core::core::{
-    InputMessage, OutputChunk, RoleInfo, SessionInfo, ToolInfo, ToolResult, ToolRuntime,
-};
+use omega_core::core::{RoleInfo, SessionInfo, ToolInfo, ToolResult, ToolRuntime};
+#[cfg(test)]
+use omega_core::core::OutputChunk;
 use omega_llm::types::CustomTool;
 use omega_llm::{
-    ContentBlock, LlmProvider, Message, MessageContent, OpenAIProvider, ToolDefinition,
-    ToolInputSchema,
+    ContentBlock, ContentDelta, LlmProvider, Message, MessageContent, OpenAIProvider, StreamEvent,
+    SystemPrompt, ToolChoice, ToolDefinition, ToolInputSchema,
 };
 use omega_tools::{Tool, ToolRegistry};
 
@@ -52,95 +55,6 @@ use crate::agent::{AgentConfig, StandardAgent};
 use crate::runtime::{AgentHandle, AgentRuntime};
 use crate::session::{AgentSession, SessionStorage};
 use omega_sh_client::OmegaClient;
-
-// ---------------------------------------------------------------------------
-// Wire protocol
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct ClientRequest {
-    #[serde(rename = "type")]
-    msg_type: String,
-    session_id: Option<String>,
-    content: Option<String>,
-    config: Option<SessionConfig>,
-    model: Option<String>,
-    max_tokens: Option<u32>,
-    /// Optional search filter for `list_sessions` (case-insensitive substring).
-    query: Option<String>,
-    /// Project spec for `activate_project` — a registered project name or a
-    /// git URL.
-    spec: Option<String>,
-    /// Active project for a `run` request — binds the session's tools to
-    /// the project's git worktree.
-    project: Option<ActiveProject>,
-    /// Optional role name for a `run` request.  When a *new* session is
-    /// created, the named role's alternative system prompt is used instead
-    /// of the default (roles are configured in NixOS via
-    /// `services.omega.roles`).
-    role: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct SessionConfig {
-    #[serde(default)]
-    think: bool,
-    #[serde(default)]
-    no_cache: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type")]
-enum ServerEvent {
-    Created {
-        session_id: String,
-        session_name: String,
-    },
-    Chunk {
-        session_id: String,
-        chunk: OutputChunk,
-    },
-    SessionList {
-        sessions: Vec<SessionInfo>,
-    },
-    SessionResumed {
-        session_id: String,
-        session_name: String,
-    },
-    /// A single message from a resumed session's history, replayed so the
-    /// client renders it exactly like a live turn.
-    HistoryMessage {
-        session_id: String,
-        role: String,
-        content: String,
-    },
-    ModelChanged {
-        model: String,
-    },
-    SessionCompacted {
-        session_id: String,
-    },
-    ModelList {
-        models: Vec<String>,
-    },
-    ProjectList {
-        projects: Vec<ProjectInfo>,
-    },
-    /// Named roles / alternative system prompts (response to list_roles).
-    RoleList {
-        roles: Vec<RoleInfo>,
-    },
-    /// A project was activated for a session: the daemon created (or
-    /// re-created) a dedicated git worktree the session will operate in.
-    ProjectActive {
-        project: ProjectInfo,
-        worktree_path: String,
-        branch: String,
-    },
-    SystemMsg {
-        message: String,
-    },
-}
 
 // ---------------------------------------------------------------------------
 // History replay + session listing helpers
@@ -561,7 +475,7 @@ fn save_active_to_metadata(
 /// the git-host session index see the current path/branch. Best-effort:
 /// failures are logged, never fatal for the request that triggered them.
 fn persist_active_project(
-    session_storage: &SessionStorage,
+    session_storage: &Arc<SessionStorage>,
     session_id: &str,
     active: &ActiveProject,
 ) {
@@ -646,7 +560,7 @@ fn attach_forwarder(
                 Ok(chunk) => {
                     let event = ServerEvent::Chunk {
                         session_id: sid.clone(),
-                        chunk,
+                        chunk: WireChunk::Known(chunk),
                     };
                     if ev_tx.send(event).is_err() {
                         break;
@@ -676,7 +590,7 @@ async fn create_session(
     no_cache: bool,
     runtime: &AgentRuntime,
     event_tx: &broadcast::Sender<ServerEvent>,
-    session_storage: &SessionStorage,
+    session_storage: &Arc<SessionStorage>,
 ) -> anyhow::Result<AgentHandle> {
     let mut system_prompt = base_system_prompt.to_string();
     if let Some(active) = project {
@@ -689,13 +603,15 @@ async fn create_session(
         "omega-tui",
         "A coding agent",
         &system_prompt,
-        session_storage.clone(),
+        session_storage.as_ref().clone(),
     )?;
 
     if let Some(active) = project {
         save_active_to_metadata(&mut agent_session.metadata, active);
-        session_storage.save_metadata(&agent_session.metadata)?;
     }
+    agent_session.set_model(provider.model());
+    agent_session.set_provider(provider.provider_name());
+    session_storage.save_metadata(&agent_session.metadata)?;
 
     let mut agent_cfg = AgentConfig::new()
         .with_tools(tools.clone())
@@ -714,6 +630,167 @@ async fn create_session(
     Ok(handle)
 }
 
+/// Select a provider for one session without changing the daemon default.
+fn session_provider(
+    default_provider: &Arc<dyn LlmProvider>,
+    stored_model: &str,
+    requested: Option<(&str, Option<u32>)>,
+) -> Arc<dyn LlmProvider> {
+    let (model, max_tokens) = requested
+        .filter(|(model, _)| !model.trim().is_empty())
+        .map(|(model, max)| (model.trim().to_string(), max))
+        .unwrap_or_else(|| {
+            let model = stored_model.trim();
+            if model.is_empty() {
+                (default_provider.model(), None)
+            } else {
+                (model.to_string(), None)
+            }
+        });
+    default_provider.create_variant(&model, max_tokens)
+}
+
+/// Load and re-spawn one stored session with a session-specific provider.
+/// History, metadata, system prompt, project binding, and project-scoped tools
+/// are all retained. The caller is responsible for shutting down any old
+/// handle while holding the live-session registry lock.
+#[allow(clippy::too_many_arguments)]
+async fn recreate_stored_session(
+    session_id: &str,
+    requested_model: Option<(&str, Option<u32>)>,
+    default_provider: &Arc<dyn LlmProvider>,
+    session_storage: &Arc<SessionStorage>,
+    tools: &Arc<ToolRegistry>,
+    runtime: &AgentRuntime,
+    projects: &Arc<ProjectManager>,
+    session_projects: &Arc<Mutex<HashMap<String, ActiveProject>>>,
+    event_tx: &broadcast::Sender<ServerEvent>,
+) -> anyhow::Result<(AgentHandle, Option<ActiveProject>, String)> {
+    let mut agent_session =
+        AgentSession::load_with_storage(session_id, session_storage.as_ref().clone())?;
+    let provider = session_provider(
+        default_provider,
+        &agent_session.metadata.model,
+        requested_model,
+    );
+    let model = provider.model();
+    agent_session.set_model(&model);
+    agent_session.set_provider(provider.provider_name());
+
+    let persisted = active_from_metadata(&agent_session.metadata);
+    let active = resolve_project_context(projects, session_id, None, persisted.as_ref()).await;
+    if let Some(active) = &active {
+        save_active_to_metadata(&mut agent_session.metadata, active);
+    }
+    session_storage.save_metadata(&agent_session.metadata)?;
+
+    let session_tools = tools_for_session(
+        tools,
+        active.as_ref(),
+        session_id,
+        rename_worktree_tool(
+            projects,
+            session_id,
+            session_projects,
+            session_storage,
+            event_tx,
+        ),
+    );
+    let agent = StandardAgent::new(AgentConfig::new().with_tools(session_tools), provider);
+    let handle = runtime
+        .spawn(agent_session, |internals| agent.run(internals))
+        .await?;
+    attach_forwarder(&handle, event_tx, session_id);
+
+    Ok((handle, active, model))
+}
+
+const COMPACTION_SYSTEM_PROMPT: &str = "You compact coding-agent conversations. Return only a dense, precise continuation summary. Preserve the user's goals, decisions, constraints, important code paths, commands and test results, unresolved errors, and the exact next work. Do not invent facts. Do not include preamble.";
+const MAX_COMPACTION_SUMMARY_BYTES: usize = 64 * 1024;
+
+/// Ask the session's current provider for a bounded replacement summary.
+async fn compact_history(
+    provider: Arc<dyn LlmProvider>,
+    session_id: &str,
+    messages: &[Message],
+) -> anyhow::Result<Vec<Message>> {
+    if messages.is_empty() {
+        anyhow::bail!("session has no history to compact");
+    }
+    let original_size = serde_json::to_vec(messages)?.len();
+    let mut prompt_messages = messages.to_vec();
+    prompt_messages.push(Message::user(
+        "Summarize the conversation above for another coding agent that will continue the work immediately.",
+    ));
+    let compact_provider = provider.create_variant(&provider.model(), Some(2048));
+    let mut stream = compact_provider
+        .stream_with_tools_and_system(
+            prompt_messages,
+            Some(SystemPrompt::Text(COMPACTION_SYSTEM_PROMPT.to_string())),
+            Vec::new(),
+            Some(ToolChoice::none()),
+            None,
+            Some(session_id),
+        )
+        .await?;
+    let mut summary = String::new();
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::ContentBlockDelta(delta) => {
+                if let ContentDelta::TextDelta { text } = delta.delta {
+                    summary.push_str(&text);
+                    if summary.len() > MAX_COMPACTION_SUMMARY_BYTES {
+                        anyhow::bail!(
+                            "provider compaction summary exceeded {} bytes",
+                            MAX_COMPACTION_SUMMARY_BYTES
+                        );
+                    }
+                }
+            }
+            StreamEvent::Error(error) => anyhow::bail!("{}", error.error.message),
+            _ => {}
+        }
+    }
+    let summary = summary.trim();
+    if summary.is_empty() {
+        anyhow::bail!("provider returned an empty compaction summary");
+    }
+    let replacement = vec![
+        Message::user("[Earlier conversation compacted for context]"),
+        Message::assistant(summary),
+    ];
+    let replacement_size = serde_json::to_vec(&replacement)?.len();
+    if replacement_size >= original_size {
+        anyhow::bail!(
+            "session is already too short to compact (summary was not smaller than history)"
+        );
+    }
+    Ok(replacement)
+}
+
+async fn compact_stored_history(
+    provider: Arc<dyn LlmProvider>,
+    session_id: &str,
+    session_storage: &SessionStorage,
+) -> anyhow::Result<()> {
+    let history = session_storage.load_messages(session_id)?;
+    let replacement = compact_history(provider, session_id, &history).await?;
+    session_storage.replace_messages(session_id, &replacement)?;
+    Ok(())
+}
+
+async fn require_idle(handle: Option<&AgentHandle>, operation: &str) -> Result<(), String> {
+    if let Some(handle) = handle {
+        let state = handle.state().await;
+        if state != omega_core::core::AgentState::Idle {
+            return Err(format!(
+                "Cannot {operation} while it is {state}; wait for the turn to finish"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -728,6 +805,7 @@ async fn handle_connection(
     projects: Arc<ProjectManager>,
     roles: Vec<omega_projects::roles::Role>,
     sessions: Arc<Mutex<HashMap<String, AgentHandle>>>,
+    session_controls: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     session_projects: Arc<Mutex<HashMap<String, omega_projects::ActiveProject>>>,
 ) {
     let (reader, writer) = tokio::io::split(stream);
@@ -850,6 +928,18 @@ async fn handle_connection(
             }
         };
 
+        // Serialize control-plane changes and messages per session without
+        // holding the daemon-global session registry. A slow compaction can
+        // block its own chat, but never unrelated sessions.
+        let session_control = {
+            let mut controls = session_controls.lock().await;
+            controls
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _session_guard = session_control.lock().await;
+
         match req.msg_type.as_str() {
             "run" | "message" => {
                 let mut sessions_lock = sessions.lock().await;
@@ -945,21 +1035,22 @@ async fn handle_connection(
 
                     let config = req.config.unwrap_or_default();
 
-                    // Apply model from request if provided (on session creation only)
-                    if let Some(ref model) = req.model {
-                        let max_tokens = req.max_tokens;
-                        let prov = current_provider.read().unwrap().clone();
-                        let new_provider = prov.create_variant(model, max_tokens);
-                        *current_provider.write().unwrap() = new_provider;
-                        tracing::info!(model = %model, "model set from run request");
-                    }
+                    // A requested model belongs to this session only. The
+                    // daemon-wide provider remains the default/factory for
+                    // other sessions.
+                    let default_provider = current_provider.read().unwrap().clone();
+                    let provider = session_provider(
+                        &default_provider,
+                        "",
+                        req.model.as_deref().map(|m| (m, req.max_tokens)),
+                    );
 
                     // Always broadcast the current model so the client knows
                     // what the session is using.
                     {
-                        let prov = current_provider.read().unwrap();
                         let _ = event_tx.send(ServerEvent::ModelChanged {
-                            model: prov.model().to_string(),
+                            session_id: session_id.clone(),
+                            model: provider.model(),
                         });
                     }
 
@@ -1000,8 +1091,6 @@ async fn handle_connection(
                             &event_tx,
                         ),
                     );
-                    let provider = current_provider.read().unwrap().clone();
-
                     let handle = match create_session(
                         &session_id,
                         &system_prompt,
@@ -1184,8 +1273,7 @@ async fn handle_connection(
             "interrupt" => {
                 let sessions_lock = sessions.lock().await;
                 if let Some(handle) = sessions_lock.get(&session_id) {
-                    let msg = InputMessage::Interrupt;
-                    if let Err(e) = handle.send(msg).await {
+                    if let Err(e) = handle.interrupt().await {
                         tracing::warn!(%session_id, "send interrupt: {e}");
                     }
                 }
@@ -1193,76 +1281,37 @@ async fn handle_connection(
 
             "resume_session" => {
                 if session_storage.session_exists(&session_id) {
-                    let mut sessions_lock = sessions.lock().await;
-                    let already_live = sessions_lock.contains_key(&session_id);
-                    if !already_live {
-                        // Load existing session from disk
-                        let mut agent_session = match crate::session::AgentSession::load_with_storage(
+                    let mut resumed_active = None;
+                    let live_handle = sessions.lock().await.get(&session_id).cloned();
+                    if live_handle.is_none() {
+                        let default_provider = current_provider.read().unwrap().clone();
+                        match recreate_stored_session(
                             &session_id,
-                            SessionStorage::with_dir("./sessions"),
-                        ) {
-                            Ok(s) => s,
+                            None,
+                            &default_provider,
+                            &session_storage,
+                            &tools,
+                            &runtime,
+                            &projects,
+                            &session_projects,
+                            &event_tx,
+                        )
+                        .await
+                        {
+                            Ok((handle, active, _)) => {
+                                sessions.lock().await.insert(session_id.clone(), handle);
+                                attached.insert(session_id.clone());
+                                resumed_active = active;
+                            }
                             Err(e) => {
-                                tracing::error!(%session_id, "resume load session: {e}");
+                                tracing::error!(%session_id, "resume session: {e}");
                                 let _ = event_tx.send(ServerEvent::SystemMsg {
                                     message: format!("Cannot resume session: {e}"),
                                 });
                                 continue;
                             }
-                        };
-
-                        // Restore the project binding from metadata so the
-                        // resumed session keeps working in its worktree.
-                        let persisted = active_from_metadata(&agent_session.metadata);
-                        let active = resolve_project_context(
-                            &projects,
-                            &session_id,
-                            None,
-                            persisted.as_ref(),
-                        )
-                        .await;
-                        if let Some(active) = &active {
-                            // Update both the in-memory AND persisted metadata so
-                            // a later message save doesn't revert the binding to
-                            // the stale value read before reconciliation.
-                            save_active_to_metadata(&mut agent_session.metadata, active);
-                            if let Err(e) = session_storage.save_metadata(&agent_session.metadata) {
-                                tracing::warn!(%session_id, "resume save project metadata: {e}");
-                            }
                         }
-
-                        let prov = current_provider.read().unwrap().clone();
-                        let session_tools = tools_for_session(
-                            &tools,
-                            active.as_ref(),
-                            &session_id,
-                            rename_worktree_tool(
-                                &projects,
-                                &session_id,
-                                &session_projects,
-                                &session_storage,
-                                &event_tx,
-                            ),
-                        );
-                        let agent_cfg = AgentConfig::new().with_tools(session_tools);
-                        let agent = StandardAgent::new(agent_cfg, prov);
-
-                        let handle = runtime
-                            .spawn(agent_session, |internals| agent.run(internals))
-                            .await
-                            .unwrap();
-
-                        attach_forwarder(&handle, &event_tx, &session_id);
-
-                        if let Some(active) = &active {
-                            session_projects
-                                .lock()
-                                .await
-                                .insert(session_id.clone(), active.clone());
-                        }
-                        sessions_lock.insert(session_id.clone(), handle);
-                        attached.insert(session_id.clone());
-                    } else if let Some(handle) = sessions_lock.get(&session_id) {
+                    } else if let Some(handle) = live_handle.as_ref() {
                         // The session is already running — but it may have
                         // been created on THIS connection (which already
                         // attached a forwarder). Attach a fresh one only if
@@ -1273,11 +1322,23 @@ async fn handle_connection(
                             attached.insert(session_id.clone());
                         }
                     }
+                    if let Some(active) = resumed_active {
+                        session_projects
+                            .lock()
+                            .await
+                            .insert(session_id.clone(), active);
+                    }
 
                     let _ = event_tx.send(ServerEvent::SessionResumed {
                         session_id: session_id.clone(),
                         session_name: session_id.clone(),
                     });
+                    if let Ok(meta) = session_storage.load_metadata(&session_id) {
+                        let _ = event_tx.send(ServerEvent::ModelChanged {
+                            session_id: session_id.clone(),
+                            model: meta.model,
+                        });
+                    }
 
                     // Re-announce the project binding so the client's status
                     // line reflects the resumed session's worktree.
@@ -1309,97 +1370,149 @@ async fn handle_connection(
             }
 
             "set_model" => {
-                if let Some(model) = &req.model {
-                    let max_tokens = req.max_tokens;
-                    let prov = current_provider.read().unwrap().clone();
-                    let new_provider = prov.create_variant(model, max_tokens);
-                    *current_provider.write().unwrap() = new_provider;
-                    let _ = event_tx.send(ServerEvent::ModelChanged {
-                        model: model.clone(),
+                let Some(model) = req.model.as_deref().map(str::trim) else {
+                    let _ = event_tx.send(ServerEvent::SystemMsg {
+                        message: "Cannot change model: model is required".to_string(),
                     });
-                    tracing::info!(model = %model, "model changed");
+                    continue;
+                };
+                if model.is_empty()
+                    || model.len() > 256
+                    || model.chars().any(char::is_control)
+                    || !session_storage.session_exists(&session_id)
+                {
+                    let _ = event_tx.send(ServerEvent::SystemMsg {
+                        message: if !session_storage.session_exists(&session_id) {
+                            format!("Cannot change model: session '{session_id}' not found")
+                        } else {
+                            "Cannot change model: invalid model name".to_string()
+                        },
+                    });
+                    continue;
+                }
+
+                let old_handle = sessions.lock().await.get(&session_id).cloned();
+                if let Err(message) = require_idle(old_handle.as_ref(), "change model").await {
+                    let _ = event_tx.send(ServerEvent::SystemMsg { message });
+                    continue;
+                }
+
+                // Build the replacement before stopping the old idle agent;
+                // a provider/session load error therefore leaves it untouched.
+                let default_provider = current_provider.read().unwrap().clone();
+                match recreate_stored_session(
+                    &session_id,
+                    Some((model, req.max_tokens)),
+                    &default_provider,
+                    &session_storage,
+                    &tools,
+                    &runtime,
+                    &projects,
+                    &session_projects,
+                    &event_tx,
+                )
+                .await
+                {
+                    Ok((new_handle, active, selected_model)) => {
+                        sessions.lock().await.insert(session_id.clone(), new_handle);
+                        if let Some(old_handle) = old_handle {
+                            let _ = old_handle.shutdown().await;
+                        }
+                        attached.insert(session_id.clone());
+                        if let Some(active) = active {
+                            session_projects
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), active);
+                        }
+                        let _ = event_tx.send(ServerEvent::ModelChanged {
+                            session_id: session_id.clone(),
+                            model: selected_model.clone(),
+                        });
+                        tracing::info!(%session_id, model = %selected_model, "session model changed");
+                    }
+                    Err(e) => {
+                        tracing::error!(%session_id, error = %e, "change session model");
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: format!("Cannot change model: {e}"),
+                        });
+                    }
                 }
             }
 
             "compact" => {
-                let mut sessions_lock = sessions.lock().await;
-                if let Some(handle) = sessions_lock.get(&session_id) {
-                    // Interrupt current processing
-                    let _ = handle.interrupt().await;
-                    // Remove the old handle (the agent task will terminate)
-                    sessions_lock.remove(&session_id);
+                let old_handle = sessions.lock().await.get(&session_id).cloned();
+                if let Err(message) = require_idle(old_handle.as_ref(), "compact session").await {
+                    let _ = event_tx.send(ServerEvent::SystemMsg { message });
+                    continue;
                 }
-
-                // Reload session from disk and re-spawn so the channel is fresh
-                match crate::session::AgentSession::load_with_storage(
+                let meta = match session_storage.load_metadata(&session_id) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: format!("Cannot compact session: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                let default_provider = current_provider.read().unwrap().clone();
+                let provider = session_provider(&default_provider, &meta.model, None);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    compact_stored_history(provider, &session_id, &session_storage),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: format!("Cannot compact session: {e}"),
+                        });
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = event_tx.send(ServerEvent::SystemMsg {
+                            message: "Cannot compact session: summarization timed out".to_string(),
+                        });
+                        continue;
+                    }
+                }
+                if let Some(old_handle) = old_handle {
+                    let _ = old_handle.shutdown().await;
+                }
+                match recreate_stored_session(
                     &session_id,
-                    SessionStorage::with_dir("./sessions"),
-                ) {
-                    Ok(mut agent_session) => {
-                        // Keep the project binding across the compact.
-                        let persisted = active_from_metadata(&agent_session.metadata);
-                        let active = resolve_project_context(
-                            &projects,
-                            &session_id,
-                            None,
-                            persisted.as_ref(),
-                        )
-                        .await;
-                        if let Some(active) = &active {
-                            // Update both the in-memory AND persisted metadata so
-                            // a later message save doesn't revert the binding to
-                            // the stale value read before reconciliation.
-                            save_active_to_metadata(&mut agent_session.metadata, active);
-                            if let Err(e) = session_storage.save_metadata(&agent_session.metadata) {
-                                tracing::warn!(%session_id, "compact save project metadata: {e}");
-                            }
-                        }
-
-                        let prov = current_provider.read().unwrap().clone();
-                        let session_tools = tools_for_session(
-                            &tools,
-                            active.as_ref(),
-                            &session_id,
-                            rename_worktree_tool(
-                                &projects,
-                                &session_id,
-                                &session_projects,
-                                &session_storage,
-                                &event_tx,
-                            ),
-                        );
-                        let agent_cfg = AgentConfig::new().with_tools(session_tools);
-                        let agent = StandardAgent::new(agent_cfg, prov);
-
-                        let handle = runtime
-                            .spawn(agent_session, |internals| agent.run(internals))
-                            .await
-                            .unwrap();
-
-                        // Forward output chunks to the event channel
-                        attach_forwarder(&handle, &event_tx, &session_id);
-
-                        if let Some(active) = &active {
+                    None,
+                    &default_provider,
+                    &session_storage,
+                    &tools,
+                    &runtime,
+                    &projects,
+                    &session_projects,
+                    &event_tx,
+                )
+                .await
+                {
+                    Ok((handle, active, _)) => {
+                        sessions.lock().await.insert(session_id.clone(), handle);
+                        attached.insert(session_id.clone());
+                        if let Some(active) = active {
                             session_projects
                                 .lock()
                                 .await
-                                .insert(session_id.clone(), active.clone());
+                                .insert(session_id.clone(), active);
                         }
-                        sessions_lock.insert(session_id.clone(), handle);
-                        attached.insert(session_id.clone());
-
                         let _ = event_tx.send(ServerEvent::SessionCompacted {
                             session_id: session_id.clone(),
                         });
-                        let _ = event_tx.send(ServerEvent::SystemMsg {
-                            message: format!("Session '{}' compacted and re-created", session_id),
-                        });
-                        tracing::info!(%session_id, "session compacted and re-created");
+                        tracing::info!(%session_id, "session history compacted");
                     }
                     Err(e) => {
-                        tracing::error!(%session_id, "compact reload session: {e}");
+                        tracing::error!(%session_id, error = %e, "restart compacted session");
                         let _ = event_tx.send(ServerEvent::SystemMsg {
-                            message: format!("Cannot compact session: {e}"),
+                            message: format!(
+                                "Session history was compacted, but the live session could not restart: {e}"
+                            ),
                         });
                     }
                 }
@@ -1423,6 +1536,12 @@ async fn handle_connection(
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn configured_session_dir(value: Option<String>) -> std::path::PathBuf {
+    value
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("./sessions"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -1436,8 +1555,11 @@ async fn main() -> Result<()> {
     let current_provider: Arc<std::sync::RwLock<Arc<dyn LlmProvider>>> =
         Arc::new(std::sync::RwLock::new(llm));
 
-    // Global shared SessionStorage for listing/resuming sessions.
-    let session_storage = Arc::new(crate::session::SessionStorage::with_dir("./sessions"));
+    // One configured store for every create/resume/model/compact path. The
+    // NixOS module exports OMEGA_SESSION_DIR; local development keeps the
+    // historical ./sessions default.
+    let session_dir = configured_session_dir(env::var("OMEGA_SESSION_DIR").ok());
+    let session_storage = Arc::new(SessionStorage::with_dir(session_dir));
 
     // Empty sessions (metadata written, but the agent never produced a
     // message — aborted creations) are useless to everyone: prune them so
@@ -1504,6 +1626,8 @@ async fn main() -> Result<()> {
     // detached session costs nothing until someone subscribes.
     let sessions: Arc<Mutex<HashMap<String, AgentHandle>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let session_controls: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let session_projects: Arc<Mutex<HashMap<String, omega_projects::ActiveProject>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -1534,6 +1658,7 @@ async fn main() -> Result<()> {
                 // closes (and survives across web page loads), so every
                 // connection shares the same live-session registry.
                 let sessions = sessions.clone();
+                let session_controls = session_controls.clone();
                 let session_projects = session_projects.clone();
                 tokio::spawn(handle_connection(
                     stream,
@@ -1544,6 +1669,7 @@ async fn main() -> Result<()> {
                     projects,
                     roles,
                     sessions,
+                    session_controls,
                     session_projects,
                 ));
             }
@@ -1557,9 +1683,247 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
     use omega_core::core::ToolResultData;
-    use omega_llm::{ContentBlock, Message};
+    use omega_llm::{
+        ContentBlock, ContentBlockDeltaEvent, ContentBlockStart, ContentBlockStartEvent, Message,
+        ToolChoice,
+    };
+    use std::pin::Pin;
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct MockProvider {
+        model: String,
+        summary: String,
+        fail: bool,
+        include_start_text: bool,
+    }
+
+    impl MockProvider {
+        fn summary(model: &str, summary: impl Into<String>) -> Self {
+            Self {
+                model: model.to_string(),
+                summary: summary.into(),
+                fail: false,
+                include_start_text: true,
+            }
+        }
+
+        fn failing(model: &str) -> Self {
+            Self {
+                model: model.to_string(),
+                summary: String::new(),
+                fail: true,
+                include_start_text: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockProvider {
+        async fn stream_with_tools_and_system(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<SystemPrompt>,
+            _tools: Vec<ToolDefinition>,
+            _tool_choice: Option<ToolChoice>,
+            _thinking: Option<omega_llm::ThinkingConfig>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>>>
+        {
+            if self.fail {
+                anyhow::bail!("mock compaction failure");
+            }
+            let mut events = Vec::new();
+            if self.include_start_text {
+                // StandardAgent treats deltas as authoritative. Including the
+                // same text here catches accidental start+delta duplication.
+                events.push(Ok(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    index: 0,
+                    content_block: ContentBlockStart::Text {
+                        text: self.summary.clone(),
+                    },
+                })));
+            }
+            events.push(Ok(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index: 0,
+                delta: ContentDelta::TextDelta {
+                    text: self.summary.clone(),
+                },
+            })));
+            events.push(Ok(StreamEvent::MessageStop));
+            Ok(Box::pin(stream::iter(events)))
+        }
+
+        async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+            Ok(vec![self.model.clone(), "model-a".into(), "model-b".into()])
+        }
+
+        fn model(&self) -> String {
+            self.model.clone()
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+
+        fn create_variant(
+            &self,
+            model: &str,
+            _max_tokens: Option<u32>,
+        ) -> Arc<dyn LlmProvider> {
+            Arc::new(Self {
+                model: model.to_string(),
+                ..self.clone()
+            })
+        }
+    }
+
+    fn long_history() -> Vec<Message> {
+        (0..12)
+            .flat_map(|n| {
+                [
+                    Message::user(format!("request {n}: {}", "important context ".repeat(40))),
+                    Message::assistant(format!("answer {n}: {}", "implementation detail ".repeat(40))),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn configured_session_dir_honors_override() {
+        assert_eq!(
+            configured_session_dir(Some("/custom/omega-sessions".to_string())),
+            std::path::PathBuf::from("/custom/omega-sessions")
+        );
+        assert_eq!(
+            configured_session_dir(None),
+            std::path::PathBuf::from("./sessions")
+        );
+    }
+
+    #[test]
+    fn session_provider_variants_are_isolated() {
+        let default: Arc<dyn LlmProvider> = Arc::new(MockProvider::summary("default", "summary"));
+        let first = session_provider(&default, "", Some(("model-a", None)));
+        let second = session_provider(&default, "model-b", None);
+        assert_eq!(first.model(), "model-a");
+        assert_eq!(second.model(), "model-b");
+        assert_eq!(default.model(), "default", "session variants must not mutate default");
+    }
+
+    #[tokio::test]
+    async fn model_recreation_changes_only_target_session() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(SessionStorage::with_dir(temp.path().join("sessions")));
+        for (id, model) in [("one", "old-one"), ("two", "old-two")] {
+            let mut session = AgentSession::new_with_storage(
+                id,
+                "omega",
+                "omega-tui",
+                "test",
+                "system",
+                storage.as_ref().clone(),
+            )
+            .unwrap();
+            session.set_model(model);
+            session.set_provider("mock");
+            session.save().unwrap();
+        }
+        let default: Arc<dyn LlmProvider> = Arc::new(MockProvider::summary("default", "summary"));
+        let tools = Arc::new(ToolRegistry::new());
+        let projects = Arc::new(ProjectManager::with_root(temp.path().join("projects")));
+        let bindings = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _receiver) = broadcast::channel(16);
+        let (handle, _, model) = recreate_stored_session(
+            "one",
+            Some(("model-a", None)),
+            &default,
+            &storage,
+            &tools,
+            &AgentRuntime::new(),
+            &projects,
+            &bindings,
+            &events,
+        )
+        .await
+        .unwrap();
+        assert_eq!(model, "model-a");
+        assert_eq!(storage.load_metadata("one").unwrap().model, "model-a");
+        assert_eq!(storage.load_metadata("two").unwrap().model, "old-two");
+        assert_eq!(default.model(), "default");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_reduces_custom_store_and_does_not_duplicate_start_text() {
+        let temp = TempDir::new().unwrap();
+        let storage = SessionStorage::with_dir(temp.path().join("custom-session-dir"));
+        let original = long_history();
+        storage.replace_messages("session", &original).unwrap();
+        let original_bytes = std::fs::read(storage.history_path("session")).unwrap().len();
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::summary("model-a", "dense continuation summary"));
+
+        compact_stored_history(provider, "session", &storage)
+            .await
+            .unwrap();
+
+        let compacted = storage.load_messages("session").unwrap();
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(message_text(&compacted[1]), "dense continuation summary");
+        assert!(
+            std::fs::read(storage.history_path("session")).unwrap().len() < original_bytes,
+            "compaction must actually reduce persisted history"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_and_summary_cap_leave_history_untouched() {
+        let temp = TempDir::new().unwrap();
+        let storage = SessionStorage::with_dir(temp.path().join("sessions"));
+        storage.replace_messages("session", &long_history()).unwrap();
+        let before = std::fs::read(storage.history_path("session")).unwrap();
+
+        let failing: Arc<dyn LlmProvider> = Arc::new(MockProvider::failing("model-a"));
+        assert!(compact_stored_history(failing, "session", &storage)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(storage.history_path("session")).unwrap(), before);
+
+        let oversized: Arc<dyn LlmProvider> = Arc::new(MockProvider::summary(
+            "model-a",
+            "x".repeat(MAX_COMPACTION_SUMMARY_BYTES + 1),
+        ));
+        assert!(compact_stored_history(oversized, "session", &storage)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(storage.history_path("session")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn busy_session_rejection_precedes_any_history_mutation() {
+        let temp = TempDir::new().unwrap();
+        let storage = SessionStorage::with_dir(temp.path());
+        storage.replace_messages("busy", &long_history()).unwrap();
+        let before = std::fs::read(storage.history_path("busy")).unwrap();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+        let (output_tx, _output_rx) = broadcast::channel(1);
+        let handle = AgentHandle::new(
+            "busy",
+            input_tx,
+            output_tx,
+            Arc::new(tokio::sync::RwLock::new(
+                omega_core::core::AgentState::Processing,
+            )),
+        );
+        let error = require_idle(Some(&handle), "compact session")
+            .await
+            .unwrap_err();
+        assert!(error.contains("Processing"));
+        assert_eq!(std::fs::read(storage.history_path("busy")).unwrap(), before);
+    }
 
     // -----------------------------------------------------------------------
     // Project helpers — system context + metadata round-trip + worktree

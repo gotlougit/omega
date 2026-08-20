@@ -198,16 +198,13 @@ fn telemetry_now_reflects_cached_tokens() {
     // Step 1: A stamped message (internal type)
     let cc = CacheControl::ephemeral_1h();
     let mut msg = Message::user("What is 2+2?");
-    match &mut msg.content {
-        MessageContent::Text(text) => {
-            if !text.is_empty() {
-                msg.content = MessageContent::Blocks(vec![ContentBlock::Text {
-                    text: text.clone(),
-                    cache_control: Some(cc.clone()),
-                }]);
-            }
+    if let MessageContent::Text(text) = &mut msg.content {
+        if !text.is_empty() {
+            msg.content = MessageContent::Blocks(vec![ContentBlock::Text {
+                text: text.clone(),
+                cache_control: Some(cc.clone()),
+            }]);
         }
-        _ => {}
     }
 
     // Verify cache_control is on the internal type

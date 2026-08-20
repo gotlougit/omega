@@ -5,57 +5,12 @@ pub use omega_core;
 pub use omega_tools;
 
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use omega_core::core::{ToolResult, ToolResultData};
-
-// ---------------------------------------------------------------------------
-// Wire protocol (mirrors the types in src/bin/omega-sh.rs)
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct OmegaRequest {
-    id: String,
-    tool: String,
-    args: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dir: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OmegaResponse {
-    id: String,
-    result: OmegaToolResult,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum OmegaContent {
-    Text {
-        data: String,
-    },
-    Image {
-        data: String,
-        media_type: String,
-    },
-    Document {
-        data: String,
-        media_type: String,
-        description: String,
-    },
-}
-
-#[derive(Deserialize)]
-struct OmegaToolResult {
-    #[serde(flatten)]
-    content: OmegaContent,
-    is_error: bool,
-}
+use omega_protocol::sh::{OmegaContent, OmegaRequest, OmegaResponse, OmegaToolResult};
 
 // ---------------------------------------------------------------------------
 // Client
@@ -189,11 +144,6 @@ fn convert_result(tr: OmegaToolResult) -> ToolResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Proxy tool implementations
-// ---------------------------------------------------------------------------
-
-/// Proxy tool implementations that delegate to the omega-sh daemon.
 // ---------------------------------------------------------------------------
 // Generic proxy tool  –  forwards execution to omega-sh
 // ---------------------------------------------------------------------------

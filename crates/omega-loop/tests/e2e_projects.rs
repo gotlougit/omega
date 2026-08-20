@@ -393,11 +393,11 @@ async fn activate_bogus_url_reports_error() {
         .send_activate_project("e2e-sess", "/nonexistent/not-a-repo-xyz")
         .await
         .unwrap();
-    match wait_for_event(&mut reader, |e| matches!(e, ServerEvent::SystemMsg(_))).await {
-        ServerEvent::SystemMsg(msg) => {
+    match wait_for_event(&mut reader, |e| matches!(e, ServerEvent::SystemMsg { .. })).await {
+        ServerEvent::SystemMsg { message } => {
             assert!(
-                msg.contains("Cannot activate project"),
-                "unexpected message: {msg}"
+                message.contains("Cannot activate project"),
+                "unexpected message: {message}"
             );
         }
         _ => unreachable!(),

@@ -167,7 +167,7 @@ pub fn fmt_text_to_styled_text(fmt_text: &FmtText<'_, '_>, skin: &MadSkin) -> St
                 let rule_char = skin.horizontal_rule.get_char();
                 // A horizontal rule fills the terminal width.
                 let w = fmt_text.width.unwrap_or(80).min(120);
-                let rule_line: String = std::iter::repeat(rule_char).take(w).collect();
+                let rule_line: String = std::iter::repeat_n(rule_char, w).collect();
                 result.push(Span::new(rule_line, rule_style));
             }
             FmtLine::TableRow(row) => {
@@ -187,7 +187,7 @@ pub fn fmt_text_to_styled_text(fmt_text: &FmtText<'_, '_>, skin: &MadSkin) -> St
                     if i > 0 {
                         result.push(Span::new(tbc.cross.to_string(), rule_style));
                     }
-                    let hbar: String = std::iter::repeat(tbc.horizontal).take(*w).collect();
+                    let hbar: String = std::iter::repeat_n(tbc.horizontal, *w).collect();
                     result.push(Span::new(hbar, rule_style));
                 }
             }

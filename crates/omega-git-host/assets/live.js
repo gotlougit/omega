@@ -345,6 +345,12 @@ function el(tag, cls, text) {
       case 'status':
         this.statusEl.textContent = m.message || '';
         break;
+      case 'model_changed':
+        this.handleModelChanged(m);
+        break;
+      case 'compacted':
+        this.handleCompacted(m);
+        break;
       case 'error':
         this.statusEl.textContent = '⚠ ' + (m.message || '');
         break;
@@ -352,6 +358,26 @@ function el(tag, cls, text) {
         this.handleDone();
         break;
     }
+  };
+
+  /** Apply model notifications only to the session this stream represents. */
+  LiveChat.prototype.handleModelChanged = function (m) {
+    const sessionId = this.container.getAttribute('data-session-id') || '';
+    if (m.session_id && m.session_id !== sessionId) return;
+    const model = String(m.model || '');
+    const current = document.getElementById('session-model');
+    if (current) current.textContent = model;
+    const select = document.getElementById('session-model-select');
+    if (select) select.value = model;
+    this.statusEl.textContent = model ? 'Model: ' + model : '';
+  };
+
+  /** A compacted transcript changed on disk; reload to render its summary. */
+  LiveChat.prototype.handleCompacted = function (m) {
+    const sessionId = this.container.getAttribute('data-session-id') || '';
+    if (m.session_id && m.session_id !== sessionId) return;
+    this.statusEl.textContent = 'Session compacted; refreshing transcript…';
+    window.location.reload();
   };
 
   /** Reconnect: drop live-appended messages, back to the persisted state. */

@@ -2,6 +2,8 @@
 
 {% block content %}
 <div class="container">
+  {% if error %}<div class="alert alert-danger">{{ error | e }}</div>{% endif %}
+  {% if ok %}<div class="alert alert-success">{{ ok | e }}</div>{% endif %}
   <div class="row mb-3">
     <div class="col-md-8">
       <div class="event-list mb-2">
@@ -53,16 +55,77 @@
         {% endfor %}
       </dl>
       {% if origin %}
-      <h3>origin</h3>
+      <h3>upstream</h3>
       <p><a href="{{ origin }}">{{ origin }}</a></p>
       {% endif %}
       <h3>rebase cron</h3>
       {% if rebase_enabled %}
-      <p><span class="text-success">enabled</span> — main is kept in sync with upstream (rebaser chat: <code>rebaser-{{ name }}</code>).</p>
+      <p><span class="text-success">enabled</span> — runs every {{ rebase_interval }}.</p>
       {% else %}
       <p><span class="text-muted">disabled</span> — main is not auto-synced with upstream.</p>
       {% endif %}
-      <p class="text-muted"><a href="/rebase/">manage in the rebase page</a></p>
+      <p>
+        status: <strong>{{ rebase_status }}</strong>{% if rebase_outcome %} ({{ rebase_outcome }}){% endif %}
+      </p>
+      <form method="post" action="/rebase/run">
+        <input type="hidden" name="project" value="{{ name }}" />
+        <button type="submit" class="btn btn-success btn-sm">Rebase now</button>
+        <a class="ml-2" href="/rebase/">schedule and prompt settings</a>
+      </form>
+      <hr />
+      <h3>GitHub mirror</h3>
+      {% if mirror_configured %}
+      <p>
+        <a href="{{ mirror_url | e }}">{{ mirror_url | e }}</a><br />
+        status: <strong>{{ mirror_status | e }}</strong>
+        {% if mirror_last_success %}<small class="text-muted">at {{ mirror_last_success | date | e }}</small>{% endif %}
+      </p>
+      {% if mirror_detail %}<p class="alert alert-warning py-1">{{ mirror_detail | e }}</p>{% endif %}
+      <p class="text-muted">
+        {% if mirror_auto_push %}Automatic push after successful rebases and merges is enabled.{% else %}Automatic push is disabled.{% endif %}
+        {% if mirror_has_token %}A write-only credential is available.{% else %}<strong>No credential is available.</strong>{% endif %}
+      </p>
+      <form method="post" action="/{{ name | e }}/mirror/push" class="mb-3">
+        <button type="submit" class="btn btn-success btn-sm" {% if not mirror_has_token %}disabled{% endif %}>Push now</button>
+      </form>
+      {% else %}
+      <p class="text-muted">No writable mirror is configured. Upstream remains fetch-only.</p>
+      {% endif %}
+      <form method="post" action="/{{ name | e }}/mirror/configure">
+        <div class="form-group">
+          <label for="mirror-url">GitHub repository</label>
+          <input id="mirror-url" name="mirror" class="form-control" required maxlength="256"
+                 value="{{ (mirror_url or '') | e }}" placeholder="owner/repo" />
+          <small class="form-text text-muted">Only <code>https://github.com/owner/repo.git</code> is accepted.</small>
+        </div>
+        <div class="form-group">
+          <label for="mirror-token">GitHub PAT</label>
+          <input id="mirror-token" name="token" type="password" class="form-control"
+                 maxlength="4096" autocomplete="new-password" value="" />
+          <small class="form-text text-muted">Write-only. Leave blank to keep the existing token unchanged.</small>
+        </div>
+        <div class="form-check mb-2">
+          <input id="mirror-auto" name="auto_push" type="checkbox" class="form-check-input"
+                 {% if mirror_auto_push %}checked{% endif %} />
+          <label for="mirror-auto" class="form-check-label">Push automatically after a successful rebase or merge</label>
+        </div>
+        <div class="form-check mb-2">
+          <input id="mirror-remove-token" name="remove_token" type="checkbox" class="form-check-input" />
+          <label for="mirror-remove-token" class="form-check-label">Remove the per-project token when saving</label>
+        </div>
+        <button type="submit" class="btn btn-primary btn-sm">Save mirror settings</button>
+      </form>
+      {% if mirror_configured %}
+      <form method="post" action="/{{ name | e }}/mirror/remove" class="mt-2"
+            onsubmit="return confirm('Remove this mirror configuration?');">
+        <label><input type="checkbox" name="remove_token" /> also remove per-project token</label><br />
+        <button type="submit" class="btn btn-outline-danger btn-sm">Remove mirror</button>
+      </form>
+      {% endif %}
+      <p class="small text-muted mt-2">
+        Rewritten history uses an exact force-with-lease. If GitHub moves unexpectedly,
+        omega refuses to overwrite it. The <code>upstream</code> remote is never pushed.
+      </p>
       <hr />
       <h3 class="text-danger">danger zone</h3>
       <form method="post" action="/projects/delete"

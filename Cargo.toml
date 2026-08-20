@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/omega-protocol",
     "crates/omega-sh",
     "crates/omega-loop-client",
     "crates/cli",

@@ -28,6 +28,20 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+/// The fetch-only remote that represents the authoritative repository. It
+/// is intentionally not called `origin`: a soft fork may later use origin
+/// (or another remote) as its writable mirror without conflating it with
+/// the repository it rebases onto.
+pub const UPSTREAM_REMOTE: &str = "upstream";
+
+/// The only writable remote managed by omega. It is deliberately distinct
+/// from [`UPSTREAM_REMOTE`], which is authoritative and fetch-only.
+pub const MIRROR_REMOTE: &str = "mirror";
+
+/// Safe GitHub mirror configuration, credentials, and force-with-lease push
+/// mechanics shared by omega-loop and omega-git-host.
+pub mod mirror;
+
 /// Rebase-cron configuration & state, shared with omega-loop and
 /// omega-git-host (see `rebase.rs`).
 pub mod rebase;
@@ -43,7 +57,7 @@ pub struct ProjectInfo {
     pub name: String,
     /// Remote URL the project was registered from.
     pub url: String,
-    /// Default branch at clone time (informational; may drift).
+    /// Local/upstream branch pair used by the soft-fork rebase flow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
     /// When the project was first registered.
@@ -102,6 +116,14 @@ pub enum DefaultBranchStatus {
         ahead: usize,
         behind: usize,
     },
+}
+
+/// Result of mechanically starting a rebase of the local default branch on
+/// the fetched upstream branch. The LLM is only needed for the second case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultBranchRebaseStatus {
+    Rebased { old: String, new: String },
+    Conflicts { upstream_ref: String, detail: String },
 }
 
 impl ProjectManager {
@@ -616,7 +638,7 @@ impl ProjectManager {
     // -----------------------------------------------------------------------
 
     /// Fetch upstream and classify (and where safe, mechanically update) the
-    /// project's default branch relative to `origin/<default>`.
+    /// project's default branch relative to `upstream/<default>`.
     ///
     /// - strictly behind  → fast-forward `refs/heads/<default>` (a pure
     ///   mirror update — never drops local-only commits),
@@ -648,7 +670,7 @@ impl ProjectManager {
         }
 
         let local_ref = format!("refs/heads/{default}");
-        let upstream_ref = format!("refs/remotes/origin/{default}");
+        let upstream_ref = format!("refs/remotes/{UPSTREAM_REMOTE}/{default}");
         let local = match git(&repo, &["rev-parse", &local_ref]).await {
             Ok(sha) if !sha.is_empty() => sha,
             _ => return Ok(None),
@@ -666,7 +688,22 @@ impl ProjectManager {
         // of B.
         let local_behind = is_ancestor(&repo, &local, &upstream).await;
         if local_behind {
-            git(&repo, &["update-ref", &local_ref, &upstream]).await?;
+            // Updating a checked-out ref behind Git's back leaves that
+            // worktree's index/files at the old commit and makes it appear
+            // dirty. Fast-forward through the worktree when one exists.
+            if let Some(path) = worktree_path_for_branch(&repo, &default).await {
+                let worktree = Path::new(&path);
+                let dirty = git(worktree, &["status", "--porcelain"]).await?;
+                if !dirty.trim().is_empty() {
+                    bail!(
+                        "cannot fast-forward project '{}': default-branch worktree has uncommitted changes",
+                        info.name
+                    );
+                }
+                git(worktree, &["merge", "--ff-only", &upstream]).await?;
+            } else {
+                git(&repo, &["update-ref", &local_ref, &upstream]).await?;
+            }
             return Ok(Some(DefaultBranchStatus::FastForwarded(local, upstream)));
         }
 
@@ -683,6 +720,72 @@ impl ProjectManager {
             ahead,
             behind,
         }))
+    }
+
+    /// Start (and, when conflict-free, finish) rebasing the local default
+    /// branch onto its fetched upstream ref. On conflicts Git's rebase state
+    /// is deliberately left intact in the dedicated main worktree so the
+    /// rebaser session can inspect, resolve, and continue it.
+    pub async fn rebase_default_branch(
+        &self,
+        info: &ProjectInfo,
+    ) -> Result<DefaultBranchRebaseStatus> {
+        self.fetch(info).await?;
+        let default = self
+            .default_branch(info)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("project '{}' has no configured default branch", info.name))?;
+        let upstream_ref = format!("{UPSTREAM_REMOTE}/{default}");
+        let main = self.ensure_main_worktree(info).await?;
+        let worktree = Path::new(&main.worktree_path);
+
+        if has_rebase_state(worktree).await {
+            return Ok(DefaultBranchRebaseStatus::Conflicts {
+                upstream_ref,
+                detail: "a rebase is already in progress".to_string(),
+            });
+        }
+
+        let dirty = git(worktree, &["status", "--porcelain"]).await?;
+        if !dirty.trim().is_empty() {
+            bail!(
+                "cannot rebase project '{}': default-branch worktree has uncommitted changes",
+                info.name
+            );
+        }
+
+        let old = git(worktree, &["rev-parse", "HEAD"]).await?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["rebase", &upstream_ref])
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true")
+            .output()
+            .await
+            .with_context(|| format!("failed to start rebase in {}", worktree.display()))?;
+        if output.status.success() {
+            let new = git(worktree, &["rev-parse", "HEAD"]).await?;
+            return Ok(DefaultBranchRebaseStatus::Rebased { old, new });
+        }
+
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if has_rebase_state(worktree).await {
+            Ok(DefaultBranchRebaseStatus::Conflicts {
+                upstream_ref,
+                detail,
+            })
+        } else {
+            bail!("git rebase failed before creating rebase state: {detail}")
+        }
+    }
+
+    /// Whether the dedicated default-branch worktree still contains Git
+    /// rebase state. Used to reconcile persisted conflicted jobs after an
+    /// omega-loop restart without waking the rebaser again.
+    pub async fn default_branch_rebase_in_progress(&self, info: &ProjectInfo) -> Result<bool> {
+        let main = self.ensure_main_worktree(info).await?;
+        Ok(has_rebase_state(Path::new(&main.worktree_path)).await)
     }
 
     /// Ensure a dedicated worktree exists for the project's default branch —
@@ -841,6 +944,7 @@ impl ProjectManager {
         let out = Command::new("git")
             .arg("clone")
             .arg("--bare")
+            .args(["--origin", UPSTREAM_REMOTE])
             .arg(&info.url)
             .arg(&tmp)
             .output()
@@ -873,29 +977,59 @@ impl ProjectManager {
 
     async fn fetch(&self, info: &ProjectInfo) -> Result<()> {
         let repo = self.repo_dir(&info.name);
-        // Explicit refspec: keeps refs/remotes/origin/* up to date even for
+        self.ensure_upstream_remote(info).await?;
+        // Explicit refspec: keeps refs/remotes/upstream/* up to date even for
         // clones made by `git clone` local-path optimizations, which skip
         // the remote-tracking refspec (tests use local dirs as remotes).
         git(
             &repo,
             &[
                 "fetch",
-                "origin",
+                UPSTREAM_REMOTE,
                 "--prune",
-                "+refs/heads/*:refs/remotes/origin/*",
+                "+refs/heads/*:refs/remotes/upstream/*",
             ],
         )
         .await?;
         Ok(())
     }
 
-    /// Best-effort default branch detection: the bare clone's own HEAD
-    /// (which mirrors the remote's default branch at clone time).
+    /// Migrate old stores which cloned their authoritative repository as
+    /// `origin`, and keep the explicit upstream URL consistent with the
+    /// registry. This frees `origin` for an optional writable fork mirror.
+    async fn ensure_upstream_remote(&self, info: &ProjectInfo) -> Result<()> {
+        let repo = self.repo_dir(&info.name);
+        if git(&repo, &["remote", "get-url", UPSTREAM_REMOTE]).await.is_err() {
+            if git(&repo, &["remote", "get-url", "origin"]).await.is_ok() {
+                git(&repo, &["remote", "rename", "origin", UPSTREAM_REMOTE]).await?;
+            } else {
+                git(&repo, &["remote", "add", UPSTREAM_REMOTE, &info.url]).await?;
+            }
+        }
+        let current = git(&repo, &["remote", "get-url", UPSTREAM_REMOTE]).await?;
+        if current.trim() != info.url {
+            git(
+                &repo,
+                &["remote", "set-url", UPSTREAM_REMOTE, &info.url],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The registry's configured branch is authoritative. Older entries
+    /// without it fall back to the bare clone/remote HEAD for migration.
     pub async fn default_branch(&self, info: &ProjectInfo) -> Option<String> {
+        if let Some(branch) = info.default_branch.as_deref() {
+            let branch = branch.trim();
+            if !branch.is_empty() && branch != "HEAD" {
+                return Some(branch.to_string());
+            }
+        }
         let repo = self.repo_dir(&info.name);
         for args in [
             vec!["symbolic-ref", "--short", "HEAD"],
-            vec!["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            vec!["symbolic-ref", "--short", "refs/remotes/upstream/HEAD"],
             vec!["rev-parse", "--abbrev-ref", "HEAD"],
         ] {
             if let Ok(out) = git(&repo, &args).await {
@@ -966,6 +1100,17 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+async fn has_rebase_state(worktree: &Path) -> bool {
+    for path in ["rebase-merge", "rebase-apply"] {
+        if let Ok(git_path) = git(worktree, &["rev-parse", "--git-path", path]).await {
+            if Path::new(git_path.trim()).exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether `ancestor` is an ancestor of `descendant` (`git merge-base
@@ -1107,7 +1252,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A throwaway "origin" repository plus a throwaway project store.
+    /// A throwaway upstream repository plus a throwaway project store.
     /// Dropping the fixture removes both (nothing is committed or shared).
     struct Fixture {
         _remote: TempDir,
@@ -1668,7 +1813,7 @@ mod tests {
         assert!(Path::new(&taken.worktree_path).is_dir());
         assert_eq!(
             git(
-                &Path::new(&taken.worktree_path),
+                Path::new(&taken.worktree_path),
                 &["branch", "--show-current"]
             )
             .await
@@ -1965,7 +2110,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(local, new);
-                let upstream = git(&repo, &["rev-parse", "refs/remotes/origin/main"])
+                let upstream = git(&repo, &["rev-parse", "refs/remotes/upstream/main"])
                     .await
                     .unwrap();
                 assert_eq!(local, upstream, "main should now equal upstream");
@@ -1981,6 +2126,27 @@ mod tests {
             .unwrap()
             .expect("a status");
         assert!(matches!(status, DefaultBranchStatus::UpToDate));
+    }
+
+    #[tokio::test]
+    async fn fast_forward_keeps_existing_main_worktree_clean_and_current() {
+        let fx = fixture().await;
+        let info = fx.manager.resolve(&fx.remote_url).await.unwrap();
+        let main = fx.manager.ensure_main_worktree(&info).await.unwrap();
+        advance_remote(fx._remote.path()).await;
+        let status = fx.manager.update_default_branch(&info).await.unwrap().unwrap();
+        assert!(matches!(status, DefaultBranchStatus::FastForwarded(_, _)));
+        let main_dir = Path::new(&main.worktree_path);
+        assert_eq!(git(main_dir, &["status", "--porcelain"]).await.unwrap(), "");
+        assert_eq!(
+            git(main_dir, &["rev-parse", "HEAD"]).await.unwrap(),
+            git(
+                &fx.manager.repo_dir(&info.name),
+                &["rev-parse", "refs/remotes/upstream/main"]
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2037,6 +2203,94 @@ mod tests {
             .unwrap()
             .expect("a status");
         assert!(matches!(status, DefaultBranchStatus::AheadOnly));
+    }
+
+    #[tokio::test]
+    async fn registered_source_is_the_distinct_upstream_remote() {
+        let fx = fixture().await;
+        let info = fx.manager.resolve(&fx.remote_url).await.unwrap();
+        let repo = fx.manager.repo_dir(&info.name);
+        let remotes = git(&repo, &["remote"]).await.unwrap();
+        assert_eq!(remotes, UPSTREAM_REMOTE);
+
+        // Old stores are migrated in place on their next fetch, freeing
+        // origin for a future writable fork mirror.
+        git(&repo, &["remote", "rename", UPSTREAM_REMOTE, "origin"])
+            .await
+            .unwrap();
+        fx.manager.update_default_branch(&info).await.unwrap();
+        let remotes = git(&repo, &["remote"]).await.unwrap();
+        assert_eq!(remotes, UPSTREAM_REMOTE);
+    }
+
+    #[tokio::test]
+    async fn diverged_default_branch_is_rebased_without_llm_when_conflict_free() {
+        let fx = fixture().await;
+        let info = fx.manager.resolve(&fx.remote_url).await.unwrap();
+        let local_sha = local_only_commit(&fx.manager, &info).await;
+        advance_remote(fx._remote.path()).await;
+
+        let status = fx.manager.update_default_branch(&info).await.unwrap().unwrap();
+        assert!(matches!(status, DefaultBranchStatus::Diverged { .. }));
+        let result = fx.manager.rebase_default_branch(&info).await.unwrap();
+        let (old, new) = match result {
+            DefaultBranchRebaseStatus::Rebased { old, new } => (old, new),
+            other => panic!("expected completed rebase, got {other:?}"),
+        };
+        assert_eq!(old, local_sha);
+        assert_ne!(new, old, "rebased local commit gets a new identity");
+        let repo = fx.manager.repo_dir(&info.name);
+        assert!(is_ancestor(
+            &repo,
+            "refs/remotes/upstream/main",
+            "refs/heads/main"
+        )
+        .await);
+    }
+
+    #[tokio::test]
+    async fn conflicting_rebase_is_left_in_progress_for_the_agent() {
+        let fx = fixture().await;
+        let info = fx.manager.resolve(&fx.remote_url).await.unwrap();
+        let main = fx.manager.ensure_main_worktree(&info).await.unwrap();
+        configure_worktree_identity(&fx.manager, &info).await;
+        let main_dir = Path::new(&main.worktree_path);
+        tokio::fs::write(main_dir.join("README.md"), "# Local behavior\n")
+            .await
+            .unwrap();
+        git(main_dir, &["add", "README.md"]).await.unwrap();
+        git(main_dir, &["commit", "-m", "local readme behavior"])
+            .await
+            .unwrap();
+
+        tokio::fs::write(fx._remote.path().join("README.md"), "# Upstream behavior\n")
+            .await
+            .unwrap();
+        git(fx._remote.path(), &["add", "README.md"]).await.unwrap();
+        git(fx._remote.path(), &["commit", "-m", "upstream readme change"])
+            .await
+            .unwrap();
+
+        let result = fx.manager.rebase_default_branch(&info).await.unwrap();
+        assert!(matches!(
+            result,
+            DefaultBranchRebaseStatus::Conflicts { .. }
+        ));
+        assert!(fx
+            .manager
+            .default_branch_rebase_in_progress(&info)
+            .await
+            .unwrap());
+        let rebase_dir = git(main_dir, &["rev-parse", "--git-path", "rebase-merge"])
+            .await
+            .unwrap();
+        assert!(Path::new(&rebase_dir).exists());
+        git(main_dir, &["rebase", "--abort"]).await.unwrap();
+        assert!(!fx
+            .manager
+            .default_branch_rebase_in_progress(&info)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

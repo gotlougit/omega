@@ -34,10 +34,14 @@ async fn init_source_repo(dir: &Path) {
     git(dir, &["config", "user.email", "omega-test@example.com"])
         .await
         .unwrap();
-    git(dir, &["config", "user.name", "Omega Test"]).await.unwrap();
+    git(dir, &["config", "user.name", "Omega Test"])
+        .await
+        .unwrap();
     // Don't inherit the host's commit.gpgsign — signing would prompt/
     // hang on a throwaway repo that has no signing key.
-    git(dir, &["config", "commit.gpgsign", "false"]).await.unwrap();
+    git(dir, &["config", "commit.gpgsign", "false"])
+        .await
+        .unwrap();
     std::fs::write(dir.join("README.md"), "# Dummy project\n").unwrap();
     git(dir, &["add", "."]).await.unwrap();
     git(dir, &["commit", "-m", "initial commit"]).await.unwrap();
@@ -69,7 +73,11 @@ fn free_port() -> u16 {
 
 /// Persist a session's active-project binding the way omega-loop does after a
 /// rename: JSON metadata under `session_dir/<id>/metadata.json`.
-fn persist_active_binding(session_dir: &Path, session_id: &str, active: &omega_projects::ActiveProject) {
+fn persist_active_binding(
+    session_dir: &Path,
+    session_id: &str,
+    active: &omega_projects::ActiveProject,
+) {
     let dir = session_dir.join(session_id);
     std::fs::create_dir_all(&dir).unwrap();
     let meta = serde_json::json!({
@@ -95,8 +103,16 @@ fn persist_active_binding(session_dir: &Path, session_id: &str, active: &omega_p
             }
         }
     });
-    std::fs::write(dir.join("metadata.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-    std::fs::write(dir.join("history.jsonl"), "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("history.jsonl"),
+        "{\"role\":\"user\",\"content\":\"hi\"}\n",
+    )
+    .unwrap();
 }
 
 /// Spawn the real `omega-git-host` binary against `projects_dir` (and
@@ -118,12 +134,7 @@ async fn spawn_server(projects_dir: &Path, session_dir: &Path, port: u16) -> Chi
 
 /// Write a fake session's metadata.json so the refs page can link a worktree
 /// branch to a chat conversation (mirrors omega-loop's custom metadata).
-async fn seed_session(
-    session_dir: &Path,
-    session_id: &str,
-    branch: &str,
-    conversation_name: &str,
-) {
+async fn seed_session(session_dir: &Path, session_id: &str, branch: &str, conversation_name: &str) {
     let dir = session_dir.join(session_id);
     std::fs::create_dir_all(&dir).unwrap();
     let meta = serde_json::json!({
@@ -190,15 +201,14 @@ async fn http_get(port: u16, path: &str) -> String {
     for attempt in 0..5 {
         let mut stream = match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(s) => s,
-            Err(e) if attempt < 4 => {
+            Err(_e) if attempt < 4 => {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
             Err(e) => panic!("connect failed: {e}"),
         };
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        );
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
         if stream.write_all(req.as_bytes()).await.is_err() && attempt < 4 {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
@@ -255,12 +265,9 @@ async fn clone_serves_default_branch_and_worktree_branches() {
     );
 
     // ...and referenceable like any other branch.
-    let sha = git(
-        dest.path(),
-        &["rev-parse", &remote_worktree],
-    )
-    .await
-    .unwrap();
+    let sha = git(dest.path(), &["rev-parse", &remote_worktree])
+        .await
+        .unwrap();
     assert!(sha.len() >= 40, "resolved sha: {sha}");
 
     drop(server);
@@ -426,7 +433,10 @@ async fn repo_pages_render_and_refs_link_worktrees_to_sessions() {
     let body = http_get(port, &format!("/{project}/sessions")).await;
     assert!(body.contains("200 OK"), "repo sessions:\n{body}");
     assert!(body.contains("Fix the thing"), "repo sessions:\n{body}");
-    assert!(body.contains("/sessions/sess-123"), "repo sessions:\n{body}");
+    assert!(
+        body.contains("/sessions/sess-123"),
+        "repo sessions:\n{body}"
+    );
     assert!(
         body.contains(&escaped_url(&worktree_branch)),
         "repo sessions:\n{body}"
@@ -513,8 +523,14 @@ async fn worktree_rename_is_reflected_in_summary_and_refs() {
 
     // Pre-rename: old branch shown + linked to chat.
     let body = http_get(port, &format!("/{}/refs", active.project.name)).await;
-    assert!(body.contains(&escaped_url(&old_branch)), "pre-rename refs:\n{body}");
-    assert!(body.contains("/sessions/sess-123"), "pre-rename refs:\n{body}");
+    assert!(
+        body.contains(&escaped_url(&old_branch)),
+        "pre-rename refs:\n{body}"
+    );
+    assert!(
+        body.contains("/sessions/sess-123"),
+        "pre-rename refs:\n{body}"
+    );
 
     // Simulate the omega-loop rename tool: rename_worktree + persist metadata.
     let renamed = manager
@@ -526,15 +542,33 @@ async fn worktree_rename_is_reflected_in_summary_and_refs() {
     // Post-rename: refs must show the NEW branch, still linked to the chat,
     // and must NOT reference the old (now gone) branch.
     let body = http_get(port, &format!("/{}/refs", active.project.name)).await;
-    assert!(body.contains(&escaped_url(&renamed.branch)), "post-rename refs:\n{body}");
-    assert!(body.contains("/sessions/sess-123"), "post-rename refs:\n{body}");
-    assert!(!body.contains(&escaped_url(&old_branch)), "old branch leaked:\n{body}");
+    assert!(
+        body.contains(&escaped_url(&renamed.branch)),
+        "post-rename refs:\n{body}"
+    );
+    assert!(
+        body.contains("/sessions/sess-123"),
+        "post-rename refs:\n{body}"
+    );
+    assert!(
+        !body.contains(&escaped_url(&old_branch)),
+        "old branch leaked:\n{body}"
+    );
 
     // Summary page likewise.
     let body = http_get(port, &format!("/{}/", active.project.name)).await;
-    assert!(body.contains(&escaped_url(&renamed.branch)), "post-rename summary:\n{body}");
-    assert!(body.contains("/sessions/sess-123"), "post-rename summary:\n{body}");
-    assert!(!body.contains(&escaped_url(&old_branch)), "old branch in summary:\n{body}");
+    assert!(
+        body.contains(&escaped_url(&renamed.branch)),
+        "post-rename summary:\n{body}"
+    );
+    assert!(
+        body.contains("/sessions/sess-123"),
+        "post-rename summary:\n{body}"
+    );
+    assert!(
+        !body.contains(&escaped_url(&old_branch)),
+        "old branch in summary:\n{body}"
+    );
 
     // The session transcript still opens.
     let body = http_get(port, "/sessions/sess-123").await;
@@ -573,7 +607,10 @@ async fn session_pages_render_transcripts_and_system_prompts() {
     // raw user/assistant exchange.
     let body = http_get(port, "/sessions/sess-123").await;
     assert!(body.contains("200 OK"), "session page:\n{body}");
-    assert!(body.contains("please add a feature"), "session page:\n{body}");
+    assert!(
+        body.contains("please add a feature"),
+        "session page:\n{body}"
+    );
     // Assistant body is markdown-rendered.
     assert!(
         body.contains("<strong>let me check</strong>"),
@@ -581,7 +618,10 @@ async fn session_pages_render_transcripts_and_system_prompts() {
     );
     // Thinking is part of the assistant message, hidden by default.
     assert!(body.contains("class=\"thinking\""), "session page:\n{body}");
-    assert!(body.contains("hmm, let me look around"), "session page:\n{body}");
+    assert!(
+        body.contains("hmm, let me look around"),
+        "session page:\n{body}"
+    );
     // Tool call + result are one collapsed unit inside the assistant message.
     assert!(body.contains("class=\"tools\""), "session page:\n{body}");
     assert!(body.contains("<code>Bash</code>"), "session page:\n{body}");
@@ -591,7 +631,10 @@ async fn session_pages_render_transcripts_and_system_prompts() {
     );
     assert!(body.contains("system-prompt"), "session page:\n{body}");
     assert!(
-        body.contains(&format!("/{project}/tree/{}", escaped_url(&worktree_branch))),
+        body.contains(&format!(
+            "/{project}/tree/{}",
+            escaped_url(&worktree_branch)
+        )),
         "session page must link back to the worktree:\n{body}"
     );
 
@@ -612,6 +655,208 @@ async fn session_pages_render_transcripts_and_system_prompts() {
     // Unknown session → 404.
     let body = http_get(port, "/sessions/nope").await;
     assert!(body.contains("404 Not Found"), "unknown session:\n{body}");
+
+    drop(server);
+}
+
+/// The changes page is a live, bounded view over the *real* session
+/// worktree: committed branch changes, index changes, tracked worktree
+/// changes, and untracked files remain distinct so the user can tell what
+/// the agent has done and what it has committed.
+#[tokio::test]
+async fn session_changes_render_every_git_layer_and_truncate_large_output() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let source_root = TempDir::new().unwrap();
+    let source = source_root.path().join("my-project");
+    std::fs::create_dir_all(&source).unwrap();
+    init_source_repo(&source).await;
+
+    let manager = ProjectManager::with_root(store.path());
+    let active = manager
+        .activate(source.to_str().unwrap(), "changes-session", None)
+        .await
+        .unwrap();
+    let worktree = Path::new(&active.worktree_path);
+    git(worktree, &["config", "user.email", "omega-test@example.com"])
+        .await
+        .unwrap();
+    git(worktree, &["config", "user.name", "Omega Test"])
+        .await
+        .unwrap();
+    git(worktree, &["config", "commit.gpgsign", "false"])
+        .await
+        .unwrap();
+
+    // Committed layer: a rename, regular additions, and the empty tracked
+    // file which will later produce the deliberately huge unstaged patch.
+    git(worktree, &["mv", "README.md", "README-renamed.md"])
+        .await
+        .unwrap();
+    std::fs::write(worktree.join("committed.txt"), "committed by omega\n").unwrap();
+    std::fs::write(worktree.join("delete-me.txt"), "remove this later\n").unwrap();
+    std::fs::write(worktree.join("large.txt"), "").unwrap();
+    git(worktree, &["add", "."]).await.unwrap();
+    git(worktree, &["commit", "-m", "omega committed changes"])
+        .await
+        .unwrap();
+
+    // Staged layer: text, a binary file, and a deletion.
+    std::fs::write(worktree.join("staged.txt"), "staged by omega\n").unwrap();
+    std::fs::write(worktree.join("staged.bin"), b"\0\x01omega-binary").unwrap();
+    git(worktree, &["add", "staged.txt", "staged.bin"])
+        .await
+        .unwrap();
+    git(worktree, &["rm", "delete-me.txt"]).await.unwrap();
+
+    // Unstaged tracked layer. The large patch proves the subprocess/output
+    // guard emits an explicit notice instead of buffering indefinitely.
+    std::fs::write(
+        worktree.join("README-renamed.md"),
+        "# Dummy project\nunstaged by omega\n",
+    )
+    .unwrap();
+    std::fs::write(worktree.join("large.txt"), "large line\n".repeat(40_000)).unwrap();
+
+    // Untracked layer: render a safe text patch but list binary content
+    // without trying to include it inline.
+    std::fs::write(worktree.join("untracked.txt"), "untracked by omega\n").unwrap();
+    std::fs::write(worktree.join("untracked.bin"), b"\0not-inline").unwrap();
+    let hostile_filename = "<img src=x onerror=alert(1)>.txt";
+    std::fs::write(worktree.join(hostile_filename), "hostile-looking name\n").unwrap();
+    persist_active_binding(sessions.path(), "changes-session", &active);
+    let metadata_path = sessions.path().join("changes-session/metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["conversation_name"] =
+        serde_json::json!("<img src=x onerror=alert(2)>");
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let port = free_port();
+    let server = spawn_server(store.path(), sessions.path(), port).await;
+    wait_for_server(port).await;
+
+    // The persisted and live chat render from the same template, and both
+    // expose the changes snapshot directly.
+    let transcript = http_get(port, "/sessions/changes-session").await;
+    assert!(
+        transcript.contains("/sessions/changes-session/changes"),
+        "persisted chat changes link:\n{transcript}"
+    );
+    let live = http_get(port, "/sessions/changes-session/live").await;
+    assert!(
+        live.contains("/sessions/changes-session/changes"),
+        "live chat changes link:\n{live}"
+    );
+
+    let body = http_get(port, "/sessions/changes-session/changes").await;
+    assert!(body.contains("200 OK"), "changes response:\n{body}");
+    assert!(
+        body.to_ascii_lowercase().contains("cache-control: no-store"),
+        "changes snapshots must not be cached:\n{body}"
+    );
+    assert!(body.contains("Refresh now"), "refresh action:\n{body}");
+    assert!(body.contains("Committed changes"), "committed layer:\n{body}");
+    assert!(body.contains("Staged changes"), "staged layer:\n{body}");
+    assert!(body.contains("Unstaged changes"), "unstaged layer:\n{body}");
+    assert!(body.contains("Untracked files"), "untracked layer:\n{body}");
+    assert!(body.contains("rename from README.md"), "rename patch:\n{body}");
+    assert!(body.contains("deleted file mode"), "deleted patch:\n{body}");
+    assert!(body.contains("Binary files"), "binary tracked patch:\n{body}");
+    assert!(body.contains("untracked.txt"), "untracked text list:\n{body}");
+    assert!(body.contains("untracked by omega"), "untracked text patch:\n{body}");
+    assert!(body.contains("untracked.bin"), "untracked binary list:\n{body}");
+    assert!(
+        body.contains("binary file; content was not rendered"),
+        "untracked binary omission:\n{body}"
+    );
+    assert!(
+        body.contains("&lt;img src=x onerror=alert(1)&gt;.txt")
+            && body.contains("&lt;img src=x onerror=alert(2)&gt;"),
+        "hostile-looking Git/session text must be escaped:\n{body}"
+    );
+    assert!(
+        !body.contains("<img src=x onerror=alert(1)")
+            && !body.contains("<img src=x onerror=alert(2)"),
+        "hostile-looking Git/session text became markup:\n{body}"
+    );
+    assert!(
+        body.contains("This snapshot was truncated")
+            && body.contains("Output stopped at 256 KiB"),
+        "large tracked diff must carry a limit notice:\n{body}"
+    );
+    assert!(
+        body.len() < 1_000_000,
+        "bounded page unexpectedly large: {} bytes",
+        body.len()
+    );
+
+    drop(server);
+}
+
+/// Worktree paths in session metadata are untrusted. An otherwise valid
+/// Git checkout outside the configured project store must never become an
+/// arbitrary repo/file reader, while a removed in-store worktree should
+/// degrade to an ordinary explanatory page.
+#[tokio::test]
+async fn session_changes_reject_out_of_store_and_handle_missing_worktrees() {
+    let store = TempDir::new().unwrap();
+    let sessions = TempDir::new().unwrap();
+    let source_root = TempDir::new().unwrap();
+    let source = source_root.path().join("my-project");
+    std::fs::create_dir_all(&source).unwrap();
+    init_source_repo(&source).await;
+
+    let manager = ProjectManager::with_root(store.path());
+    let active = manager
+        .activate(source.to_str().unwrap(), "secure-session", None)
+        .await
+        .unwrap();
+
+    let rogue_root = TempDir::new().unwrap();
+    init_source_repo(rogue_root.path()).await;
+    std::fs::write(rogue_root.path().join("secret.txt"), "must never be rendered").unwrap();
+    let mut rogue = active.clone();
+    rogue.worktree_path = rogue_root.path().canonicalize().unwrap().display().to_string();
+    persist_active_binding(sessions.path(), "outside-session", &rogue);
+
+    let mut missing = active.clone();
+    missing.worktree_path = store
+        .path()
+        .join("worktrees")
+        .join(&active.project.name)
+        .join("removed-session")
+        .display()
+        .to_string();
+    persist_active_binding(sessions.path(), "missing-session", &missing);
+
+    let port = free_port();
+    let server = spawn_server(store.path(), sessions.path(), port).await;
+    wait_for_server(port).await;
+
+    let outside = http_get(port, "/sessions/outside-session/changes").await;
+    assert!(outside.contains("200 OK"), "outside response:\n{outside}");
+    assert!(outside.contains("Changes unavailable"), "outside response:\n{outside}");
+    assert!(
+        outside.contains("outside the configured project store"),
+        "containment reason:\n{outside}"
+    );
+    assert!(
+        !outside.contains("must never be rendered"),
+        "outside file leaked:\n{outside}"
+    );
+
+    let missing = http_get(port, "/sessions/missing-session/changes").await;
+    assert!(missing.contains("200 OK"), "missing response:\n{missing}");
+    assert!(missing.contains("Changes unavailable"), "missing response:\n{missing}");
+    assert!(
+        missing.contains("worktree no longer exists"),
+        "missing worktree reason:\n{missing}"
+    );
 
     drop(server);
 }
@@ -713,56 +958,80 @@ async fn rebase_page_renders_and_controls_persist_state() {
     let server = spawn_server(store.path(), sessions.path(), port).await;
     wait_for_server(port).await;
 
-    // Initial page: no cron-jobbable projects, project listed as addable.
+    // Initial page: every registered project is configurable and has a
+    // first-class per-project manual trigger.
     let body = http_get(port, "/rebase").await;
     assert!(
-        body.contains("Upstream rebase cron"),
+        body.contains("Upstream rebases"),
         "rebase page title:\n{body}"
     );
-    assert!(body.contains("No cron-jobbable projects yet"));
-    assert!(body.contains("Enable</button>"), "addable row:\n{body}");
+    assert!(
+        body.contains("Rebase now</button>"),
+        "manual action:\n{body}"
+    );
+    assert!(
+        body.contains("Conflict-resolution prompt"),
+        "prompt editor:\n{body}"
+    );
 
-    // Enable the project imperatively → state file gets `project: true`.
+    // Configure this soft fork's independent timer and prompt.
     let resp = http_post_form(
         port,
-        "/rebase/toggle",
-        &format!("project={project}&enabled=true"),
+        "/rebase/configure",
+        &format!("project={project}&enabled=true&interval_seconds=90&prompt=Preserve+our+parser"),
     )
     .await;
-    assert!(resp.contains("303 See Other"), "toggle response:\n{resp}");
+    assert!(
+        resp.contains("303 See Other"),
+        "configure response:\n{resp}"
+    );
     let state: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(store.path().join("rebase-job.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(
-        state["project_states"][project.as_str()].as_bool(),
+        state["project_configs"][project.as_str()]["enabled"].as_bool(),
         Some(true),
-        "state file after enable: {state}"
+        "state file after configure: {state}"
+    );
+    assert_eq!(
+        state["project_configs"][project.as_str()]["interval_seconds"].as_u64(),
+        Some(90)
+    );
+    assert_eq!(
+        state["project_configs"][project.as_str()]["prompt"].as_str(),
+        Some("Preserve our parser")
     );
 
-    // The page now lists it as enabled (Disable button).
+    // The page reflects the independently configured cadence.
     let body = http_get(port, "/rebase").await;
-    assert!(body.contains("Disable</button>"), "enabled row:\n{body}");
+    assert!(body.contains("1m30s"), "configured cadence:\n{body}");
+    assert!(
+        body.contains("Preserve our parser"),
+        "configured prompt:\n{body}"
+    );
 
-    // Set the interval; the state file records the override.
-    let resp = http_post_form(port, "/rebase/interval", "interval_seconds=90").await;
-    assert!(resp.contains("303 See Other"));
+    // Per-project "Rebase now" is a durable queue record, not a lossy
+    // cross-process marker.
+    let resp = http_post_form(port, "/rebase/run", &format!("project={project}")).await;
+    assert!(resp.contains("303 See Other"), "run now response:\n{resp}");
     let state: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(store.path().join("rebase-job.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(state["interval_seconds"].as_u64(), Some(90));
-
-    // "Run now" drops the marker file the daemon polls.
-    let resp = http_post_form(port, "/rebase/run", "").await;
-    assert!(resp.contains("303 See Other"), "run now response:\n{resp}");
-    assert!(
-        store.path().join("rebase-now").is_file(),
-        "run-now marker should exist"
+    assert!(state["project_runs"][project.as_str()]["pending_since"].is_string());
+    assert_eq!(
+        state["project_runs"][project.as_str()]["result"]["status"].as_str(),
+        Some("queued")
     );
+    let body = http_get(port, &format!("/{project}/")).await;
+    assert!(
+        body.contains("Rebase now</button>"),
+        "summary action:\n{body}"
+    );
+    assert!(body.contains("queued"), "summary queue status:\n{body}");
 
-    // Disabling again persists `project: false` (which wins over any NixOS
-    // defaults list).
+    // The compatibility toggle also updates the canonical per-project state.
     let resp = http_post_form(
         port,
         "/rebase/toggle",
@@ -775,7 +1044,7 @@ async fn rebase_page_renders_and_controls_persist_state() {
     )
     .unwrap();
     assert_eq!(
-        state["project_states"][project.as_str()].as_bool(),
+        state["project_configs"][project.as_str()]["enabled"].as_bool(),
         Some(false),
         "state file after disable: {state}"
     );
@@ -871,7 +1140,10 @@ async fn create_project_merge_worktree_into_main_and_delete() {
 
     // The refs page shows a "Merge into main" action for the worktree.
     let body = http_get(port, "/my-fork/refs").await;
-    assert!(body.contains("Merge into main"), "refs merge action:\n{body}");
+    assert!(
+        body.contains("Merge into main"),
+        "refs merge action:\n{body}"
+    );
 
     // Merge the session branch into main via the web action.
     let encoded_branch = active.branch.replace('/', "%2F");
@@ -903,7 +1175,10 @@ async fn create_project_merge_worktree_into_main_and_delete() {
     assert!(resp.contains("303 See Other"), "delete response:\n{resp}");
     let body = http_get(port, "/my-fork/").await;
     assert!(body.contains("404 Not Found"), "after delete:\n{body}");
-    assert!(!manager.repo_dir("my-fork").exists(), "bare clone should be gone");
+    assert!(
+        !manager.repo_dir("my-fork").exists(),
+        "bare clone should be gone"
+    );
 
     drop(server);
 }
@@ -917,9 +1192,7 @@ async fn create_project_merge_worktree_into_main_and_delete() {
 async fn http_get_stream_head(port: u16, path: &str) -> String {
     use tokio::io::AsyncReadExt;
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
     // Accumulate until we see the first SSE data frame (the body arrives in
     // later TCP segments, after the chunked headers).
@@ -969,14 +1242,33 @@ async fn spawn_mock_daemon(socket: &Path) {
                         .unwrap_or("mock");
                     let mut out = String::new();
                     match ty {
-                        "activate_project" => {
+                        "list_models" => {
+                            out = "{\"type\":\"ModelList\",\"models\":[\"model-a\",\"model-b\"]}\n"
+                                .to_string();
+                        }
+                        "set_model" => {
+                            let model = v
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("model-a");
                             out = format!(
-                                "{{\"type\":\"ProjectActive\",\"project\":{{\"name\":\"mock-proj\",\"url\":\"x\",\"created_at\":\"2025-01-01T00:00:00Z\"}},\"worktree_path\":\"/tmp/mock/wt\",\"branch\":\"omega/web-abc123\"}}\n"
+                                "{{\"type\":\"ModelChanged\",\"session_id\":\"{sid}\",\"model\":\"{model}\"}}\n"
                             );
+                        }
+                        "compact" => {
+                            out = format!(
+                                "{{\"type\":\"SessionCompacted\",\"session_id\":\"{sid}\"}}\n"
+                            );
+                        }
+                        "activate_project" => {
+                            out = "{\"type\":\"ProjectActive\",\"project\":{\"name\":\"mock-proj\",\"url\":\"x\",\"created_at\":\"2025-01-01T00:00:00Z\"},\"worktree_path\":\"/tmp/mock/wt\",\"branch\":\"omega/web-abc123\"}\n".to_string();
                         }
                         "resume_session" => {
                             out = format!(
                                 "{{\"type\":\"SessionResumed\",\"session_id\":\"{sid}\",\"session_name\":\"{sid}\"}}\n"
+                            );
+                            out += &format!(
+                                "{{\"type\":\"ModelChanged\",\"session_id\":\"{sid}\",\"model\":\"model-a\"}}\n"
                             );
                             out += &format!(
                                 "{{\"type\":\"HistoryMessage\",\"session_id\":\"{sid}\",\"role\":\"user\",\"content\":\"hello\"}}\n"
@@ -1012,10 +1304,8 @@ async fn spawn_mock_daemon(socket: &Path) {
                         }
                         _ => {}
                     }
-                    if !out.is_empty() {
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
-                        }
+                    if !out.is_empty() && writer.write_all(out.as_bytes()).await.is_err() {
+                        break;
                     }
                 }
             });
@@ -1035,7 +1325,13 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
 
     // Seed a registered project + a session on disk so the live page renders.
     let (project, worktree_branch) = seed_store(store.path()).await;
-    seed_session(sessions.path(), "web-chat-1", &worktree_branch, "Chat session").await;
+    seed_session(
+        sessions.path(),
+        "web-chat-1",
+        &worktree_branch,
+        "Chat session",
+    )
+    .await;
 
     let port = free_port();
     let server = Command::new(env!("CARGO_BIN_EXE_omega-git-host"))
@@ -1064,7 +1360,7 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
     let location = resp
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("location:"))
-        .map(|l| l.splitn(2, ':').nth(1).unwrap().trim().to_string())
+        .map(|l| l.split_once(':').unwrap().1.trim().to_string())
         .expect("redirect location");
     assert!(
         location.starts_with("/sessions/web-"),
@@ -1079,7 +1375,7 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
     assert!(body.contains("Send a message"), "live page:\n{body}");
     assert!(body.contains("Interrupt"), "live page:\n{body}");
     assert!(
-        body.contains("/sessions/web-chat-1/stream"),
+        body.contains("data-stream-url=\"&#x2f;sessions&#x2f;web-chat-1&#x2f;stream\""),
         "live page streams:\n{body}"
     );
     assert!(
@@ -1090,11 +1386,34 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
         body.contains("id=\"live-conversation\""),
         "live page has the shared conversation container:\n{body}"
     );
+    assert!(
+        body.contains("data-session-id=\"web-chat-1\""),
+        "live SSE events are bound to the exact session:\n{body}"
+    );
+    assert!(body.contains("session-model-select"), "model control:\n{body}");
+    assert!(body.contains("Compact session"), "compact control:\n{body}");
     // The persisted transcript is server-rendered *inside* the live
     // container too (one code path for past and future messages)…
     assert!(
         body.contains("please add a feature"),
         "live page renders the persisted transcript:\n{body}"
+    );
+
+    let model_change = http_post_form(
+        port,
+        "/sessions/web-chat-1/model",
+        "model=model-b",
+    )
+    .await;
+    assert!(
+        model_change.contains("303 See Other")
+            && model_change.contains("Model%20changed%20to%20model-b"),
+        "model change confirmation redirect:\n{model_change}"
+    );
+    let compact = http_post_form(port, "/sessions/web-chat-1/compact", "").await;
+    assert!(
+        compact.contains("303 See Other") && compact.contains("Session%20compacted"),
+        "compaction confirmation redirect:\n{compact}"
     );
 
     // The SSE stream opens: 200, event-stream, and the mock daemon's turn
@@ -1126,10 +1445,7 @@ async fn web_chat_start_session_stream_message_and_interrupt() {
         head.contains("\"type\":\"tool_end\"") && head.contains("\"preview\":\"file1 file2\""),
         "tool end frame with server-computed preview:\n{head}"
     );
-    assert!(
-        head.contains("\"type\":\"done\""),
-        "done frame:\n{head}"
-    );
+    assert!(head.contains("\"type\":\"done\""), "done frame:\n{head}");
 
     // Send a chat message → the web forwards run to the daemon and redirects.
     let resp = http_post_form(

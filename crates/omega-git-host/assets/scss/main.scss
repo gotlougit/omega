@@ -4,8 +4,40 @@
 @import "git-sr-ht";
 
 // ---------------------------------------------------------------------------
-// omega-git-host additions: session transcript
+// omega-git-host additions: session transcript + live worktree changes
 // ---------------------------------------------------------------------------
+.changes-actions {
+  white-space: nowrap;
+
+  .btn {
+    margin: 0 0 0.25rem 0.25rem;
+  }
+}
+
+.changes-metadata code {
+  overflow-wrap: anywhere;
+}
+
+.change-section {
+  border-top: 1px solid $gray-300;
+  margin-top: 2rem;
+  padding-top: 1rem;
+
+  .event.diff pre {
+    max-height: 48rem;
+    overflow: auto;
+  }
+}
+
+.change-file-header {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.untracked-list .event {
+  overflow-wrap: anywhere;
+}
+
 .session-message {
   border-left: 0.25rem solid #ddd;
   padding: 0.5rem 1rem;
@@ -145,6 +177,10 @@
 }
 
 @media (prefers-color-scheme: dark) {
+  .change-section {
+    border-top-color: #343a40;
+  }
+
   .session-message {
     border-left-color: #343a40;
 

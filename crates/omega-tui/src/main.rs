@@ -16,8 +16,8 @@ use cli::{BlockId, Color, Event, Span, Style, StyledBlock, StyledText, Term, Ter
 use crossterm::event::KeyCode;
 use omega_core::core::SessionInfo;
 use omega_loop_client::{
-    connect, ActiveProject, DaemonReader, DaemonWriter, OutputChunk, ProjectInfo, ServerEvent,
-    SessionConfig,
+    connect, tool_result_text, ActiveProject, DaemonReader, DaemonWriter, OutputChunk, ProjectInfo,
+    ServerEvent, SessionConfig,
 };
 
 mod markdown;
@@ -333,12 +333,9 @@ fn handle_picker_key(
     cmd_tx: &Sender<DaemonCmd>,
     key: KeyCode,
 ) {
-    match key {
-        KeyCode::Enter => {
-            picker_select(app, handle, cmd_tx);
-            return;
-        }
-        _ => {}
+    if key == KeyCode::Enter {
+        picker_select(app, handle, cmd_tx);
+        return;
     }
     let Some(picker) = app.picker.as_mut() else {
         return;
@@ -658,7 +655,7 @@ fn turn_separator() -> StyledBlock {
 /// Refresh the persistent cache-bar status line after any change.
 fn refresh_cache_status(handle: &TermHandle, app: &AppState) {
     let (w, _) = handle.size();
-    handle.set_status_line(app.cache.to_status_block(w.max(40)));
+    handle.set_status_line(app.cache.render_status_block(w.max(40)));
 }
 
 fn handle_daemon_event(
@@ -678,6 +675,9 @@ fn handle_daemon_event(
             if session_id != app.session_id {
                 return;
             }
+            let Some(chunk) = chunk.into_known() else {
+                return;
+            };
             match chunk {
             OutputChunk::TextDelta(s) => {
                 if s.is_empty() {
@@ -846,7 +846,8 @@ fn handle_daemon_event(
                     }
                 }
                 // For Transfer tool, save the file content to the user's PWD
-                if name == "Transfer" && !result.is_error && !result.text.is_empty() {
+                let result_text = tool_result_text(&result);
+                if name == "Transfer" && !result.is_error && !result_text.is_empty() {
                     let file_path = input
                         .get("file_path")
                         .and_then(|v| v.as_str())
@@ -861,7 +862,7 @@ fn handle_daemon_event(
                         .unwrap_or(0);
                     let out_name = format!("{}-{}", basename, timestamp);
 
-                    match std::fs::write(&out_name, &result.text) {
+                    match std::fs::write(&out_name, &result_text) {
                         Ok(()) => {
                             let cwd = std::env::current_dir().unwrap_or_default();
                             let full_path = cwd.join(&out_name);
@@ -878,17 +879,17 @@ fn handle_daemon_event(
                         }
                     }
                 } else if result.is_error {
-                    let text = if result.text.trim().is_empty() {
+                    let text = if result_text.trim().is_empty() {
                         "failed".to_string()
                     } else {
-                        result.text.clone()
+                        result_text.clone()
                     };
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                         format!("  ✗ {name} {text}"),
                         s_error(),
                     ))));
-                } else if !result.text.is_empty() {
-                    let preview = cli::truncate_to_width(&result.text, 80);
+                } else if !result_text.is_empty() {
+                    let preview = cli::truncate_to_width(&result_text, 80);
                     handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                         format!("  ✓ {name} {preview}"),
                         s_tool_ok(),
@@ -900,17 +901,6 @@ fn handle_daemon_event(
                         s_tool_ok(),
                     ))));
                 }
-            }
-            OutputChunk::PermissionRequest {
-                tool_name,
-                action,
-                input,
-                ..
-            } => {
-                handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                    format!("🔐 {tool_name} wants to {action} — {input}"),
-                    s_tool(),
-                ))));
             }
             OutputChunk::Status(s) => {
                 handle.print_output(StyledBlock::new(StyledText::from(Span::new(s, s_system()))));
@@ -944,12 +934,12 @@ fn handle_daemon_event(
                 }
                 streaming.reset();
             }
-            OutputChunk::CacheTelemetry {
+            OutputChunk::CacheTelemetry(omega_core::core::CacheTelemetry {
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
-            } => {
+            }) => {
                 app.cache.update(
                     input_tokens,
                     output_tokens,
@@ -958,7 +948,10 @@ fn handle_daemon_event(
                 );
                 refresh_cache_status(handle, app);
             }
-            OutputChunk::Unknown => {}
+            OutputChunk::SubAgentSpawned { .. }
+            | OutputChunk::SubAgentOutput { .. }
+            | OutputChunk::SubAgentComplete { .. }
+            | OutputChunk::StateChange(_) => {}
             }
         },
         ServerEvent::Created {
@@ -1076,7 +1069,10 @@ fn handle_daemon_event(
                 _ => {}
             }
         }
-        ServerEvent::ModelChanged { model } => {
+        ServerEvent::ModelChanged { session_id, model } => {
+            if !session_id.is_empty() && session_id != app.session_id {
+                return;
+            }
             app.model = Some(model.clone());
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
                 format!("Model changed: {model}"),
@@ -1115,13 +1111,13 @@ fn handle_daemon_event(
                 handle.print_output(StyledBlock::new(st));
             }
         }
-        ServerEvent::SystemMsg(msg) => {
+        ServerEvent::SystemMsg { message } => {
             handle.print_output(StyledBlock::new(StyledText::from(Span::new(
-                msg,
+                message,
                 s_system(),
             ))));
         }
-        ServerEvent::Unknown(_) => {}
+        ServerEvent::Unknown => {}
     }
 }
 
@@ -1177,7 +1173,7 @@ impl CacheStats {
     }
 
     /// Render a compact one-line status summary matching pi-agent's format.
-    fn to_status_block(&self, terminal_width: usize) -> StyledBlock {
+    fn render_status_block(&self, terminal_width: usize) -> StyledBlock {
         if self.request_count == 0 {
             return StyledBlock::new(StyledText::from(Span::new(
                 " cache: \u{2014}",
@@ -1675,7 +1671,7 @@ fn run_loop(
                 // telemetry has actually arrived.
                 if app.cache.request_count > 0 {
                     let w = width.max(1) as usize;
-                    handle.set_status_line(app.cache.to_status_block(w.max(40)));
+                    handle.set_status_line(app.cache.render_status_block(w.max(40)));
                 }
             }
         }
@@ -1743,7 +1739,9 @@ fn main() -> Result<()> {
                     Err(e) => {
                         tracing::error!(target: "omega_tui::daemon", error = %e, "failed to connect");
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(
-                            ServerEvent::SystemMsg(format!("Failed to connect to omega-loop: {e}")),
+                            ServerEvent::SystemMsg {
+                                message: format!("Failed to connect to omega-loop: {e}"),
+                            },
                         )));
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Disconnected));
                         return;
@@ -1828,7 +1826,8 @@ mod tests {
     use cli::emulator::{Capture, Emulator};
     use cli::{BlockId, RawEvent};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use omega_loop_client::{OutputChunk, ServerEvent, ToolResultWire};
+    use omega_core::core::{CacheTelemetry, ToolResult, ToolResultData};
+    use omega_loop_client::{OutputChunk, ServerEvent, WireChunk};
     use std::sync::{Arc, Mutex};
 
     const ROWS: usize = 12;
@@ -1913,7 +1912,14 @@ mod tests {
     fn chunk(c: OutputChunk) -> ServerEvent {
         ServerEvent::Chunk {
             session_id: "sess-1".to_string(),
-            chunk: c,
+            chunk: WireChunk::Known(c),
+        }
+    }
+
+    fn tool_result(text: impl Into<String>, is_error: bool) -> ToolResult {
+        ToolResult {
+            content: ToolResultData::Text(text.into()),
+            is_error,
         }
     }
 
@@ -2159,11 +2165,7 @@ mod tests {
                 id: "t1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "src/main.rs"}),
-                result: ToolResultWire {
-                    text: "boom".into(),
-                    is_error: true,
-                    content: None,
-                },
+                result: tool_result("boom", true),
             }),
         );
         fx.handle.redraw_sync();
@@ -2209,12 +2211,31 @@ mod tests {
             &mut fx.app,
             &mut fx.streaming,
             ServerEvent::ModelChanged {
+                session_id: String::new(),
                 model: "gpt-b".into(),
             },
         );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.model, Some("gpt-b".to_string()));
         assert_eq!(count_rows_containing(&fx, "Model changed: gpt-b"), 1);
+    }
+
+    #[test]
+    fn model_changed_for_other_session_is_ignored() {
+        let mut fx = fixture();
+        fx.app.model = Some("gpt-a".to_string());
+        handle_daemon_event(
+            &fx.handle,
+            &mut fx.app,
+            &mut fx.streaming,
+            ServerEvent::ModelChanged {
+                session_id: "some-other-session".to_string(),
+                model: "gpt-b".to_string(),
+            },
+        );
+        fx.handle.redraw_sync();
+        assert_eq!(fx.app.model, Some("gpt-a".to_string()));
+        assert_eq!(count_rows_containing(&fx, "Model changed"), 0);
     }
 
     #[test]
@@ -2742,11 +2763,7 @@ mod tests {
                 id: "t2".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "ls"}),
-                result: ToolResultWire {
-                    text: "done".into(),
-                    is_error: false,
-                    content: None,
-                },
+                result: tool_result("done", false),
             }),
         );
         fx.handle.redraw_sync();
@@ -2952,7 +2969,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "sess-1".into(),
-                chunk: OutputChunk::TextDelta("old-session".into()),
+                chunk: WireChunk::Known(OutputChunk::TextDelta("old-session".into())),
             },
         );
         assert!(fx.streaming.block_id.is_some());
@@ -2968,7 +2985,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "sess-1".into(),
-                chunk: OutputChunk::TextDelta("stale".into()),
+                chunk: WireChunk::Known(OutputChunk::TextDelta("stale".into())),
             },
         );
         handle_daemon_event(
@@ -2977,7 +2994,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "sess-1".into(),
-                chunk: OutputChunk::Done,
+                chunk: WireChunk::Known(OutputChunk::Done),
             },
         );
         fx.handle.redraw_sync();
@@ -2994,7 +3011,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "fresh".into(),
-                chunk: OutputChunk::TextDelta("fresh output".into()),
+                chunk: WireChunk::Known(OutputChunk::TextDelta("fresh output".into())),
             },
         );
         handle_daemon_event(
@@ -3003,7 +3020,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "fresh".into(),
-                chunk: OutputChunk::Done,
+                chunk: WireChunk::Known(OutputChunk::Done),
             },
         );
         fx.handle.redraw_sync();
@@ -3024,7 +3041,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "some-other-session".into(),
-                chunk: OutputChunk::TextDelta("intruder".into()),
+                chunk: WireChunk::Known(OutputChunk::TextDelta("intruder".into())),
             },
         );
         fx.handle.redraw_sync();
@@ -3209,7 +3226,11 @@ mod tests {
                 KeyModifiers::NONE,
             )))
             .unwrap();
-        let _ = fx.term.next_event();
+        // Ignore unrelated queued render events and wait for the Home key's
+        // cursor update. A single blind `next_event` made this test racy.
+        while fx.handle.get_cursor() != 0 {
+            fx.term.next_event().expect("terminal event channel open");
+        }
         assert_eq!(fx.handle.get_cursor(), 0);
         fx.input
             .send(RawEvent::Key(KeyEvent::new(
@@ -3224,7 +3245,7 @@ mod tests {
     /// Home on empty buffer stays at 0, End on empty buffer stays at 0.
     #[test]
     fn home_and_end_on_empty_buffer() {
-        let mut fx = fixture();
+        let fx = fixture();
         assert_eq!(fx.handle.get_buffer(), "");
         assert_eq!(fx.handle.get_cursor(), 0);
         // Home on empty buffer — stays at 0, no event
@@ -3855,12 +3876,9 @@ mod tests {
                     "Message starting with '/' should be sent as input, not treated as a command"
                 );
             }
-            other => {
-                assert!(
-                    false,
-                    "BUG: '/home/user/file.txt' was treated as a slash command, got {other:?}"
-                );
-            }
+            other => panic!(
+                "BUG: '/home/user/file.txt' was treated as a slash command, got {other:?}"
+            ),
         }
     }
 
@@ -4015,11 +4033,7 @@ mod tests {
                 id: "t1".into(),
                 name: "run".into(),
                 input: serde_json::json!({"command": "true"}),
-                result: omega_loop_client::ToolResultWire {
-                    text: String::new(),
-                    is_error: false,
-                    content: None,
-                },
+                result: tool_result("", false),
             }),
         );
         fx.handle.redraw_sync();
@@ -4283,13 +4297,13 @@ mod tests {
     }
 
     // =========================================================================
-    // Prompt caching bar — to_status_block formatting
+    // Prompt caching bar — render_status_block formatting
     // =========================================================================
 
     #[test]
     fn cache_bar_shows_no_requests_when_empty() {
         let cs = CacheStats::default();
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         let text: String = block
             .content
             .spans()
@@ -4306,7 +4320,7 @@ mod tests {
     fn cache_bar_shows_percentage_after_update() {
         let mut cs = CacheStats::default();
         cs.update(1000, 500, 500, 100);
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         let text: String = block
             .content
             .spans()
@@ -4324,7 +4338,7 @@ mod tests {
     fn cache_bar_displays_perfect_hit_rate() {
         let mut cs = CacheStats::default();
         cs.update(1000, 500, 1000, 0);
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         let text: String = block
             .content
             .spans()
@@ -4339,7 +4353,7 @@ mod tests {
     fn cache_bar_displays_zero_hit_rate() {
         let mut cs = CacheStats::default();
         cs.update(1000, 500, 0, 1000);
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         let text: String = block
             .content
             .spans()
@@ -4355,7 +4369,7 @@ mod tests {
         // With the new format there is no bar, so just ensure no panic.
         let mut cs = CacheStats::default();
         cs.update(100, 50, 200, 0); // more read than input \u{2014} shouldn't happen
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         let text: String = block
             .content
             .spans()
@@ -4371,7 +4385,7 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(1000, 500, 500, 100);
 
-        let block_narrow = cs.to_status_block(50);
+        let block_narrow = cs.render_status_block(50);
         let text_n: String = block_narrow
             .content
             .spans()
@@ -4379,7 +4393,7 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
 
-        let block_wide = cs.to_status_block(120);
+        let block_wide = cs.render_status_block(120);
         let text_w: String = block_wide
             .content
             .spans()
@@ -4394,7 +4408,7 @@ mod tests {
     fn cache_bar_shows_arrows_and_labels() {
         let mut cs = CacheStats::default();
         cs.update(100, 50, 30, 10);
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         let text: String = block
             .content
             .spans()
@@ -4414,7 +4428,7 @@ mod tests {
         // The status block always uses s_cache_hit() (green) even at 0% hit rate.
         let mut cs = CacheStats::default();
         cs.update(100, 50, 0, 100);
-        let block = cs.to_status_block(80);
+        let block = cs.render_status_block(80);
         // The top-level style of the block comes from the Span's style.
         let span = &block.content.spans()[0];
         // s_cache_hit() returns green, s_cache_miss() returns dark grey.
@@ -4431,7 +4445,7 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(1000, 500, 500, 100);
 
-        let block_50 = cs.to_status_block(50);
+        let block_50 = cs.render_status_block(50);
         let text_50: String = block_50
             .content
             .spans()
@@ -4439,7 +4453,7 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
 
-        let block_120 = cs.to_status_block(120);
+        let block_120 = cs.render_status_block(120);
         let text_120: String = block_120
             .content
             .spans()
@@ -4455,7 +4469,7 @@ mod tests {
         let mut cs = CacheStats::default();
         cs.update(100, 50, 50, 10);
         // terminal_width = 40 should not cause a panic or empty bar
-        let block = cs.to_status_block(40);
+        let block = cs.render_status_block(40);
         let text: String = block
             .content
             .spans()
@@ -4476,11 +4490,13 @@ mod tests {
         // If total_input_tokens is 0 but cache_read_tokens > 0 (shouldn't happen),
         // hit_rate_pct returns 0.0 (due to early return), so the bar shows 0.0%.
         // This is arguably wrong — it should be undefined/N/A.
-        let mut cs = CacheStats::default();
         // Manually set the fields to simulate the impossible state
-        cs.total_cache_read_tokens = 50;
-        cs.total_input_tokens = 0;
-        cs.request_count = 1;
+        let cs = CacheStats {
+            total_cache_read_tokens: 50,
+            total_input_tokens: 0,
+            request_count: 1,
+            ..Default::default()
+        };
         // hit_rate_pct early-returns 0.0 when total_input_tokens == 0
         // but that hides the fact that cache_read > 0 with zero input
         let pct = cs.hit_rate_pct();
@@ -4501,12 +4517,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 100,
                 output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }),
+            })),
         );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "cache:"), 1);
@@ -4521,23 +4537,23 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 100,
                 output_tokens: 50,
                 cache_read_tokens: 80,
                 cache_creation_tokens: 10,
-            }),
+            })),
         );
         handle_daemon_event(
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 200,
                 output_tokens: 100,
                 cache_read_tokens: 100,
                 cache_creation_tokens: 50,
-            }),
+            })),
         );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.cache.request_count, 2);
@@ -4552,12 +4568,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 100,
                 output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }),
+            })),
         );
         fx.handle.redraw_sync();
         assert!(transcript_contains(&fx, "cache:"));
@@ -4578,12 +4594,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 100,
                 output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }),
+            })),
         );
         fx.handle.redraw_sync();
         assert!(transcript_contains(&fx, "cache:"));
@@ -4613,12 +4629,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 200,
                 output_tokens: 100,
                 cache_read_tokens: 100,
                 cache_creation_tokens: 50,
-            }),
+            })),
         );
         // More streaming text
         handle_daemon_event(
@@ -4656,7 +4672,7 @@ mod tests {
         fx.app.cache.update(100, 50, 50, 10);
         let (w, _) = fx.handle.size();
         fx.handle
-            .set_status_line(fx.app.cache.to_status_block(w.max(40)));
+            .set_status_line(fx.app.cache.render_status_block(w.max(40)));
         fx.handle.redraw_sync();
         // Simulate disconnect
         let driver = {
@@ -4692,12 +4708,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 1000,
                 output_tokens: 500,
                 cache_read_tokens: 800,
                 cache_creation_tokens: 200,
-            }),
+            })),
         );
         fx.handle.redraw_sync();
         assert_eq!(fx.app.cache.request_count, 1);
@@ -4738,12 +4754,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 50,
                 output_tokens: 25,
                 cache_read_tokens: 10,
                 cache_creation_tokens: 5,
-            }),
+            })),
         );
         handle_daemon_event(
             &fx.handle,
@@ -4753,11 +4769,7 @@ mod tests {
                 id: "t1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({"command": "echo hello"}),
-                result: ToolResultWire {
-                    text: "done".into(),
-                    is_error: false,
-                    content: None,
-                },
+                result: tool_result("done", false),
             }),
         );
         fx.handle.redraw_sync();
@@ -4780,21 +4792,21 @@ mod tests {
             let app_tx = fx.app_tx.clone();
             std::thread::spawn(move || {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::CacheTelemetry {
+                    OutputChunk::CacheTelemetry(CacheTelemetry {
                         input_tokens: 100,
                         output_tokens: 50,
                         cache_read_tokens: 50,
                         cache_creation_tokens: 10,
-                    },
+                    }),
                 ))));
                 std::thread::sleep(Duration::from_millis(10));
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::CacheTelemetry {
+                    OutputChunk::CacheTelemetry(CacheTelemetry {
                         input_tokens: 200,
                         output_tokens: 100,
                         cache_read_tokens: 100,
                         cache_creation_tokens: 20,
-                    },
+                    }),
                 ))));
                 std::thread::sleep(Duration::from_millis(20));
                 let _ = app_tx.send(AppEvent::Term(Event::Eof));
@@ -5349,7 +5361,7 @@ mod tests {
     /// Ctrl+Right on empty buffer is a no-op.
     #[test]
     fn ctrl_right_on_empty_buffer() {
-        let mut fx = fixture();
+        let fx = fixture();
         assert_eq!(fx.handle.get_cursor(), 0);
         fx.input
             .send(RawEvent::Key(KeyEvent::new(
@@ -5467,7 +5479,7 @@ mod tests {
     /// Ctrl+Left on empty buffer is a no-op.
     #[test]
     fn ctrl_left_on_empty_buffer() {
-        let mut fx = fixture();
+        let fx = fixture();
         assert_eq!(fx.handle.get_cursor(), 0);
         fx.input
             .send(RawEvent::Key(KeyEvent::new(
@@ -5716,12 +5728,12 @@ mod tests {
             let app_tx = fx.app_tx.clone();
             std::thread::spawn(move || {
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::CacheTelemetry {
+                    OutputChunk::CacheTelemetry(CacheTelemetry {
                         input_tokens: 1000,
                         output_tokens: 500,
                         cache_read_tokens: 500,
                         cache_creation_tokens: 100,
-                    },
+                    }),
                 ))));
                 std::thread::sleep(Duration::from_millis(30));
                 let _ = app_tx.send(AppEvent::Term(Event::Resize {
@@ -6015,7 +6027,7 @@ mod tests {
         );
         // The cursor (from terminal emulator) must be on the prompt row,
         // not on the status line row.
-        let (cursor_row, cursor_col) = em.cursor();
+        let (cursor_row, _cursor_col) = em.cursor();
         assert_eq!(
             cursor_row,
             prompt_row.unwrap(),
@@ -6026,6 +6038,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn resize_with_cache_bar_does_not_duplicate_status_line() {
         let mut fx = loop_fixture();
         // Pre-populate cache stats
@@ -6033,7 +6046,7 @@ mod tests {
         {
             let (w, _) = fx.handle.size();
             fx.handle
-                .set_status_line(fx.app.cache.to_status_block(w.max(40)));
+                .set_status_line(fx.app.cache.render_status_block(w.max(40)));
         }
         fx.handle.redraw_sync();
 
@@ -6154,7 +6167,7 @@ mod tests {
 
     #[test]
     fn paste_long_text_handled_correctly() {
-        let mut fx = fixture();
+        let fx = fixture();
         // Simulate paste (newlines in paste are silently dropped)
         fx.input
             .send(RawEvent::Paste("line1\nline2\nline3".to_string()))
@@ -6184,12 +6197,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            chunk(OutputChunk::CacheTelemetry {
+            chunk(OutputChunk::CacheTelemetry(CacheTelemetry {
                 input_tokens: 100,
                 output_tokens: 50,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 10,
-            }),
+            })),
         );
         handle_daemon_event(
             &fx.handle,
@@ -6270,7 +6283,7 @@ mod tests {
         {
             let (w, _) = fx.handle.size();
             fx.handle
-                .set_status_line(fx.app.cache.to_status_block(w.max(40)));
+                .set_status_line(fx.app.cache.render_status_block(w.max(40)));
         }
         // Status ping should include cache info
         let driver = {
@@ -6319,12 +6332,12 @@ mod tests {
                         OutputChunk::TextDelta(format!("chunk{i} ")),
                     ))));
                     let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                        OutputChunk::CacheTelemetry {
+                        OutputChunk::CacheTelemetry(CacheTelemetry {
                             input_tokens: 100 + i,
                             output_tokens: 100 + i,
                             cache_read_tokens: 50 + i / 2,
                             cache_creation_tokens: 10,
-                        },
+                        }),
                     ))));
                 }
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(OutputChunk::Done))));
@@ -7931,11 +7944,7 @@ mod tests {
                 id: "t1".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "make"}),
-                result: ToolResultWire {
-                    text: "done".into(),
-                    is_error: false,
-                    content: None,
-                },
+                result: tool_result("done", false),
             }),
         );
         fx.handle.redraw_sync();
@@ -8148,7 +8157,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "other-session".into(),
-                chunk: OutputChunk::TextDelta(" post".into()),
+                chunk: WireChunk::Known(OutputChunk::TextDelta(" post".into())),
             },
         );
         handle_daemon_event(
@@ -8157,7 +8166,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "other-session".into(),
-                chunk: OutputChunk::Done,
+                chunk: WireChunk::Known(OutputChunk::Done),
             },
         );
         fx.handle.redraw_sync();
@@ -8348,11 +8357,7 @@ mod tests {
                 id: "t1".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "ls"}),
-                result: ToolResultWire {
-                    text: "done".into(),
-                    is_error: false,
-                    content: None,
-                },
+                result: tool_result("done", false),
             }),
         );
         handle_daemon_event(
@@ -8426,6 +8431,7 @@ mod tests {
             &mut fx.app,
             &mut fx.streaming,
             ServerEvent::ModelChanged {
+                session_id: String::new(),
                 model: "gpt-b".into(),
             },
         );
@@ -8590,29 +8596,12 @@ mod tests {
             &fx.handle,
             &mut fx.app,
             &mut fx.streaming,
-            ServerEvent::SystemMsg("daemon says hi".into()),
+            ServerEvent::SystemMsg {
+                message: "daemon says hi".into(),
+            },
         );
         fx.handle.redraw_sync();
         assert_eq!(count_rows_containing(&fx, "daemon says hi"), 1);
-    }
-
-    /// PermissionRequest renders a prompt line.
-    #[test]
-    fn permission_request_renders() {
-        let mut fx = fixture();
-        handle_daemon_event(
-            &fx.handle,
-            &mut fx.app,
-            &mut fx.streaming,
-            chunk(OutputChunk::PermissionRequest {
-                tool_name: "Bash".into(),
-                action: "run".into(),
-                input: "ls".into(),
-                details: None,
-            }),
-        );
-        fx.handle.redraw_sync();
-        assert!(transcript_contains(&fx, "Bash wants to run"));
     }
 
     // --- unit-level edge cases -------------------------------------------
@@ -9113,13 +9102,15 @@ mod tests {
     /// rendered as a fixed block and overflowing it corrupts the layout.
     #[test]
     fn cache_bar_fits_narrow_width() {
-        let mut cs = CacheStats::default();
         // Pathological but representable totals (1e12 tokens).
-        cs.total_input_tokens = 1_000_000_000_000;
-        cs.total_output_tokens = 1_000_000_000_000;
-        cs.total_cache_read_tokens = 1_000_000_000_000;
-        cs.request_count = 1;
-        let block = cs.to_status_block(40);
+        let cs = CacheStats {
+            total_input_tokens: 1_000_000_000_000,
+            total_output_tokens: 1_000_000_000_000,
+            total_cache_read_tokens: 1_000_000_000_000,
+            request_count: 1,
+            ..Default::default()
+        };
+        let block = cs.render_status_block(40);
         let text: String = block
             .content
             .spans()
@@ -9241,11 +9232,7 @@ mod tests {
                 id: "t1".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "ls"}),
-                result: ToolResultWire {
-                    text: "done".into(),
-                    is_error: false,
-                    content: None,
-                },
+                result: tool_result("done", false),
             }),
         );
         fx.handle.redraw_sync();
@@ -9273,12 +9260,12 @@ mod tests {
                     OutputChunk::TextDelta("streamed ".into()),
                 ))));
                 let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                    OutputChunk::CacheTelemetry {
+                    OutputChunk::CacheTelemetry(CacheTelemetry {
                         input_tokens: 100,
                         output_tokens: 50,
                         cache_read_tokens: 50,
                         cache_creation_tokens: 10,
-                    },
+                    }),
                 ))));
                 std::thread::sleep(Duration::from_millis(20));
                 let _ = app_tx.send(AppEvent::Term(Event::Escape));
@@ -9330,12 +9317,12 @@ mod tests {
                         OutputChunk::TextDelta(format!("chunk {i} ")),
                     ))));
                     let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
-                        OutputChunk::CacheTelemetry {
+                        OutputChunk::CacheTelemetry(CacheTelemetry {
                             input_tokens: 10 + i,
                             output_tokens: 5 + i,
                             cache_read_tokens: 3 + i,
                             cache_creation_tokens: 1,
-                        },
+                        }),
                     ))));
                     if i == 3 {
                         let _ = app_tx.send(AppEvent::Daemon(DaemonEv::Event(chunk(
@@ -9419,11 +9406,7 @@ mod tests {
                 id: "t1".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "false"}),
-                result: ToolResultWire {
-                    text: String::new(),
-                    is_error: true,
-                    content: None,
-                },
+                result: tool_result("", true),
             }),
         );
         fx.handle.redraw_sync();
@@ -9613,7 +9596,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "sess-target".into(),
-                chunk: OutputChunk::TextDelta("resumed stream".into()),
+                chunk: WireChunk::Known(OutputChunk::TextDelta("resumed stream".into())),
             },
         );
         handle_daemon_event(
@@ -9622,7 +9605,7 @@ mod tests {
             &mut fx.streaming,
             ServerEvent::Chunk {
                 session_id: "sess-target".into(),
-                chunk: OutputChunk::Done,
+                chunk: WireChunk::Known(OutputChunk::Done),
             },
         );
         fx.handle.redraw_sync();
@@ -9752,11 +9735,7 @@ mod tests {
                 id: "t1".into(),
                 name: "Bash".into(),
                 input: serde_json::json!({"command": "false"}),
-                result: ToolResultWire {
-                    text: "boom\r\ntrace".into(),
-                    is_error: true,
-                    content: None,
-                },
+                result: tool_result("boom\r\ntrace", true),
             }),
         );
         fx.handle.redraw_sync();

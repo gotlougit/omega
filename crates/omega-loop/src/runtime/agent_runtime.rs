@@ -56,7 +56,7 @@ impl AgentRuntime {
             Arc::clone(&state),
         );
 
-        let handle = AgentHandle::new(session_id, input_tx, output_tx.clone());
+        let handle = AgentHandle::new(session_id, input_tx, output_tx.clone(), Arc::clone(&state));
 
         tokio::spawn(async move {
             if let Err(e) = agent_fn(internals).await {

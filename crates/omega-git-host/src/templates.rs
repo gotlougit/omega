@@ -38,8 +38,11 @@ impl Templates {
             .context("register commit.html")?;
         env.add_template("refs.html", include_str!("../templates/refs.html"))
             .context("register refs.html")?;
-        env.add_template("repo-sessions.html", include_str!("../templates/repo-sessions.html"))
-            .context("register repo-sessions.html")?;
+        env.add_template(
+            "repo-sessions.html",
+            include_str!("../templates/repo-sessions.html"),
+        )
+        .context("register repo-sessions.html")?;
         env.add_template("clone.html", include_str!("../templates/clone.html"))
             .context("register clone.html")?;
         env.add_template("rebase.html", include_str!("../templates/rebase.html"))
@@ -48,8 +51,16 @@ impl Templates {
             .context("register sessions.html")?;
         env.add_template("session.html", include_str!("../templates/session.html"))
             .context("register session.html")?;
-        env.add_template("session-prompt.html", include_str!("../templates/session-prompt.html"))
-            .context("register session-prompt.html")?;
+        env.add_template(
+            "session-changes.html",
+            include_str!("../templates/session-changes.html"),
+        )
+        .context("register session-changes.html")?;
+        env.add_template(
+            "session-prompt.html",
+            include_str!("../templates/session-prompt.html"),
+        )
+        .context("register session-prompt.html")?;
         Ok(Self { env })
     }
 
@@ -86,9 +97,15 @@ fn diff_filter(value: &Value) -> String {
     for line in raw.split('\n') {
         let escaped = html_escape(line);
         if let Some(rest) = line.strip_prefix('+') {
-            out.push_str(&format!("<span class=\"text-success\">+{}</span>\n", html_escape(rest)));
+            out.push_str(&format!(
+                "<span class=\"text-success\">+{}</span>\n",
+                html_escape(rest)
+            ));
         } else if let Some(rest) = line.strip_prefix('-') {
-            out.push_str(&format!("<span class=\"text-danger\">-{}</span>\n", html_escape(rest)));
+            out.push_str(&format!(
+                "<span class=\"text-danger\">-{}</span>\n",
+                html_escape(rest)
+            ));
         } else {
             out.push_str(&escaped);
             out.push('\n');

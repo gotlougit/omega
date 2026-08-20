@@ -9,19 +9,37 @@
 
 use omega_loop_client::{connect_to, DaemonWriter, ServerEvent};
 use omega_projects::ActiveProject;
+use std::future::Future;
+use std::time::Duration;
 
 const DEFAULT_SOCKET: &str = "/tmp/omega-loop.sock";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const COMPACT_TIMEOUT: Duration = Duration::from_secs(125);
 
 fn socket_path() -> String {
     std::env::var("OMEGA_LOOP_SOCKET_PATH").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
 }
 
 /// Open a short-lived connection to the daemon.
-async fn open_conn(
-) -> Result<(omega_loop_client::DaemonReader, DaemonWriter), String> {
-    connect_to(&socket_path())
+async fn open_conn() -> Result<(omega_loop_client::DaemonReader, DaemonWriter), String> {
+    with_timeout(
+        CONNECT_TIMEOUT,
+        "connecting to omega-loop",
+        connect_to(&socket_path()),
+    )
+    .await?
+    .map_err(|e| format!("cannot reach omega-loop at {}: {e:#}", socket_path()))
+}
+
+async fn with_timeout<T, E>(
+    duration: Duration,
+    operation: &str,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, String> {
+    tokio::time::timeout(duration, future)
         .await
-        .map_err(|e| format!("cannot reach omega-loop at {}: {e:#}", socket_path()))
+        .map_err(|_| format!("timed out {operation}"))
 }
 
 /// Mark a brand-new session as being bound to a project's worktree: the
@@ -37,16 +55,93 @@ pub async fn create_session_on_project(
         .send_activate_project(session_id, project)
         .await
         .map_err(|e| format!("failed to request session start: {e:#}"))?;
-    while let Some(event) = reader.recv_event().await.map_err(|e| e.to_string())? {
-        match event {
-            ServerEvent::ProjectActive { .. } => return Ok(Ok(())),
-            ServerEvent::SystemMsg(msg) if msg.contains("Cannot") => return Ok(Err(msg)),
-            _ => {}
+    with_timeout(CONTROL_TIMEOUT, "starting the session", async {
+        while let Some(event) = reader.recv_event().await.map_err(|e| e.to_string())? {
+            match event {
+                ServerEvent::ProjectActive { .. } => return Ok(Ok(())),
+                ServerEvent::SystemMsg { message } if message.contains("Cannot") => {
+                    return Ok(Err(message))
+                }
+                _ => {}
+            }
         }
-    }
-    // The loop never confirms but the activation may still have happened;
-    // treat an EOF without a refusal as success.
-    Ok(Ok(()))
+        Err("omega-loop closed the connection before confirming the session".to_string())
+    })
+    .await?
+}
+
+/// Discover the models offered by omega-loop's configured provider.
+pub async fn list_models() -> Result<Vec<String>, String> {
+    let (mut reader, mut writer) = open_conn().await?;
+    writer
+        .send_list_models()
+        .await
+        .map_err(|e| format!("failed to request models: {e:#}"))?;
+    with_timeout(CONTROL_TIMEOUT, "listing models", async {
+        while let Some(event) = reader.recv_event().await.map_err(|e| e.to_string())? {
+            match event {
+                ServerEvent::ModelList { models } => return Ok(models),
+                ServerEvent::SystemMsg { message } if message.contains("Cannot") => {
+                    return Err(message)
+                }
+                _ => {}
+            }
+        }
+        Err("omega-loop closed the connection before listing models".to_string())
+    })
+    .await?
+}
+
+/// Change exactly one session and wait for the daemon's canonical event.
+pub async fn set_model(session_id: &str, model: &str) -> Result<String, String> {
+    let (mut reader, mut writer) = open_conn().await?;
+    writer
+        .send_set_model(session_id, model, None)
+        .await
+        .map_err(|e| format!("failed to request model change: {e:#}"))?;
+    with_timeout(CONTROL_TIMEOUT, "changing the session model", async {
+        while let Some(event) = reader.recv_event().await.map_err(|e| e.to_string())? {
+            match event {
+                ServerEvent::ModelChanged {
+                    session_id: confirmed,
+                    model,
+                } if confirmed.is_empty() || confirmed == session_id => return Ok(model),
+                ServerEvent::SystemMsg { message } if message.contains("Cannot") => {
+                    return Err(message)
+                }
+                _ => {}
+            }
+        }
+        Err("omega-loop closed the connection before confirming the model".to_string())
+    })
+    .await?
+}
+
+/// Compact exactly one session and wait for the canonical completion event.
+pub async fn compact(session_id: &str) -> Result<(), String> {
+    let (mut reader, mut writer) = open_conn().await?;
+    writer
+        .send_compact(session_id)
+        .await
+        .map_err(|e| format!("failed to request compaction: {e:#}"))?;
+    with_timeout(COMPACT_TIMEOUT, "compacting the session", async {
+        while let Some(event) = reader.recv_event().await.map_err(|e| e.to_string())? {
+            match event {
+                ServerEvent::SessionCompacted {
+                    session_id: confirmed,
+                } if confirmed == session_id => return Ok(()),
+                ServerEvent::SystemMsg { message }
+                    if message.contains("Cannot compact")
+                        || message.contains("history was compacted") =>
+                {
+                    return Err(message)
+                }
+                _ => {}
+            }
+        }
+        Err("omega-loop closed the connection before confirming compaction".to_string())
+    })
+    .await?
 }
 
 /// Send a chat message for `session_id`. The daemon delivers it to the live

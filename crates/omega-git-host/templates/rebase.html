@@ -1,149 +1,131 @@
 {% extends "layout.html" %}
 
 {% block title %}
-<title>omega-git-host — rebase cron</title>
+<title>omega-git-host — upstream rebases</title>
 {% endblock %}
 
 {% block content %}
 <div class="row">
-  <div class="col-md-8">
-    <h3>Upstream rebase cron</h3>
-    <p>
-      Keeps each cron-jobbable project's <code>main</code> branch in sync with
-      upstream. When upstream has moved and a plain fast-forward is possible,
-      <code>omega-loop</code> does it without the model. When the local main
-      also carries commits upstream doesn't have (diverged), the project's
-      dedicated <strong>upstream rebaser</strong> chat is woken to rebase
-      main onto upstream — and to resolve any merge conflicts itself.
-    </p>
-
-    <h4 class="mt-3">Schedule</h4>
-    <p>
-      Every <code>{{ interval_seconds }}s</code> (<code>{{ interval_display }}</code>).
-      {% if defaults_present %}
-      Defaults come from the NixOS module (<code>services.omega.rebaseJob</code>);
-      values set below override them imperatively.
-      {% else %}
-      No NixOS defaults file is present — settings below are the whole config.
+  <div class="col-md-9">
+    <div class="d-flex justify-content-between align-items-start">
+      <div>
+        <h3>Upstream rebases</h3>
+        <p>
+          Each project is a soft fork. Its configured local default branch is
+          rebased onto the matching branch from the fetch-only
+          <code>upstream</code> remote. Conflict-free rebases are completed by
+          omega-loop; conflicts are handed to the project's rebaser chat.
+        </p>
+      </div>
+      {% if projects %}
+      <form method="post" action="/rebase/run">
+        <button type="submit" class="btn btn-success">Run all enabled now</button>
+      </form>
       {% endif %}
-    </p>
+    </div>
 
-    <form method="post" action="/rebase/interval" class="form-inline">
-      <label for="interval_seconds" class="mr-2">Interval (seconds):</label>
-      <input type="number" id="interval_seconds" name="interval_seconds"
-             value="{{ interval_seconds }}" min="30" class="form-control mr-2" />
-      <button type="submit" class="btn btn-primary">Set interval</button>
-    </form>
-    <form method="post" action="/rebase/run" class="form-inline mt-2">
-      <button type="submit" class="btn btn-success">Run now</button>
-      <span class="text-muted ml-2">
-        drops a <code>rebase-now</code> marker; the daemon picks it up within seconds
-      </span>
-    </form>
+    {% for p in projects %}
+    <div class="card mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between">
+          <div>
+            <h4 class="card-title mb-1"><a href="/{{ p.name }}/">{{ p.name }}</a></h4>
+            <p class="text-muted mb-2">
+              <code>{{ p.default_branch or "unknown branch" }}</code> onto
+              <code>upstream/{{ p.default_branch or "?" }}</code> — {{ p.upstream_url }}
+            </p>
+          </div>
+          <div class="text-right">
+            {% if p.status == "queued" %}<span class="badge badge-info">queued</span>
+            {% elif p.status == "running" %}<span class="badge badge-primary">running</span>
+            {% elif p.status == "conflicted" %}<span class="badge badge-warning">conflicted</span>
+            {% elif p.status == "completed" %}<span class="badge badge-success">completed</span>
+            {% elif p.status == "failed" %}<span class="badge badge-danger">failed</span>
+            {% else %}<span class="badge badge-secondary">never run</span>{% endif %}
+            {% if p.outcome %}<div class="small text-muted">{{ p.outcome }}</div>{% endif %}
+          </div>
+        </div>
 
-    <h4 class="mt-4">Projects</h4>
-    <table class="table table-sm">
-      <thead>
-        <tr><th>project</th><th>source</th><th>rebaser chat</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for p in projects %}
-        <tr>
-          <td>
-            <a href="/{{ p.name }}/">{{ p.name }}</a>
-            {% if not p.registered %}<span class="text-danger">(not registered)</span>{% endif %}
-          </td>
-          <td class="text-muted">
-            {% if p.from_config %}NixOS config{% else %}web UI{% endif %}
-          </td>
-          <td>
-            {% for r in rebasers %}
-              {% if r.project == p.name %}
-                {% if r.exists %}
-                  <a href="/sessions/{{ r.session_id }}">{{ r.session_id }}</a>
-                {% else %}
-                  <span class="text-muted">not started yet</span>
-                {% endif %}
-              {% endif %}
-            {% endfor %}
-          </td>
-          <td class="text-right">
-            <form method="post" action="/rebase/toggle">
-              <input type="hidden" name="project" value="{{ p.name }}" />
-              <input type="hidden" name="enabled" value="false" />
-              <button type="submit" class="btn btn-danger btn-sm">Disable</button>
-            </form>
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="4" class="text-muted">No cron-jobbable projects yet.</td></tr>
-        {% endfor %}
-        {% if addable %}
-        {% for name in addable %}
-        <tr>
-          <td><a href="/{{ name }}/">{{ name }}</a></td>
-          <td class="text-muted">—</td>
-          <td class="text-muted">—</td>
-          <td class="text-right">
-            <form method="post" action="/rebase/toggle">
-              <input type="hidden" name="project" value="{{ name }}" />
-              <input type="hidden" name="enabled" value="true" />
-              <button type="submit" class="btn btn-primary btn-sm">Enable</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-        {% endif %}
-      </tbody>
-    </table>
+        {% if p.detail %}<p class="alert alert-warning py-1">{{ p.detail }}</p>{% endif %}
 
-    {% if last_run %}
-    <h4 class="mt-4">Last run</h4>
-    <p class="text-muted">{{ last_run.at }}</p>
-    <table class="table table-sm">
-      <thead><tr><th>project</th><th>result</th></tr></thead>
-      <tbody>
-        {% for name, entry in last_run.per_project %}
-        <tr>
-          <td>{{ name }}</td>
-          <td>
-            {{ entry.status }}
-            {% if entry.detail %}<span class="text-muted">— {{ entry.detail }}</span>{% endif %}
-            {% if entry.ahead %}<span class="text-muted">
-              ({{ entry.ahead }} local commit(s), {{ entry.behind }} upstream)</span>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% endif %}
+        <form method="post" action="/rebase/configure">
+          <input type="hidden" name="project" value="{{ p.name }}" />
+          <div class="form-row">
+            <div class="form-group col-md-3">
+              <label for="enabled-{{ loop.index }}">Automatic schedule</label>
+              <select id="enabled-{{ loop.index }}" name="enabled" class="form-control">
+                <option value="true" {% if p.enabled %}selected{% endif %}>Enabled</option>
+                <option value="false" {% if not p.enabled %}selected{% endif %}>Disabled</option>
+              </select>
+            </div>
+            <div class="form-group col-md-3">
+              <label for="interval-{{ loop.index }}">Every (seconds)</label>
+              <input id="interval-{{ loop.index }}" type="number" name="interval_seconds"
+                     value="{{ p.interval_seconds }}" min="30" max="7776000"
+                     class="form-control" required />
+              <small class="form-text text-muted">{{ p.interval_display }}</small>
+            </div>
+            <div class="form-group col-md-6">
+              <label>Timing</label>
+              <div class="small text-muted">
+                {% if p.last_started_at %}last {{ p.last_started_at }} ({{ p.trigger }}){% else %}not run yet{% endif %}<br />
+                {% if p.next_run_at %}next {{ p.next_run_at }}{% else %}automatic runs disabled{% endif %}
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="prompt-{{ loop.index }}">Conflict-resolution prompt</label>
+            <textarea id="prompt-{{ loop.index }}" name="prompt" rows="7"
+                      maxlength="65536" class="form-control">{{ p.prompt }}</textarea>
+            <small class="form-text text-muted">
+              Sent with every conflict wake. Leave blank to inherit the system default.
+            </small>
+          </div>
+          <button type="submit" class="btn btn-primary">Save settings</button>
+        </form>
+
+        <div class="d-flex align-items-center mt-2">
+          <form method="post" action="/rebase/run" class="mr-3">
+            <input type="hidden" name="project" value="{{ p.name }}" />
+            <button type="submit" class="btn btn-success btn-sm">Rebase now</button>
+          </form>
+          {% if p.session_exists %}
+          <a href="/sessions/{{ p.session_id }}">open {{ p.session_id }}</a>
+          {% else %}
+          <span class="text-muted">rebaser chat starts only if a conflict needs it</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% else %}
+    <p class="text-muted">Register a project before configuring upstream rebases.</p>
+    {% endfor %}
 
     {% if not writable %}
     <p class="text-danger">
-      The project store is read-only for this service — imperative changes can't be
-      saved. Configure <code>services.omega.rebaseJob</code> in NixOS instead.
+      The project store is read-only for this service; these controls cannot persist changes.
     </p>
     {% endif %}
   </div>
 
-  <div class="col-md-4">
-    <h3>Rebaser prompt</h3>
-    {% if agent_prompt %}
-    <p class="text-muted">The system prompt of each project's upstream-rebaser chat (configurable via <code>services.omega.rebaseJob.systemPrompt</code>):</p>
-    <pre class="text-muted"><code>{{ agent_prompt }}</code></pre>
-    {% else %}
+  <div class="col-md-3">
+    <h3>Safety model</h3>
     <p class="text-muted">
-      No defaults file — omega-loop uses its built-in rebaser prompt.
-      Configure <code>services.omega.rebaseJob.systemPrompt</code> in NixOS to override it.
+      <code>upstream</code> is fetch-only by convention. A writable fork mirror
+      is a distinct remote. The scheduler refuses to start a rebase when the
+      default-branch worktree has uncommitted changes.
     </p>
+    <h3>Status</h3>
+    <dl>
+      <dt>queued</dt><dd>manual request persisted</dd>
+      <dt>running</dt><dd>fetch/classification in progress</dd>
+      <dt>conflicted</dt><dd>Git stopped; rebaser chat was woken</dd>
+      <dt>completed</dt><dd>up-to-date, fast-forwarded, or rebased</dd>
+      <dt>failed</dt><dd>fetch, validation, or Git operation failed</dd>
+    </dl>
+    {% if defaults_present %}
+    <p class="text-muted">NixOS defaults seed settings; saved project settings override them.</p>
     {% endif %}
-    <h3>How to wake it yourself</h3>
-    <p>
-      Each upstream rebaser is an ordinary omega session. Open the
-      <code>rebaser-&lt;project&gt;</code> session in the TUI anytime and just
-      ask; it will rebase main onto upstream and resolve conflicts.
-    </p>
   </div>
 </div>
 {% endblock %}
