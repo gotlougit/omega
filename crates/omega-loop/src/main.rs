@@ -242,12 +242,13 @@ const META_ACTIVE_PROJECT: &str = "active_project";
 pub(crate) fn create_tools_for_dir(
     dir: &Path,
     session_id: &str,
-    rename_tool: RenameWorktreeTool,
+    mut rename_tool: RenameWorktreeTool,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
     let omega = OmegaClient::new()
         .with_session(session_id.to_string())
         .with_dir(dir.display().to_string());
+    rename_tool.omega_client = Some(omega.clone());
     omega_sh_client::register_proxy_tools(&mut registry, omega);
     omega_tools::register_default_tools(&mut registry);
     registry.register(rename_tool);
@@ -277,8 +278,9 @@ fn tools_for_session(
 /// the daemon's view consistent: the live session binding, the persisted
 /// session metadata (source of truth for resume + the git-host session
 /// index) and connected clients (via `ProjectActive`) all see the new
-/// path/branch. File tools in the session still point at the *old*
-/// directory, so the agent is instructed to call this as the final step.
+/// path/branch. The shared omega-sh client is retargeted as part of the same
+/// operation, so already-registered Bash/Read/Write/Edit tools follow the
+/// moved checkout immediately.
 #[derive(Clone)]
 pub(crate) struct RenameWorktreeTool {
     projects: Arc<ProjectManager>,
@@ -286,6 +288,9 @@ pub(crate) struct RenameWorktreeTool {
     session_projects: Arc<Mutex<HashMap<String, ActiveProject>>>,
     session_storage: Arc<crate::session::SessionStorage>,
     event_tx: broadcast::Sender<ServerEvent>,
+    /// Client shared by every omega-sh proxy in this session's registry.
+    /// Metadata-only unit tests may leave it unbound.
+    omega_client: Option<OmegaClient>,
 }
 
 /// Build a [`RenameWorktreeTool`] for a session, wiring it to the daemon
@@ -304,6 +309,7 @@ pub(crate) fn rename_worktree_tool(
         session_projects: Arc::clone(session_projects),
         session_storage: Arc::clone(session_storage),
         event_tx: event_tx.clone(),
+        omega_client: None,
     }
 }
 
@@ -384,6 +390,13 @@ impl Tool for RenameWorktreeTool {
             }
         };
 
+        // Proxy tools are long-lived and were created with the old checkout
+        // path. Their cloned OmegaClients share one directory binding, so
+        // this makes the next Bash/Read/Write/Edit call use the moved tree.
+        if let Some(client) = &self.omega_client {
+            client.set_dir(renamed.worktree_path.clone());
+        }
+
         // Keep every view of the binding consistent: the per-connection map,
         // the persisted session metadata (source of truth for resume and the
         // git-host session index), and connected clients.
@@ -446,9 +459,8 @@ fn project_system_context(active: &ActiveProject, update_instruction: &str) -> S
          When the task is complete and the work has been committed, rename the\n\
          worktree to a short, descriptive name with the RenameWorktree tool so\n\
          it can be easily identified later (e.g. 'fix-tui-crash' or\n\
-         'add-billing-api'). Do this once, as the final step: afterwards the\n\
-         file tools still point at the old directory, so do not run any more\n\
-         Bash/Read/Write/Edit calls after renaming.",
+         'add-billing-api'). The file and shell tools follow the renamed\n\
+         directory, so they remain available afterwards.",
         active.project.name, active.project.url, active.branch, active.worktree_path
     )
 }
@@ -2238,12 +2250,15 @@ mod tests {
         storage.save_metadata(&meta).unwrap();
 
         let (tx, mut rx) = broadcast::channel(16);
+        let omega_client = OmegaClient::with_socket("/tmp/unused.sock")
+            .with_dir(active.worktree_path.clone());
         let tool = RenameWorktreeTool {
             projects: Arc::new(projects),
             session_id: "sess-1".to_string(),
             session_projects: session_projects.clone(),
             session_storage: storage.clone(),
             event_tx: tx,
+            omega_client: Some(omega_client.clone()),
         };
 
         let result = tool
@@ -2278,6 +2293,11 @@ mod tests {
             .expect("binding present");
         assert_eq!(binding.branch, "omega/fix-tui-crash");
         assert_eq!(binding.worktree_path, new_dir.display().to_string());
+        assert_eq!(
+            omega_client.current_dir().as_deref(),
+            Some(binding.worktree_path.as_str()),
+            "existing omega-sh proxies must follow the renamed checkout"
+        );
 
         // Persisted metadata updated (source of truth for resume + git-host).
         let persisted = active_from_metadata(&storage.load_metadata("sess-1").unwrap())
@@ -2359,6 +2379,7 @@ mod tests {
             session_projects: session_projects.clone(),
             session_storage: storage.clone(),
             event_tx: tx,
+            omega_client: None,
         };
         let mut rt = SessionMetaRuntime {
             session: session.clone(),
@@ -2406,6 +2427,7 @@ mod tests {
             session_projects: session_projects.clone(),
             session_storage: storage.clone(),
             event_tx: tx,
+            omega_client: None,
         };
 
         // Missing/empty name → clean error result, no panic.

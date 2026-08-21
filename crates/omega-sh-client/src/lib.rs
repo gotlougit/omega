@@ -6,6 +6,7 @@ pub use omega_tools;
 
 use base64::Engine;
 use serde_json::Value;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -21,7 +22,10 @@ use omega_protocol::sh::{OmegaContent, OmegaRequest, OmegaResponse, OmegaToolRes
 pub struct OmegaClient {
     socket_path: String,
     session: Option<String>,
-    dir: Option<String>,
+    // Clones are shared by all proxy tools in one registry. Keeping the
+    // directory behind an Arc lets a worktree rename retarget every existing
+    // proxy without rebuilding the running agent's tool registry.
+    dir: Option<Arc<RwLock<String>>>,
 }
 
 impl OmegaClient {
@@ -53,8 +57,27 @@ impl OmegaClient {
 
     /// Set an optional working-directory hint (included in omega-sh request logs).
     pub fn with_dir(mut self, dir: impl Into<String>) -> Self {
-        self.dir = Some(dir.into());
+        self.dir = Some(Arc::new(RwLock::new(dir.into())));
         self
+    }
+
+    /// Retarget this client and all of its clones to a new working directory.
+    ///
+    /// Proxy tools clone one client when a registry is built, so this is used
+    /// after a git worktree is moved without invalidating those live tools.
+    pub fn set_dir(&self, dir: impl Into<String>) {
+        if let Some(current) = &self.dir {
+            *current.write().unwrap_or_else(|e| e.into_inner()) = dir.into();
+        }
+    }
+
+    /// Return the working directory that will be sent with the next request.
+    pub fn current_dir(&self) -> Option<String> {
+        self.dir.as_ref().map(|dir| {
+            dir.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
     }
 
     /// Send a tool request to omega-sh and wait for the response.
@@ -71,7 +94,7 @@ impl OmegaClient {
             tool: tool.to_string(),
             args,
             session: self.session.clone(),
-            dir: self.dir.clone(),
+            dir: self.current_dir(),
         };
 
         let mut buf = serde_json::to_vec(&request).map_err(|e| format!("Serialize error: {e}"))?;
@@ -315,6 +338,26 @@ mod tests {
         assert_eq!(bash.name(), "Bash");
         assert_eq!(read.name(), "Read");
         assert_ne!(bash.name(), read.name());
+    }
+
+    /// Every proxy in one registry receives a clone of the same client. A
+    /// worktree move must therefore retarget all of those clones at once.
+    #[test]
+    fn cloned_clients_share_directory_updates() {
+        let client = OmegaClient::with_socket("/tmp/irrelevant.sock").with_dir("/old/worktree");
+        let bash_client = client.clone();
+        let read_client = client.clone();
+
+        client.set_dir("/renamed/worktree");
+
+        assert_eq!(
+            bash_client.current_dir().as_deref(),
+            Some("/renamed/worktree")
+        );
+        assert_eq!(
+            read_client.current_dir().as_deref(),
+            Some("/renamed/worktree")
+        );
     }
 
     // -----------------------------------------------------------------------

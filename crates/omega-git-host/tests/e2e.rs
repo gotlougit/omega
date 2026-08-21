@@ -1138,11 +1138,20 @@ async fn create_project_merge_worktree_into_main_and_delete() {
     assert!(out.status.success());
     assert!(!dest_before.path().join("feature.txt").exists());
 
-    // The refs page shows a "Merge into main" action for the worktree.
+    // The refs page identifies the worktree as unmerged and offers both
+    // merge and guarded deletion actions.
     let body = http_get(port, "/my-fork/refs").await;
     assert!(
         body.contains("Merge into main"),
         "refs merge action:\n{body}"
+    );
+    assert!(
+        body.contains("Not merged into main"),
+        "refs merged status before merge:\n{body}"
+    );
+    assert!(
+        body.contains("Delete worktree"),
+        "refs delete action:\n{body}"
     );
 
     // Merge the session branch into main via the web action.
@@ -1154,6 +1163,13 @@ async fn create_project_merge_worktree_into_main_and_delete() {
     )
     .await;
     assert!(resp.contains("303 See Other"), "merge response:\n{resp}");
+
+    // The same row now reports that its committed work is contained by main.
+    let body = http_get(port, "/my-fork/refs").await;
+    assert!(
+        body.contains("Merged into main"),
+        "refs merged status after merge:\n{body}"
+    );
 
     // A fresh clone now sees the feature on main — shipped and fetchable.
     let dest_after = TempDir::new().unwrap();
@@ -1168,6 +1184,25 @@ async fn create_project_merge_worktree_into_main_and_delete() {
     assert!(
         dest_after.path().join("feature.txt").exists(),
         "feature must land on main and be fetchable"
+    );
+
+    // Delete just the merged session worktree; main and the project remain.
+    let resp = http_post_form(
+        port,
+        "/my-fork/worktrees/delete",
+        &format!("branch={encoded_branch}"),
+    )
+    .await;
+    assert!(resp.contains("303 See Other"), "delete worktree:\n{resp}");
+    assert!(!wt.exists(), "worktree checkout should be deleted");
+    let refs = git(&repo, &["branch", "--list", &active.branch])
+        .await
+        .unwrap();
+    assert!(refs.is_empty(), "worktree branch should be deleted");
+    let body = http_get(port, "/my-fork/refs").await;
+    assert!(
+        !body.contains(&active.branch),
+        "deleted worktree should disappear from refs:\n{body}"
     );
 
     // Delete the project via web; the repo page and clone now 404.

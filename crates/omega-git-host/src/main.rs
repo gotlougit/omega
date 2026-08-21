@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
         .route("/projects/create", post(pages::project_create))
         .route("/projects/delete", post(pages::project_delete))
         .route("/{name}/merge", post(pages::project_merge))
+        .route("/{name}/worktrees/delete", post(pages::worktree_delete))
         .route("/{name}/mirror/configure", post(pages::mirror_configure))
         .route("/{name}/mirror/push", post(pages::mirror_push))
         .route("/{name}/mirror/remove", post(pages::mirror_remove))

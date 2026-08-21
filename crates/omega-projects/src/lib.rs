@@ -479,6 +479,52 @@ impl ProjectManager {
         Ok(())
     }
 
+    /// Remove the checked-out session worktree which owns `branch`.
+    ///
+    /// This branch-based entry point is intended for management UIs, where
+    /// the branch comes from the repository's current ref list. It refuses
+    /// ordinary branches and verifies that Git's checkout path is contained
+    /// by this project's worktree directory before removing anything.
+    pub async fn remove_worktree_by_branch(
+        &self,
+        info: &ProjectInfo,
+        branch: &str,
+    ) -> Result<()> {
+        if !branch.starts_with("omega/") {
+            bail!("refusing to remove non-session branch '{branch}'");
+        }
+        let repo = self.repo_dir(&info.name);
+        if !branch_exists(&repo, branch).await {
+            bail!("worktree branch '{branch}' does not exist");
+        }
+        let path = worktree_path_for_branch(&repo, branch)
+            .await
+            .with_context(|| format!("branch '{branch}' is not checked out in a worktree"))?;
+        let worktrees_root = self
+            .worktrees_dir(&info.name)
+            .canonicalize()
+            .with_context(|| format!("resolve worktree root for '{}'", info.name))?;
+        let worktree = PathBuf::from(&path)
+            .canonicalize()
+            .with_context(|| format!("resolve worktree path '{path}'"))?;
+        if !worktree.starts_with(&worktrees_root) {
+            bail!(
+                "worktree for branch '{branch}' is outside the project worktree directory"
+            );
+        }
+
+        let active = ActiveProject {
+            project: info.clone(),
+            worktree_path: worktree.display().to_string(),
+            branch: branch.to_string(),
+        };
+        self.remove_worktree(&active).await?;
+        if worktree.exists() || branch_exists(&repo, branch).await {
+            bail!("git could not completely remove worktree branch '{branch}'");
+        }
+        Ok(())
+    }
+
     /// Rename a session worktree to a descriptive name, so it can be easily
     /// identified once the work is done.
     ///
@@ -1638,6 +1684,61 @@ mod tests {
             .await
             .unwrap();
         assert!(Path::new(&again.worktree_path).is_dir());
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_by_branch_resolves_path_and_rejects_main() {
+        let fx = fixture().await;
+        let active = fx
+            .manager
+            .activate(&fx.remote_url, "sess-1", None)
+            .await
+            .unwrap();
+        let repo = fx.manager.repo_dir(&active.project.name);
+
+        fx.manager
+            .remove_worktree_by_branch(&active.project, &active.branch)
+            .await
+            .unwrap();
+        assert!(!Path::new(&active.worktree_path).exists());
+        assert!(
+            git(&repo, &["branch", "--list", &active.branch])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let error = fx
+            .manager
+            .remove_worktree_by_branch(&active.project, "main")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-session branch"));
+
+        // Even an omega/* branch is not a managed session worktree when its
+        // checkout lives outside this project's worktree root.
+        let outside_root = TempDir::new().unwrap();
+        let outside = outside_root.path().join("checkout");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "omega/outside",
+                outside.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .await
+        .unwrap();
+        let error = fx
+            .manager
+            .remove_worktree_by_branch(&active.project, "omega/outside")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside"));
+        assert!(outside.is_dir(), "rejected worktree must remain untouched");
     }
 
     // -----------------------------------------------------------------------

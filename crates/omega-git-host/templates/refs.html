@@ -27,11 +27,21 @@
             <a class="ml-2" href="/sessions/{{ w.session.session_id }}/live">live</a>
             {% endif %}
           </p>
+          {% if w.merged %}
+          <p class="text-success mb-2"><strong>Merged into {{ default_branch }}</strong></p>
+          {% else %}
+          <p class="text-warning mb-2"><strong>Not merged into {{ default_branch }}</strong></p>
           <form method="post" action="/{{ name }}/merge">
             <input type="hidden" name="branch" value="{{ w.branch }}">
             <input type="text" name="message" class="form-control form-control-sm d-inline-block"
                    placeholder="merge message (optional)" style="width: 40%;">
-            <button type="submit" class="btn btn-primary btn-sm">Merge into main</button>
+            <button type="submit" class="btn btn-primary btn-sm">Merge into {{ default_branch }}</button>
+          </form>
+          {% endif %}
+          <form method="post" action="/{{ name }}/worktrees/delete" class="mt-2"
+                onsubmit="return confirm('Delete this worktree and its branch? Uncommitted and unmerged work will be lost.');">
+            <input type="hidden" name="branch" value="{{ w.branch }}">
+            <button type="submit" class="btn btn-outline-danger btn-sm">Delete worktree</button>
           </form>
         </div>
         {% endfor %}

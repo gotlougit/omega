@@ -321,6 +321,10 @@ pub async fn refs_page(
                     "subject": r.subject,
                     "date": r.date.map(|d| d.to_rfc3339()),
                     "session": session,
+                    "merged": repo::git_ok(
+                        &repo,
+                        &["merge-base", "--is-ancestor", &r.name, &default],
+                    ).await,
                 }));
             }
             RefKind::Branch => branches.push(r),
@@ -1667,6 +1671,12 @@ pub(crate) struct MergeForm {
     message: Option<String>,
 }
 
+/// Form for `/{name}/worktrees/delete`.
+#[derive(Deserialize)]
+pub(crate) struct WorktreeDeleteForm {
+    branch: String,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct MirrorConfigureForm {
     mirror: String,
@@ -1789,6 +1799,50 @@ pub async fn project_merge(
         }
         Err(e) => {
             tracing::warn!(project = %name, branch = %branch, error = %e, "merge failed");
+            Redirect::to(&format!(
+                "/{name}/refs?error={}",
+                url_encode(&format!("{e:#}"))
+            ))
+            .into_response()
+        }
+    }
+}
+
+/// `POST /{name}/worktrees/delete` — remove one omega session checkout and
+/// its branch. The manager resolves the checkout from Git and verifies it is
+/// contained by this project's worktree directory before deleting it.
+pub async fn worktree_delete(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<WorktreeDeleteForm>,
+) -> Response {
+    if let Some(response) = reject_cross_origin(&headers) {
+        return response;
+    }
+    let branch = form.branch.trim().to_string();
+    let project = match state.projects.find(&name).await {
+        Ok(Some(project)) => project,
+        _ => {
+            return Redirect::to(&format!(
+                "/?error={}",
+                url_encode(&format!("project '{name}' not found"))
+            ))
+            .into_response()
+        }
+    };
+    match state
+        .projects
+        .remove_worktree_by_branch(&project, &branch)
+        .await
+    {
+        Ok(()) => Redirect::to(&format!(
+            "/{name}/refs?ok={}",
+            url_encode(&format!("deleted worktree {branch}"))
+        ))
+        .into_response(),
+        Err(e) => {
+            tracing::warn!(project = %name, branch = %branch, error = %e, "worktree delete failed");
             Redirect::to(&format!(
                 "/{name}/refs?error={}",
                 url_encode(&format!("{e:#}"))
