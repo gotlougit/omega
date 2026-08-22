@@ -8,12 +8,18 @@
 //!
 //! 1. `git fetch upstream` and classify the local default branch against
 //!    `upstream/<default>` ([`omega_projects::DefaultBranchStatus`]):
-//!    - strictly behind  → mechanical fast-forward (no LLM involved),
+//!    - strictly behind  → mechanical fast-forward, then wake the rebaser
+//!      chat to **verify the worktree builds and tests pass**,
 //!    - up to date / ahead-only (local-only commits) → nothing,
-//!    - **diverged** (both sides moved) → wake the project's dedicated
-//!      upstream-rebaser chat, which rebases `main` onto upstream and
-//!      auto-fixes the merge conflicts (the local-only commits are
-//!      preserved — the rebaser keeps the intent of both sides).
+//!    - **diverged** (both sides moved) → rebase `main` onto upstream, then
+//!      wake the project's dedicated upstream-rebaser chat to fix conflicts
+//!      (if any) **and** verify the build. The local-only commits are
+//!      preserved — the rebaser keeps the intent of both sides.
+//!
+//! The rebaser chat is always invoked after any git operation that changes
+//! the branch — even a zero-conflict fast-forward or clean rebase — because
+//! upstream changes can introduce build failures even without merge
+//! conflicts.
 //!
 //! Configuration comes from the NixOS defaults file
 //! (`OMEGA_REBASE_JOB_CONFIG`, see [`omega_projects::rebase`]) overlaid with
@@ -22,7 +28,7 @@
 //! The rebaser chats are real persistent sessions (just like any other),
 //! bound to the project's dedicated `main` worktree, so the user can also
 //! wake them by hand from the TUI and read their transcripts in the web UI.
-//! A rebaser chat is created lazily when a conflict actually needs one.
+//! A rebaser chat is created lazily when a project first needs one.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -212,10 +218,17 @@ impl RebaseJob {
         }
     }
 
-    /// Reconcile conflict outcomes from Git itself. This survives losing the
-    /// in-memory output subscriber and never wakes an unresolved conflict;
-    /// it only promotes a run after Git has no rebase state and local main
-    /// is verifiably based on upstream.
+    /// Reconcile in-progress rebase runs after a daemon restart. This
+    /// survives losing the in-memory output subscriber.
+    ///
+    /// For runs stuck in "conflicted" status: checks whether Git has finished
+    /// the rebase (no more rebase state) and the branch is up to date with
+    /// upstream — if so, promotes to completed.
+    ///
+    /// For runs stuck in "verifying" status (fast-forward/clean-rebase where
+    /// the rebaser was woken for build verification): the git operation
+    /// already completed, so we just verify the branch state and promote.
+    /// Never wakes an unresolved conflict.
     async fn reconcile_conflicted_runs(&self, snapshot: &rebase::RebaseState) {
         let now = Utc::now();
         let candidates: Vec<String> = snapshot
@@ -262,18 +275,20 @@ impl RebaseJob {
                 continue;
             }
 
-            // Conflict resolution completed outside the original scheduler
-            // call. Reuse the same configured auto-push hook rather than a
-            // second polling/scheduling mechanism.
+            // Git operation completed outside the original scheduler call.
+            // Push mirrors and promote the run to completed.
             let _ = self.mirrors.auto_push(&info).await;
 
             let _ = rebase::update_state(self.projects.root(), |state| {
                 let Some(run) = state.project_runs.get_mut(&project) else {
                     return Ok(());
                 };
-                if rebase::run_status(run) != Some("conflicted") {
-                    return Ok(());
-                }
+                let current_status = rebase::run_status(run);
+                let (outcome, reconciled) = match current_status {
+                    Some("verifying") => ("verification-resolved", true),
+                    Some("conflicted") => ("conflicts-resolved", true),
+                    _ => return Ok(()),
+                };
                 let session = run
                     .result
                     .as_ref()
@@ -282,9 +297,9 @@ impl RebaseJob {
                 run.last_finished_at = Some(Utc::now());
                 run.result = Some(json!({
                     "status": "completed",
-                    "outcome": "conflicts-resolved",
+                    "outcome": outcome,
                     "session": session,
-                    "reconciled": true,
+                    "reconciled": reconciled,
                 }));
                 Ok(())
             });
@@ -308,7 +323,6 @@ impl RebaseJob {
         let mut value = match self.sync_project(project, &info).await {
             ProjectSync::Ok(entry) | ProjectSync::Skipped(entry) | ProjectSync::Err(entry) => entry,
         };
-        let mut completed = false;
         if let Some(object) = value.as_object_mut() {
             let outcome = object
                 .get("status")
@@ -316,24 +330,14 @@ impl RebaseJob {
                 .unwrap_or("unknown")
                 .to_string();
             let status = match outcome.as_str() {
-                "conflicts" => "conflicted",
+                // All rebaser-wake cases — the background monitor in
+                // `do_wake_rebaser` will eventually write the final result.
+                "conflicts" | "fast-forwarded" | "rebased" => "verifying",
                 "error" | "missing" | "skipped" => "failed",
                 _ => "completed",
             };
             object.insert("outcome".into(), json!(outcome));
             object.insert("status".into(), json!(status));
-            completed = status == "completed";
-        }
-        if completed {
-            if let Some(push) = self.mirrors.auto_push(&info).await {
-                let mirror = match push {
-                    Ok(outcome) => json!({ "status": outcome.status }),
-                    Err(_) => json!({ "status": "failed" }),
-                };
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("mirror_push".into(), mirror);
-                }
-            }
         }
         value
     }
@@ -360,7 +364,10 @@ impl RebaseJob {
         }
     }
 
-    /// Sync one project's main branch with upstream; may wake the rebaser.
+    /// Sync one project's main branch with upstream. Always invokes the
+    /// rebaser chat for any change (fast-forward, clean rebase, or conflicts)
+    /// so the LLM can verify the worktree still builds — even zero-conflict
+    /// operations can introduce build failures.
     async fn sync_project(
         &self,
         config: &EffectiveProjectConfig,
@@ -383,11 +390,17 @@ impl RebaseJob {
                         to = %new,
                         "fast-forwarded main to upstream"
                     );
-                    ProjectSync::Ok(json!({
-                        "status": "fast-forwarded",
-                        "from": old,
-                        "to": new,
-                    }))
+                    // Even a clean fast-forward can break a build — invoke rebaser to verify.
+                    self.wake_rebaser_for_verification(
+                        config,
+                        info,
+                        format!(
+                            "Main was fast-forwarded from {old} to {new} (upstream has new commits). \
+                             Please verify that the worktree builds and tests pass."
+                        ),
+                        "fast-forwarded",
+                    )
+                    .await
                 }
                 DefaultBranchStatus::Diverged {
                     local,
@@ -395,13 +408,28 @@ impl RebaseJob {
                     ahead,
                     behind,
                 } => match self.projects.rebase_default_branch(info).await {
-                    Ok(DefaultBranchRebaseStatus::Rebased { old, new }) => ProjectSync::Ok(json!({
-                        "status": "rebased",
-                        "from": old,
-                        "to": new,
-                        "ahead": ahead,
-                        "behind": behind,
-                    })),
+                    Ok(DefaultBranchRebaseStatus::Rebased { old, new }) => {
+                        tracing::info!(
+                            project = %info.name,
+                            from = %old,
+                            to = %new,
+                            ahead,
+                            behind,
+                            "rebased main onto upstream (no conflicts)"
+                        );
+                        // Clean rebase can still break a build — invoke rebaser to verify.
+                        self.wake_rebaser_for_verification(
+                            config,
+                            info,
+                            format!(
+                                "Main was rebased from {old} to {new} with {ahead} local commits ahead \
+                                 and {behind} upstream commits behind. No merge conflicts occurred, but \
+                                 please verify that the worktree still builds and tests pass."
+                            ),
+                            "rebased",
+                        )
+                        .await
+                    },
                     Ok(DefaultBranchRebaseStatus::Conflicts {
                         upstream_ref,
                         detail,
@@ -434,7 +462,8 @@ impl RebaseJob {
     }
 
     /// Both sides moved: hand the rebase to the project's dedicated
-    /// upstream-rebaser chat, which fixes the conflicts itself.
+    /// upstream-rebaser chat, which fixes the conflicts itself and then
+    /// verifies the build.
     async fn handle_diverged(
         &self,
         config: &EffectiveProjectConfig,
@@ -465,28 +494,84 @@ impl RebaseJob {
         };
 
         let session_id = session_id_for(&info.name);
+        let wake = format!(
+            "{WAKE_HINT} upstream moved for '{project}': {upstream_ref} has {behind} new \
+             commit(s) and local main has {ahead} local-only commit(s). Git has already \
+             started the rebase in your worktree (branch {branch}) and stopped for \
+             conflicts. Resolve them, continue the rebase to completion, verify the tree, \
+             and report what you did.\n\
+             Main was at {local}; upstream is at {upstream}.\n\
+             Git reported: {conflict_detail}\n\n\
+             <configured-conflict-resolution-prompt>\n{prompt}\n\
+             </configured-conflict-resolution-prompt>",
+            project = info.name,
+            branch = main_active.branch,
+            local = &local[..local.len().min(12)],
+            upstream = &upstream[..upstream.len().min(12)],
+            prompt = config.prompt,
+        );
+
+        self.do_wake_rebaser(config, info, &main_active, &session_id, wake, "conflicts")
+            .await
+    }
+
+    /// Wake the rebaser after a mechanical sync (fast-forward or clean rebase)
+    /// where no merge conflicts occurred. The rebaser verifies that the
+    /// worktree still builds and tests pass.
+    async fn wake_rebaser_for_verification(
+        &self,
+        config: &EffectiveProjectConfig,
+        info: &ProjectInfo,
+        description: String,
+        outcome: &'static str,
+    ) -> ProjectSync {
+        let main_active = match self.projects.ensure_main_worktree(info).await {
+            Ok(active) => active,
+            Err(e) => {
+                tracing::warn!(
+                    project = %info.name,
+                    error = %e,
+                    "could not ensure main worktree for build verification"
+                );
+                return ProjectSync::Err(json!({
+                    "status": "error",
+                    "detail": format!("main worktree unavailable: {e:#}"),
+                }));
+            }
+        };
+
+        let session_id = session_id_for(&info.name);
+        let wake = format!(
+            "{WAKE_HINT} {description}\n\n\
+             <configured-conflict-resolution-prompt>\n{prompt}\n\
+             </configured-conflict-resolution-prompt>",
+            description = description,
+            prompt = config.prompt,
+        );
+
+        self.do_wake_rebaser(config, info, &main_active, &session_id, wake, outcome)
+            .await
+    }
+
+    /// Common wake-the-rebaser-and-monitor-completion logic.
+    /// Sends `wake` to the rebaser session, records the run as `status`,
+    /// then spawns a background task that waits for the rebaser to finish
+    /// and promotes the run to completed (or failed).
+    async fn do_wake_rebaser(
+        &self,
+        config: &EffectiveProjectConfig,
+        info: &ProjectInfo,
+        main_active: &ActiveProject,
+        session_id: &str,
+        wake: String,
+        status: &'static str,
+    ) -> ProjectSync {
         match self
-            .ensure_rebaser(info, &main_active, &config.prompt)
+            .ensure_rebaser(info, main_active, &config.prompt)
             .await
         {
             Ok(handle) => {
                 let mut output = handle.subscribe();
-                let wake = format!(
-                    "{WAKE_HINT} upstream moved for '{project}': {upstream_ref} has {behind} new \
-                     commit(s) and local main has {ahead} local-only commit(s). Git has already \
-                     started the rebase in your worktree (branch {branch}) and stopped for \
-                     conflicts. Resolve them, continue the rebase to completion, verify the tree, \
-                     and report what you did.\n\
-                     Main was at {local}; upstream is at {upstream}.\n\
-                     Git reported: {conflict_detail}\n\n\
-                     <configured-conflict-resolution-prompt>\n{prompt}\n\
-                     </configured-conflict-resolution-prompt>",
-                    project = info.name,
-                    branch = main_active.branch,
-                    local = &local[..local.len().min(12)],
-                    upstream = &upstream[..upstream.len().min(12)],
-                    prompt = config.prompt,
-                );
                 if let Err(e) = handle.send_input(wake.clone()).await {
                     tracing::warn!(
                         %session_id,
@@ -502,20 +587,20 @@ impl RebaseJob {
                 tracing::info!(
                     %session_id,
                     project = %info.name,
-                    ahead,
-                    behind,
-                    "woke upstream rebaser for diverged main"
+                    status,
+                    "woke upstream rebaser"
                 );
-                // The immediate run status is `conflicted`. Follow the
-                // dedicated session until a turn actually leaves main based
-                // on upstream, then promote it to completed. If another user
-                // turn was already ahead of this wake, its `Done` will still
-                // leave the repository diverged and this monitor keeps
-                // waiting for the queued rebaser turn.
+
+                // Follow the dedicated session until a turn actually leaves
+                // main based on upstream, then promote it to completed. If
+                // another user turn was already ahead of this wake, its
+                // `Done` will still leave the repository diverged and this
+                // monitor keeps waiting for the queued rebaser turn.
                 let projects = Arc::clone(&self.projects);
                 let info_for_monitor = info.clone();
                 let root = self.projects.root().to_path_buf();
-                let monitored_session_id = session_id.clone();
+                let monitored_session_id = session_id.to_string();
+                let monitored_outcome = format!("{status}-verified");
                 let mirrors = self.mirrors.clone();
                 tokio::spawn(async move {
                     loop {
@@ -543,7 +628,7 @@ impl RebaseJob {
                                     run.last_finished_at = Some(Utc::now());
                                     run.result = Some(json!({
                                         "status": "completed",
-                                        "outcome": "conflicts-resolved",
+                                        "outcome": &monitored_outcome,
                                         "session": &monitored_session_id,
                                     }));
                                     Ok(())
@@ -573,12 +658,9 @@ impl RebaseJob {
                     }
                 });
                 ProjectSync::Ok(json!({
-                    "status": "conflicts",
-                    "ahead": ahead,
-                    "behind": behind,
+                    "status": status,
                     "session": session_id,
                     "rebaser_woken": true,
-                    "detail": conflict_detail,
                 }))
             }
             Err(e) => {

@@ -329,8 +329,9 @@ pub fn project_is_due(
 }
 
 /// Scheduled attempts pause while a manual request is queued, a fetch is
-/// running, or a conflict-resolution session still owns the in-progress
-/// rebase. A user can always explicitly queue another manual wake.
+/// running, or a rebaser session is still verifying (or resolving conflicts
+/// for) the in-progress run. A user can always explicitly queue another
+/// manual wake.
 pub fn run_blocks_schedule(run: Option<&RebaseProjectRun>) -> bool {
     let Some(run) = run else {
         return false;
@@ -343,7 +344,7 @@ pub fn run_blocks_schedule(run: Option<&RebaseProjectRun>) -> bool {
             .as_ref()
             .and_then(|r| r.get("status"))
             .and_then(serde_json::Value::as_str),
-        Some("queued" | "running" | "conflicted")
+        Some("queued" | "running" | "conflicted" | "verifying")
     )
 }
 
@@ -356,8 +357,8 @@ pub fn run_status(run: &RebaseProjectRun) -> Option<&str> {
 
 /// Recover work claimed by a previous omega-loop process which exited
 /// before recording a terminal result. This is called once at daemon start;
-/// it never touches conflicted entries, whose Git state is reconciled
-/// separately without automatically waking another model turn.
+/// it never touches conflicted or verifying entries, whose Git state is
+/// reconciled separately without automatically waking another model turn.
 pub fn recover_interrupted_runs(state: &mut RebaseState, now: DateTime<Utc>) -> Vec<String> {
     let mut recovered = Vec::new();
     for (project, run) in &mut state.project_runs {
@@ -646,6 +647,9 @@ mod tests {
             ..Default::default()
         };
         assert!(run_blocks_schedule(Some(&run)));
+        // "verifying" also blocks (rebaser is working)
+        run.result = Some(serde_json::json!({ "status": "verifying" }));
+        assert!(run_blocks_schedule(Some(&run)));
         run.result = Some(serde_json::json!({ "status": "completed" }));
         assert!(!run_blocks_schedule(Some(&run)));
         run.pending_since = Some(Utc::now());
@@ -671,6 +675,13 @@ mod tests {
                 ..Default::default()
             },
         );
+        state.project_runs.insert(
+            "verifying".into(),
+            RebaseProjectRun {
+                result: Some(serde_json::json!({ "status": "verifying" })),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(recover_interrupted_runs(&mut state, now), vec!["omega"]);
         let recovered = &state.project_runs["omega"];
@@ -684,6 +695,12 @@ mod tests {
         assert_eq!(
             run_status(&state.project_runs["conflicted"]),
             Some("conflicted")
+        );
+        // "verifying" runs are not recovered here — the reconciliation
+        // loop handles them in the daemon (via reconcile_conflicted_runs).
+        assert_eq!(
+            run_status(&state.project_runs["verifying"]),
+            Some("verifying")
         );
     }
 
