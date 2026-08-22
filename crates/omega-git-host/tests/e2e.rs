@@ -14,11 +14,24 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
 /// Run `git <args>` in `dir`, returning trimmed stdout on success.
+/// Provides a hermetic identity and disables GPG signing via GIT_CONFIG_COUNT
+/// so tests never hang on prompts or inherit the host's gitconfig.
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "Omega Test")
+        .env("GIT_CONFIG_KEY_1", "user.email")
+        .env("GIT_CONFIG_VALUE_1", "omega-test@example.com")
+        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "echo")
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -37,8 +50,15 @@ async fn init_source_repo(dir: &Path) {
     git(dir, &["config", "user.name", "Omega Test"])
         .await
         .unwrap();
-    // Don't inherit the host's commit.gpgsign — signing would prompt/
-    // hang on a throwaway repo that has no signing key.
+    // Set up rc-level identity and GPG config for git processes that
+    // bypass the test's env-override (e.g. git http-backend invoked in
+    // a subprocess without the test's env).
+    git(dir, &["config", "user.name", "Omega Test"])
+        .await
+        .unwrap();
+    git(dir, &["config", "user.email", "omega-test@example.com"])
+        .await
+        .unwrap();
     git(dir, &["config", "commit.gpgsign", "false"])
         .await
         .unwrap();
@@ -125,6 +145,19 @@ async fn spawn_server(projects_dir: &Path, session_dir: &Path, port: u16) -> Chi
         .env("OMEGA_GIT_HOST_LISTEN", "127.0.0.1")
         .env("OMEGA_GIT_HOST_PORT", port.to_string())
         .env("RUST_LOG", "warn")
+        // Hermetic git environment so http-backend and any hooks it spawns
+        // never prompt for GPG or SSH credentials.
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "Omega Test")
+        .env("GIT_CONFIG_KEY_1", "user.email")
+        .env("GIT_CONFIG_VALUE_1", "omega-test@example.com")
+        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "echo")
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -300,7 +333,7 @@ async fn ls_remote_lists_worktree_refs() {
 }
 
 #[tokio::test]
-async fn push_is_refused() {
+async fn push_succeeds() {
     let store = TempDir::new().unwrap();
     let (project, _) = seed_store(store.path()).await;
     let port = free_port();
@@ -313,10 +346,25 @@ async fn push_is_refused() {
         .arg("clone")
         .arg(&url)
         .arg(dest.path())
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "Omega Test")
+        .env("GIT_CONFIG_KEY_1", "user.email")
+        .env("GIT_CONFIG_VALUE_1", "omega-test@example.com")
+        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
         .unwrap();
     assert!(out.status.success());
+
+    // Make a new commit to push back.
+    std::fs::write(dest.path().join("push-test.txt"), "pushed by omega\n").unwrap();
+    git(dest.path(), &["add", "."]).await.unwrap();
+    git(dest.path(), &["commit", "-m", "push test"]).await.unwrap();
 
     let out = Command::new("git")
         .arg("-C")
@@ -324,14 +372,23 @@ async fn push_is_refused() {
         .arg("push")
         .arg("origin")
         .arg("main")
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "Omega Test")
+        .env("GIT_CONFIG_KEY_1", "user.email")
+        .env("GIT_CONFIG_VALUE_1", "omega-test@example.com")
+        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
         .unwrap();
     assert!(
-        !out.status.success(),
-        "push must be refused (read-only forge); stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
+        out.status.success(),
+        "push must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     drop(server);

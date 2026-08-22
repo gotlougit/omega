@@ -1,7 +1,7 @@
 //! # omega-git-host
 //!
-//! Fetch-only self-hosted git forge and management UI over the omega project
-//! store (SELFGIT.md).
+//! Self-hosted git forge and management UI over the omega project
+//! store (SELFGIT.md). Supports both fetch and push via smart HTTP.
 //!
 //! Phase 1: serve every registered project's bare clone as a fetchable smart
 //! HTTP remote via `git http-backend`. Phase 2: sourcehut-style web UI shell

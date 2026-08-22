@@ -3,15 +3,13 @@
 //!
 //! Every request to `/{name}.git/<rest>` is validated and proxied to
 //! `git http-backend` with `GIT_PROJECT_ROOT` pointed at the store's bare
-//! repos directory and `GIT_HTTP_EXPORT_ALL=1`.
+//! repos directory and `GIT_HTTP_EXPORT_ALL=1`. Both fetch (`git-upload-pack`)
+//! and push (`git-receive-pack`) are enabled via `http.receivepack=true`.
 //!
 //! The store's bare clones live at `repos/<name>` (no `.git` suffix), while
 //! http-backend derives the repo path from the first PATH_INFO component.
 //! We therefore advertise the conventional `/{name}.git/...` URLs and rewrite
 //! PATH_INFO to `/{name}/...` for the backend.
-//!
-//! Read-only by construction: http-backend only serves `git-upload-pack`
-//! (fetch) unless a repo opts into `http.receivepack`, which we never set.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -76,6 +74,11 @@ pub async fn git_route(
         .env("REQUEST_METHOD", method.as_str())
         .env("PATH_INFO", &path_info)
         .env("QUERY_STRING", uri.query().unwrap_or_default())
+        // Enable both fetch and push via http-backend. git http-backend
+        // denies git-receive-pack (push) unless http.receivepack is true.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.receivepack")
+        .env("GIT_CONFIG_VALUE_0", "true")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -266,7 +269,7 @@ mod tests {
 
     #[test]
     fn parses_status_line_anywhere_in_headers() {
-        // git http-backend emits Status *after* the cache headers for 403.
+        // git http-backend emits Status *after* the cache headers for errors.
         let raw = b"Expires: Fri, 01 Jan 1980 00:00:00 GMT\r\n\
                     Status: 403 Forbidden\r\n\
                     Content-Type: text/plain\r\n\
