@@ -1,34 +1,35 @@
-//! # Upstream rebaser cron
+//! # Recurring chat cron
 //!
 //! A scheduled job that keeps each cron-jobbable project's **main branch**
-//! in sync with upstream, plus the dedicated "upstream rebaser" chats that
+//! in sync with upstream, plus the dedicated "recurring chat" sessions that
 //! handle the judgment parts.
 //!
 //! Per scheduled run, for every cron-jobbable project:
 //!
 //! 1. `git fetch upstream` and classify the local default branch against
 //!    `upstream/<default>` ([`omega_projects::DefaultBranchStatus`]):
-//!    - strictly behind  → mechanical fast-forward, then wake the rebaser
+//!    - strictly behind  → mechanical fast-forward, then wake the recurring
 //!      chat to **verify the worktree builds and tests pass**,
-//!    - up to date / ahead-only (local-only commits) → nothing,
+//!    - up to date / ahead-only (local-only commits) → wake the recurring
+//!      chat to verify the worktree still builds and tests pass,
 //!    - **diverged** (both sides moved) → rebase `main` onto upstream, then
-//!      wake the project's dedicated upstream-rebaser chat to fix conflicts
+//!      wake the project's dedicated recurring chat to fix conflicts
 //!      (if any) **and** verify the build. The local-only commits are
-//!      preserved — the rebaser keeps the intent of both sides.
+//!      preserved — the recurring chat keeps the intent of both sides.
 //!
-//! The rebaser chat is always invoked after any git operation that changes
-//! the branch — even a zero-conflict fast-forward or clean rebase — because
+//! The recurring chat is always invoked on every scheduled run, even when the
+//! branch did not move, and even while a previous chat turn is still active:
 //! upstream changes can introduce build failures even without merge
-//! conflicts.
+//! conflicts, and a recurring chat is expected to run on its cadence.
 //!
 //! Configuration comes from the NixOS defaults file
 //! (`OMEGA_REBASE_JOB_CONFIG`, see [`omega_projects::rebase`]) overlaid with
 //! per-project settings and durable manual requests in `rebase-job.json`.
 //!
-//! The rebaser chats are real persistent sessions (just like any other),
+//! The recurring chats are real persistent sessions (just like any other),
 //! bound to the project's dedicated `main` worktree, so the user can also
 //! wake them by hand from the TUI and read their transcripts in the web UI.
-//! A rebaser chat is created lazily when a project first needs one.
+//! A recurring chat is created lazily when a project first needs one.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -55,9 +56,9 @@ use crate::session::{AgentSession, SessionStorage};
 const POLL: Duration = Duration::from_secs(5);
 const CONFLICT_RECONCILE_SECONDS: i64 = 60;
 
-/// Wake messages start with this so the rebaser (and a human skimming the
+/// Wake messages start with this so the recurring chat (and a human skimming the
 /// transcript) can tell a scheduled wake from a user message.
-const WAKE_HINT: &str = "⏰ upstream-rebaser job:";
+const WAKE_HINT: &str = "⏰ recurring chat job:";
 
 struct DivergedRebase {
     local: String,
@@ -68,10 +69,10 @@ struct DivergedRebase {
     conflict_detail: String,
 }
 
-/// The rebaser session id is deterministic per project so resumes and the
+/// The recurring chat session id is deterministic per project so resumes and the
 /// web UI can find it again.
 fn session_id_for(project: &str) -> String {
-    let mut out = String::from("rebaser-");
+    let mut out = String::from("recurring-");
     for c in project.chars() {
         if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
             out.push(c);
@@ -92,9 +93,9 @@ pub struct RebaseJob {
     session_storage: Arc<SessionStorage>,
     defaults: Option<RebaseDefaults>,
     mirrors: MirrorManager,
-    /// Live rebaser handles (session_id → handle), kept for the lifetime of
+    /// Live recurring chat handles (session_id → handle), kept for the lifetime of
     /// the daemon so a wake is just a message.
-    rebasers: Arc<Mutex<HashMap<String, AgentHandle>>>,
+    recurring_chats: Arc<Mutex<HashMap<String, AgentHandle>>>,
 }
 
 impl RebaseJob {
@@ -114,7 +115,7 @@ impl RebaseJob {
             session_storage,
             defaults,
             mirrors,
-            rebasers: Arc::new(Mutex::new(HashMap::new())),
+            recurring_chats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -144,9 +145,7 @@ impl RebaseJob {
             for project in &eff.projects {
                 let run = state.project_runs.get(&project.name);
                 let last = run.and_then(|r| r.last_started_at);
-                if !rebase::run_blocks_schedule(run)
-                    && rebase::project_is_due(now, last, project.interval_seconds)
-                {
+                if rebase::project_is_due(now, last, project.interval_seconds) {
                     candidates.insert(project.name.clone(), project.clone());
                 }
             }
@@ -196,7 +195,6 @@ impl RebaseJob {
                 )
             } else {
                 (current.enabled
-                    && !rebase::run_blocks_schedule(Some(run))
                     && rebase::project_is_due(now, run.last_started_at, current.interval_seconds))
                 .then_some("schedule".to_string())
             };
@@ -226,7 +224,7 @@ impl RebaseJob {
     /// upstream — if so, promotes to completed.
     ///
     /// For runs stuck in "verifying" status (fast-forward/clean-rebase where
-    /// the rebaser was woken for build verification): the git operation
+    /// the recurring chat was woken for build verification): the git operation
     /// already completed, so we just verify the branch state and promote.
     /// Never wakes an unresolved conflict.
     async fn reconcile_conflicted_runs(&self, snapshot: &rebase::RebaseState) {
@@ -330,9 +328,11 @@ impl RebaseJob {
                 .unwrap_or("unknown")
                 .to_string();
             let status = match outcome.as_str() {
-                // All rebaser-wake cases — the background monitor in
-                // `do_wake_rebaser` will eventually write the final result.
-                "conflicts" | "fast-forwarded" | "rebased" => "verifying",
+                // All recurring-chat-wake cases — the background monitor in
+                // `wake_recurring_chat` will eventually write the final result.
+                "conflicts" | "fast-forwarded" | "rebased" | "up-to-date" | "ahead-only" => {
+                    "verifying"
+                }
                 "error" | "missing" | "skipped" => "failed",
                 _ => "completed",
             };
@@ -364,10 +364,10 @@ impl RebaseJob {
         }
     }
 
-    /// Sync one project's main branch with upstream. Always invokes the
-    /// rebaser chat for any change (fast-forward, clean rebase, or conflicts)
-    /// so the LLM can verify the worktree still builds — even zero-conflict
-    /// operations can introduce build failures.
+    /// Sync one project's main branch with upstream, then always wake the
+    /// recurring chat so the LLM can verify the worktree still builds — even
+    /// zero-conflict operations (or a branch that did not move at all) can
+    /// hide build failures.
     async fn sync_project(
         &self,
         config: &EffectiveProjectConfig,
@@ -377,11 +377,27 @@ impl RebaseJob {
             Ok(Some(status)) => match status {
                 DefaultBranchStatus::UpToDate => {
                     tracing::info!(project = %info.name, "main already up to date with upstream");
-                    ProjectSync::Ok(json!({ "status": "up-to-date" }))
+                    self.wake_recurring_chat_for_verification(
+                        config,
+                        info,
+                        "Main is already up to date with upstream. Please verify that the \
+                         worktree builds and tests pass."
+                            .to_string(),
+                        "up-to-date",
+                    )
+                    .await
                 }
                 DefaultBranchStatus::AheadOnly => {
                     tracing::info!(project = %info.name, "main has local-only commits; upstream unchanged");
-                    ProjectSync::Ok(json!({ "status": "ahead-only" }))
+                    self.wake_recurring_chat_for_verification(
+                        config,
+                        info,
+                        "Main has local-only commits and upstream has not moved. Please verify \
+                         that the worktree builds and tests pass."
+                            .to_string(),
+                        "ahead-only",
+                    )
+                    .await
                 }
                 DefaultBranchStatus::FastForwarded(old, new) => {
                     tracing::info!(
@@ -390,8 +406,8 @@ impl RebaseJob {
                         to = %new,
                         "fast-forwarded main to upstream"
                     );
-                    // Even a clean fast-forward can break a build — invoke rebaser to verify.
-                    self.wake_rebaser_for_verification(
+                    // Even a clean fast-forward can break a build — invoke the recurring chat to verify.
+                    self.wake_recurring_chat_for_verification(
                         config,
                         info,
                         format!(
@@ -417,8 +433,8 @@ impl RebaseJob {
                             behind,
                             "rebased main onto upstream (no conflicts)"
                         );
-                        // Clean rebase can still break a build — invoke rebaser to verify.
-                        self.wake_rebaser_for_verification(
+                        // Clean rebase can still break a build — invoke the recurring chat to verify.
+                        self.wake_recurring_chat_for_verification(
                             config,
                             info,
                             format!(
@@ -462,7 +478,7 @@ impl RebaseJob {
     }
 
     /// Both sides moved: hand the rebase to the project's dedicated
-    /// upstream-rebaser chat, which fixes the conflicts itself and then
+    /// recurring chat, which fixes the conflicts itself and then
     /// verifies the build.
     async fn handle_diverged(
         &self,
@@ -511,14 +527,14 @@ impl RebaseJob {
             prompt = config.prompt,
         );
 
-        self.do_wake_rebaser(config, info, &main_active, &session_id, wake, "conflicts")
+        self.wake_recurring_chat(config, info, &main_active, &session_id, wake, "conflicts")
             .await
     }
 
-    /// Wake the rebaser after a mechanical sync (fast-forward or clean rebase)
-    /// where no merge conflicts occurred. The rebaser verifies that the
+    /// Wake the recurring chat after a mechanical sync (fast-forward or clean rebase)
+    /// where no merge conflicts occurred. The recurring chat verifies that the
     /// worktree still builds and tests pass.
-    async fn wake_rebaser_for_verification(
+    async fn wake_recurring_chat_for_verification(
         &self,
         config: &EffectiveProjectConfig,
         info: &ProjectInfo,
@@ -549,15 +565,15 @@ impl RebaseJob {
             prompt = config.prompt,
         );
 
-        self.do_wake_rebaser(config, info, &main_active, &session_id, wake, outcome)
+        self.wake_recurring_chat(config, info, &main_active, &session_id, wake, outcome)
             .await
     }
 
-    /// Common wake-the-rebaser-and-monitor-completion logic.
-    /// Sends `wake` to the rebaser session, records the run as `status`,
-    /// then spawns a background task that waits for the rebaser to finish
+    /// Common wake-the-recurring-chat-and-monitor-completion logic.
+    /// Sends `wake` to the recurring chat session, records the run as `status`,
+    /// then spawns a background task that waits for the recurring chat to finish
     /// and promotes the run to completed (or failed).
-    async fn do_wake_rebaser(
+    async fn wake_recurring_chat(
         &self,
         config: &EffectiveProjectConfig,
         info: &ProjectInfo,
@@ -567,7 +583,7 @@ impl RebaseJob {
         status: &'static str,
     ) -> ProjectSync {
         match self
-            .ensure_rebaser(info, main_active, &config.prompt)
+            .ensure_recurring_chat(info, main_active, &config.prompt)
             .await
         {
             Ok(handle) => {
@@ -577,7 +593,7 @@ impl RebaseJob {
                         %session_id,
                         project = %info.name,
                         error = %e,
-                        "could not wake rebaser"
+                        "could not wake the recurring chat"
                     );
                     return ProjectSync::Err(json!({
                         "status": "error",
@@ -588,14 +604,14 @@ impl RebaseJob {
                     %session_id,
                     project = %info.name,
                     status,
-                    "woke upstream rebaser"
+                    "woke recurring chat"
                 );
 
                 // Follow the dedicated session until a turn actually leaves
                 // main based on upstream, then promote it to completed. If
                 // another user turn was already ahead of this wake, its
                 // `Done` will still leave the repository diverged and this
-                // monitor keeps waiting for the queued rebaser turn.
+                // monitor keeps waiting for the queued recurring chat turn.
                 let projects = Arc::clone(&self.projects);
                 let info_for_monitor = info.clone();
                 let root = self.projects.root().to_path_buf();
@@ -644,7 +660,7 @@ impl RebaseJob {
                                     run.last_finished_at = Some(Utc::now());
                                     run.result = Some(json!({
                                         "status": "failed",
-                                        "outcome": "rebaser-error",
+                                        "outcome": "recurring-chat-error",
                                         "detail": error,
                                         "session": &monitored_session_id,
                                     }));
@@ -660,27 +676,27 @@ impl RebaseJob {
                 ProjectSync::Ok(json!({
                     "status": status,
                     "session": session_id,
-                    "rebaser_woken": true,
+                    "recurring_chat_woken": true,
                 }))
             }
             Err(e) => {
                 tracing::warn!(
                     project = %info.name,
                     error = %e,
-                    "could not create upstream rebaser session"
+                    "could not create recurring chat session"
                 );
                 ProjectSync::Err(json!({
                     "status": "error",
-                    "detail": format!("rebaser unavailable: {e:#}"),
+                    "detail": format!("recurring chat unavailable: {e:#}"),
                 }))
             }
         }
     }
 
-    /// Get (creating if needed) the dedicated upstream-rebaser chat for
+    /// Get (creating if needed) the dedicated recurring chat for
     /// `info`, bound to the project's `main` worktree, and keep its handle
     /// for the daemon's lifetime so a wake is just a message.
-    async fn ensure_rebaser(
+    async fn ensure_recurring_chat(
         &self,
         info: &ProjectInfo,
         main_active: &ActiveProject,
@@ -688,7 +704,7 @@ impl RebaseJob {
     ) -> anyhow::Result<AgentHandle> {
         let session_id = session_id_for(&info.name);
         {
-            let map = self.rebasers.lock().await;
+            let map = self.recurring_chats.lock().await;
             if let Some(handle) = map.get(&session_id) {
                 return Ok(handle.clone());
             }
@@ -700,7 +716,7 @@ impl RebaseJob {
             .await
             .unwrap_or_else(|| "main".to_string());
 
-        // System prompt: configured rebaser prompt (NixOS) or the built-in
+        // System prompt: configured recurring chat prompt (NixOS) or the built-in
         // default, plus a project header so the agent knows the repo.
         let system_prompt = format!(
             "{agent_prompt}\n\n\
@@ -728,14 +744,14 @@ impl RebaseJob {
             Err(_) => {
                 let mut s = AgentSession::new_with_storage(
                     &session_id,
-                    "rebaser",
-                    format!("rebaser-{}", info.name),
-                    "Upstream rebaser chat",
+                    "recurring",
+                    format!("recurring-{}", info.name),
+                    "Recurring chat",
                     &system_prompt,
                     self.session_storage.as_ref().clone(),
                 )?;
                 s.add_message(omega_llm::Message::user(format!(
-                    "[bootstrap] You are the dedicated upstream rebaser chat for '{name}'. \
+                    "[bootstrap] You are the dedicated recurring chat for '{name}'. \
                      This session was created by the rebase cron job so you can be woken at any \
                      time. Your worktree: {worktree} (branch {branch}).",
                     name = info.name,
@@ -753,7 +769,7 @@ impl RebaseJob {
 
         // Tools bound to the main worktree, with the usual shell/fs tools.
         // The rename tool is wired to nothing (it errors harmlessly if the
-        // agent ever tries it — rebaser worktrees are not meant to be renamed).
+        // agent ever tries it — recurring chat worktrees are not meant to be renamed).
         let event_tx = broadcast::channel(16).0;
         let rename_tool = crate::rename_worktree_tool(
             &self.projects,
@@ -778,11 +794,11 @@ impl RebaseJob {
             .spawn(session, |internals| agent.run(internals))
             .await?;
 
-        self.rebasers
+        self.recurring_chats
             .lock()
             .await
             .insert(session_id.clone(), handle.clone());
-        tracing::info!(%session_id, project = %info.name, "upstream rebaser chat ready");
+        tracing::info!(%session_id, project = %info.name, "recurring chat ready");
         Ok(handle)
     }
 }

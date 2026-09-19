@@ -1,6 +1,6 @@
 //! # Rebase cron configuration & state
 //!
-//! Shared by `omega-loop` (the cron worker + the "upstream rebaser" agent
+//! Shared by `omega-loop` (the cron worker + the "recurring chat" agent
 //! sessions) and `omega-git-host` (the web UI that edits it imperatively).
 //!
 //! There are two sources of configuration:
@@ -9,7 +9,7 @@
 //!    to a JSON file pointed at by `OMEGA_REBASE_JOB_CONFIG` (default
 //!    `/etc/omega/rebase-job.defaults.json`). Carries the interval, the
 //!    projects seeded as "cron jobbable", the system prompt for the
-//!    dedicated upstream-rebaser chat, and the per-session "update your
+//!    dedicated recurring chat, and the per-session "update your
 //!    checkout" instruction.
 //! 2. **Imperative state** — `rebase-job.json` inside the project store
 //!    root, edited by the web UI (`GET /rebase`, POST endpoints). Overrides
@@ -77,12 +77,12 @@ pub const DEFAULT_UPDATE_INSTRUCTION: &str =
      normally all that is needed. If rebasing surfaces conflicts, resolve them yourself \
      before making changes, and make sure the worktree still builds and tests pass.";
 
-/// Built-in system prompt for the dedicated "upstream rebaser" chat: told to
+/// Built-in system prompt for the dedicated "recurring chat": told to
 /// rebase the project's main branch onto upstream and fix conflicts itself.
 /// The NixOS module's `rebaseJob.systemPrompt` default is the same text —
 /// keep the two in sync.
-pub const DEFAULT_REBASER_PROMPT: &str =
-    "You are the dedicated 'upstream rebaser' chat for this project.\n\n\
+pub const DEFAULT_RECURRING_PROMPT: &str =
+    "You are the dedicated 'recurring chat' for this project.\n\n\
      Your job: keep the project's main branch in sync with upstream. The project's main \
      branch may carry commits that exist only locally (functionality upstream won't or \
      can't add) on top of the upstream history.\n\n\
@@ -108,8 +108,8 @@ pub struct RebaseDefaults {
     /// Projects seeded as cron jobbable.
     #[serde(default)]
     pub projects: Vec<String>,
-    /// System prompt for the dedicated upstream-rebaser chat.
-    #[serde(default = "default_rebaser_prompt")]
+    /// System prompt for the dedicated recurring chat.
+    #[serde(default = "default_recurring_prompt")]
     pub agent_prompt: String,
     /// Instruction appended to every session's prompt when it enters a
     /// project ("update your checkout").
@@ -117,8 +117,8 @@ pub struct RebaseDefaults {
     pub update_instruction: String,
 }
 
-fn default_rebaser_prompt() -> String {
-    DEFAULT_REBASER_PROMPT.to_string()
+fn default_recurring_prompt() -> String {
+    DEFAULT_RECURRING_PROMPT.to_string()
 }
 
 fn default_update_instruction() -> String {
@@ -186,7 +186,7 @@ pub struct RebaseProjectRun {
 pub struct EffectiveConfig {
     pub interval_seconds: u64,
     /// Sorted, deduplicated list of cron-jobbable projects, each with its
-    /// independently resolved cadence and rebaser prompt.
+    /// independently resolved cadence and recurring chat prompt.
     pub projects: Vec<EffectiveProjectConfig>,
 }
 
@@ -271,7 +271,7 @@ pub fn resolve_project(
         .filter(|p| !p.trim().is_empty())
         .map(str::to_owned)
         .or_else(|| defaults.map(|d| d.agent_prompt.clone()))
-        .unwrap_or_else(default_rebaser_prompt);
+        .unwrap_or_else(default_recurring_prompt);
     EffectiveProjectConfig {
         name: name.to_string(),
         enabled,
@@ -326,26 +326,6 @@ pub fn project_is_due(
         return true;
     };
     now.signed_duration_since(last).num_seconds() >= interval_seconds as i64
-}
-
-/// Scheduled attempts pause while a manual request is queued, a fetch is
-/// running, or a rebaser session is still verifying (or resolving conflicts
-/// for) the in-progress run. A user can always explicitly queue another
-/// manual wake.
-pub fn run_blocks_schedule(run: Option<&RebaseProjectRun>) -> bool {
-    let Some(run) = run else {
-        return false;
-    };
-    if run.pending_since.is_some() {
-        return true;
-    }
-    matches!(
-        run.result
-            .as_ref()
-            .and_then(|r| r.get("status"))
-            .and_then(serde_json::Value::as_str),
-        Some("queued" | "running" | "conflicted" | "verifying")
-    )
 }
 
 pub fn run_status(run: &RebaseProjectRun) -> Option<&str> {
@@ -515,7 +495,7 @@ mod tests {
         RebaseDefaults {
             interval_seconds: interval,
             projects: projects.iter().map(|s| s.to_string()).collect(),
-            agent_prompt: DEFAULT_REBASER_PROMPT.to_string(),
+            agent_prompt: DEFAULT_RECURRING_PROMPT.to_string(),
             update_instruction: DEFAULT_UPDATE_INSTRUCTION.to_string(),
         }
     }
@@ -603,7 +583,7 @@ mod tests {
         // falling back to the built-in prompts.
         let raw = r#"{"interval_seconds": 60, "projects": ["a"]}"#;
         let d: RebaseDefaults = serde_json::from_str(raw).unwrap();
-        assert_eq!(d.agent_prompt, DEFAULT_REBASER_PROMPT);
+        assert_eq!(d.agent_prompt, DEFAULT_RECURRING_PROMPT);
         assert_eq!(d.update_instruction, DEFAULT_UPDATE_INSTRUCTION);
     }
 
@@ -638,22 +618,6 @@ mod tests {
             Some(now - chrono::Duration::seconds(3600)),
             3600
         ));
-    }
-
-    #[test]
-    fn unresolved_run_pauses_only_the_automatic_schedule() {
-        let mut run = RebaseProjectRun {
-            result: Some(serde_json::json!({ "status": "conflicted" })),
-            ..Default::default()
-        };
-        assert!(run_blocks_schedule(Some(&run)));
-        // "verifying" also blocks (rebaser is working)
-        run.result = Some(serde_json::json!({ "status": "verifying" }));
-        assert!(run_blocks_schedule(Some(&run)));
-        run.result = Some(serde_json::json!({ "status": "completed" }));
-        assert!(!run_blocks_schedule(Some(&run)));
-        run.pending_since = Some(Utc::now());
-        assert!(run_blocks_schedule(Some(&run)));
     }
 
     #[test]

@@ -14,7 +14,8 @@
           Each project is a soft fork. Its configured local default branch is
           rebased onto the matching branch from the fetch-only
           <code>upstream</code> remote. Conflict-free rebases are completed by
-          omega-loop; conflicts are handed to the project's rebaser chat.
+          omega-loop; the project's recurring chat is woken on every run to
+          verify the build and resolve any conflicts.
         </p>
       </div>
       {% if projects %}
@@ -39,6 +40,7 @@
             {% if p.status == "queued" %}<span class="badge badge-info">queued</span>
             {% elif p.status == "running" %}<span class="badge badge-primary">running</span>
             {% elif p.status == "conflicted" %}<span class="badge badge-warning">conflicted</span>
+            {% elif p.status == "verifying" %}<span class="badge badge-info">verifying</span>
             {% elif p.status == "completed" %}<span class="badge badge-success">completed</span>
             {% elif p.status == "failed" %}<span class="badge badge-danger">failed</span>
             {% else %}<span class="badge badge-secondary">never run</span>{% endif %}
@@ -92,7 +94,7 @@
           {% if p.session_exists %}
           <a href="/sessions/{{ p.session_id }}">open {{ p.session_id }}</a>
           {% else %}
-          <span class="text-muted">rebaser chat starts only if a conflict needs it</span>
+          <span class="text-muted">recurring chat opens on the next run</span>
           {% endif %}
         </div>
       </div>
@@ -119,7 +121,8 @@
     <dl>
       <dt>queued</dt><dd>manual request persisted</dd>
       <dt>running</dt><dd>fetch/classification in progress</dd>
-      <dt>conflicted</dt><dd>Git stopped; rebaser chat was woken</dd>
+      <dt>conflicted</dt><dd>Git stopped; recurring chat is resolving conflicts</dd>
+      <dt>verifying</dt><dd>recurring chat was woken to verify the build</dd>
       <dt>completed</dt><dd>up-to-date, fast-forwarded, or rebased</dd>
       <dt>failed</dt><dd>fetch, validation, or Git operation failed</dd>
     </dl>

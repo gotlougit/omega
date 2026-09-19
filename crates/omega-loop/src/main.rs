@@ -1588,11 +1588,11 @@ async fn main() -> Result<()> {
     let projects = Arc::new(ProjectManager::new());
     let projects_root = projects.root().display().to_string();
 
-    // Upstream rebaser cron: keeps cron-jobbable projects' main branches in
-    // sync with upstream (mechanical fast-forward when possible, waking the
-    // dedicated rebaser chat when a real rebase with conflict resolution is
-    // needed). Runs in the background for the daemon's whole lifetime;
-    // with no config it is idle and costs nothing.
+    // Recurring chat cron: keeps cron-jobbable projects' main branches in
+    // sync with upstream (mechanical fast-forward when possible) and always
+    // wakes the project's dedicated recurring chat to verify the build and
+    // resolve any conflicts. Runs in the background for the daemon's whole
+    // lifetime; with no config it is idle and costs nothing.
     {
         let defaults = omega_projects::rebase::load_defaults();
         let job = rebase_job::RebaseJob::new(
@@ -1607,9 +1607,9 @@ async fn main() -> Result<()> {
             Some(d) if !d.projects.is_empty() => tracing::info!(
                 projects = ?d.projects,
                 interval_seconds = d.interval_seconds,
-                "upstream rebaser cron enabled"
+                "recurring chat cron enabled"
             ),
-            _ => tracing::debug!("upstream rebaser cron idle (no configured projects)"),
+            _ => tracing::debug!("recurring chat cron idle (no configured projects)"),
         }
     }
 

@@ -109,7 +109,7 @@ pub enum DefaultBranchStatus {
     /// Both sides moved: upstream has `behind` new commits and the local
     /// default branch has `ahead` local-only commits on top of
     /// upstream's history. Needs a real rebase (the dedicated
-    /// upstream-rebaser agent handles it). Carries local_sha, upstream_sha.
+    /// recurring chat agent handles it). Carries local_sha, upstream_sha.
     Diverged {
         local: String,
         upstream: String,
@@ -688,7 +688,7 @@ impl ProjectManager {
     ///
     /// - strictly behind  → fast-forward `refs/heads/<default>` (a pure
     ///   mirror update — never drops local-only commits),
-    /// - diverged         → left alone for the upstream-rebaser agent (a
+    /// - diverged         → left alone for the recurring chat agent (a
     ///   rebase needs judgment),
     /// - ahead-only       → left alone (local-only functionality).
     ///
@@ -771,7 +771,7 @@ impl ProjectManager {
     /// Start (and, when conflict-free, finish) rebasing the local default
     /// branch onto its fetched upstream ref. On conflicts Git's rebase state
     /// is deliberately left intact in the dedicated main worktree so the
-    /// rebaser session can inspect, resolve, and continue it.
+    /// recurring chat session can inspect, resolve, and continue it.
     pub async fn rebase_default_branch(
         &self,
         info: &ProjectInfo,
@@ -828,7 +828,7 @@ impl ProjectManager {
 
     /// Whether the dedicated default-branch worktree still contains Git
     /// rebase state. Used to reconcile persisted conflicted jobs after an
-    /// omega-loop restart without waking the rebaser again.
+    /// omega-loop restart without waking the recurring chat again.
     pub async fn default_branch_rebase_in_progress(&self, info: &ProjectInfo) -> Result<bool> {
         let main = self.ensure_main_worktree(info).await?;
         Ok(has_rebase_state(Path::new(&main.worktree_path)).await)
@@ -836,7 +836,7 @@ impl ProjectManager {
 
     /// Ensure a dedicated worktree exists for the project's default branch —
     /// the "main worktree" at `worktrees/<name>/main`. `git rebase` needs a
-    /// working tree, and the bare clone has none, so the upstream-rebaser
+    /// working tree, and the bare clone has none, so the recurring chat
     /// agent operates here, on the branch that may carry local-only commits.
     ///
     /// Returns the binding (existing worktree is reconciled, never

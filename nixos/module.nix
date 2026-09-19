@@ -167,11 +167,11 @@ let
     before making changes, and make sure the worktree still builds and tests pass.
   '';
 
-  # Default system prompt for each project's dedicated "upstream rebaser"
-  # chat. Must match omega-projects/src/rebase.rs `DEFAULT_REBASER_PROMPT`
+  # Default system prompt for each project's dedicated "recurring chat".
+  # Must match omega-projects/src/rebase.rs `DEFAULT_RECURRING_PROMPT`
   # (modulo the {branch} placeholder) — keep in sync.
-  defaultRebaserPrompt = ''
-    You are the dedicated "upstream rebaser" chat for this project.
+  defaultRecurringPrompt = ''
+    You are the dedicated "recurring chat" for this project.
 
     Your job: keep the project's main branch in sync with upstream. The project's main
     branch may carry commits that exist only locally (functionality upstream won't or
@@ -497,7 +497,7 @@ in
     };
 
     # -------------------------------------------------------------------
-    # rebaseJob — upstream rebase cron + dedicated "upstream rebaser" chats
+    # rebaseJob — upstream rebase cron + dedicated recurring chats
     # -------------------------------------------------------------------
     rebaseJob = mkOption {
       type = types.submodule {
@@ -505,8 +505,9 @@ in
           enable = mkEnableOption ''
             the upstream rebase cron: keeps cron-jobbable projects' main
             branches in sync with upstream, fast-forwarding mechanically
-            when possible and waking a dedicated "upstream rebaser" chat to
-            rebase + resolve conflicts when local main has diverged
+            when possible and waking a dedicated recurring chat on every
+            run to verify the build (and to rebase + resolve conflicts when
+            local main has diverged)
           '';
 
           interval = mkOption {
@@ -536,13 +537,14 @@ in
 
           systemPrompt = mkOption {
             type = types.str;
-            default = defaultRebaserPrompt;
+            default = defaultRecurringPrompt;
             description = ''
-              System prompt for each project's dedicated "upstream rebaser"
-              chat: the agent that rebases the project's main branch onto
-              upstream and auto-fixes merge conflicts (preserving local-only
-              commits).  The default tells it to keep the intent of both
-              sides.  Override to change the rebaser's behaviour/wording.
+              System prompt for each project's dedicated recurring chat:
+              the agent that rebases the project's main branch onto upstream,
+              auto-fixes merge conflicts (preserving local-only commits),
+              and verifies the build on every run.  The default tells it to
+              keep the intent of both sides.  Override to change the recurring
+              chat's behaviour/wording.
             '';
           };
 
@@ -562,12 +564,13 @@ in
       description = ''
         Upstream rebase cron for the project store.  On every `interval`,
         omega-loop fetches upstream for each cron-jobbable project and
-        brings the project's main branch up to date: a mechanical
-        fast-forward when upstream merely moved, or a woken "upstream
-        rebaser" chat when the local main must be rebased onto upstream
-        (conflicts are fixed by that agent).  Individual projects can also
-        be toggled imperatively on the git-host "rebase" page; NixOS
-        `projects` seeds that set, and a web-UI disable always wins.
+        brings the project's main branch up to date (a mechanical
+        fast-forward when upstream merely moved, or a real rebase when local
+        main must be rebased onto upstream).  The project's dedicated
+        recurring chat is always woken on every run to verify the build and
+        to fix any conflicts.  Individual projects can also be toggled
+        imperatively on the git-host "rebase" page; NixOS `projects` seeds
+        that set, and a web-UI disable always wins.
       '';
     };
 

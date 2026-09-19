@@ -122,16 +122,21 @@ schedule, and hand the judgment parts to a dedicated agent:
 
 - Every interval, for each cron-jobbable project, the daemon fetches
   upstream and checks the local default branch against `origin/<default>`:
-  - strictly behind → **mechanical fast-forward**, no model involved;
-  - up to date, or ahead only (commits upstream doesn't have) → nothing —
-    local-only functionality is never touched;
+  - strictly behind → **mechanical fast-forward**;
+  - up to date, or ahead only (commits upstream doesn't have) → nothing is
+    touched — local-only functionality is never dropped;
   - **diverged** (local main carries commits upstream lacks *and* upstream
-    moved) → the project's dedicated **upstream rebaser** chat is woken. It
-    rebases main onto upstream in the project's `main` worktree and
-    **resolves the merge conflicts itself**, preserving the local-only
-    commits and finishing the rebase.
-- The rebaser chats are ordinary persistent sessions
-  (`rebaser-<project>`), so you can wake one yourself anytime from the TUI
+    moved) → the project's dedicated **recurring chat** rebases main onto
+    upstream in the project's `main` worktree and **resolves the merge
+    conflicts itself**, preserving the local-only commits and finishing the
+    rebase.
+- The recurring chat is woken on **every** run, including fast-forwards,
+  clean rebases, and up-to-date branches, so it can verify the worktree
+  still builds and tests pass. A run is triggered even while a previous chat
+  turn is still active — there is no short-circuit for an active recurring
+  chat.
+- The recurring chats are ordinary persistent sessions
+  (`recurring-<project>`), so you can wake one yourself anytime from the TUI
   and read its transcripts in the web UI.
 - Every session that enters a project is told, via its system prompt, to
   keep its checkout up to date with upstream first.
@@ -139,7 +144,7 @@ schedule, and hand the judgment parts to a dedicated agent:
 Configuration has two sources, merged at runtime:
 
 1. **NixOS defaults** — `services.omega.rebaseJob` (interval, projects,
-   the rebaser system prompt, and the per-session “update your checkout”
+   the recurring chat system prompt, and the per-session “update your checkout”
    instruction), written to `/etc/omega/rebase-job.defaults.json`.
 2. **Imperative state** — the web UI's `/rebase` page toggles projects in
    and out of the cron set, changes the interval, and has a “run now”
@@ -152,7 +157,7 @@ services.omega.rebaseJob = {
   interval = "6h";                  # or "30m", "1d", "3600"
   projects = [ "pi-omega" ];        # seed; the web UI can add/remove more
   systemPrompt = ''                # default: rebase main on upstream + fix conflicts
-    You are the upstream rebaser for this project...
+    You are the recurring chat for this project...
   '';
 };
 ```

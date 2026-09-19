@@ -247,7 +247,7 @@ pub async fn summary(
         .and_then(|r| r.result.as_ref())
         .and_then(|r| r.get("outcome"))
         .and_then(Value::as_str));
-    ctx["rebaser_session"] = json!(rebaser_session_id(&name));
+    ctx["recurring_session"] = json!(recurring_session_id(&name));
     let mirror = state.mirrors.project(&name);
     ctx["mirror_configured"] = json!(mirror.is_some());
     ctx["mirror_url"] = json!(mirror.as_ref().map(|m| m.url.as_str()));
@@ -1353,10 +1353,10 @@ pub(crate) struct RebaseRunForm {
     project: Option<String>,
 }
 
-/// The rebaser session id omega-loop uses for a project (same derivation as
+/// The recurring chat session id omega-loop uses for a project (same derivation as
 /// `rebase_job::session_id_for` — keep in sync).
-fn rebaser_session_id(project: &str) -> String {
-    let mut out = String::from("rebaser-");
+fn recurring_session_id(project: &str) -> String {
+    let mut out = String::from("recurring-");
     for c in project.chars() {
         if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
             out.push(c);
@@ -1415,7 +1415,7 @@ pub async fn rebase_page(State(state): State<AppState>, headers: HeaderMap) -> R
         } else {
             None
         };
-        let session_id = rebaser_session_id(name);
+        let session_id = recurring_session_id(name);
         projects.push(json!({
             "name": name,
             "upstream_url": info.url,
